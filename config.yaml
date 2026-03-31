@@ -1,0 +1,68 @@
+# ============================================================
+# PubSubPrivacy Configuration
+# S-Sensitive w-Event Differential Privacy for MQTT
+# ============================================================
+
+broker:
+  host: "localhost"
+  port: 1883
+  # Raw topics from publishers arrive under this prefix
+  raw_prefix: "factory/raw"
+  # Protected topics delivered to subscribers under this prefix
+  protected_prefix: "factory/protected"
+
+privacy:
+  # Global privacy budget epsilon
+  epsilon: 1.0
+  # Window size w (number of timestamps in sliding window)
+  window_size: 10
+  # Sensitivity parameter S (minimum publishers per aggregate)
+  min_publishers: 3
+  # Budget allocation strategy: "uniform", "sample", "budget_absorption"
+  budget_strategy: "uniform"
+  # Timestamp interval in seconds (how often aggregates are released)
+  timestamp_interval: 5.0
+
+factory:
+  # Number of production lines
+  num_lines: 2
+  # Machines per line
+  machines_per_line: 4
+  # Sensor types and their payload bounds [min, max]
+  sensors:
+    temperature:
+      unit: "celsius"
+      min: 15.0
+      max: 120.0
+      publish_interval: 5.0
+      noise_std: 0.5
+    vibration:
+      unit: "mm/s"
+      min: 0.0
+      max: 50.0
+      publish_interval: 5.0
+      noise_std: 0.3
+    power_draw:
+      unit: "kW"
+      min: 0.0
+      max: 500.0
+      publish_interval: 5.0
+      noise_std: 2.0
+    humidity:
+      unit: "percent"
+      min: 10.0
+      max: 95.0
+      publish_interval: 5.0
+      noise_std: 0.8
+
+experiment:
+  # Total duration of the experiment in seconds
+  duration: 120
+  # Values of S to sweep in the experiment
+  s_values: [1, 2, 3, 5, 8]
+  # Values of epsilon to sweep
+  epsilon_values: [0.1, 0.5, 1.0, 2.0, 5.0]
+  # Window sizes to sweep
+  w_values: [5, 10, 20]
+  # Budget strategies to compare
+  strategies: ["uniform", "sample", "budget_absorption"]
