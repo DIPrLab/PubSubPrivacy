@@ -1,26 +1,4 @@
 #!/usr/bin/env python3
-"""
-Real-data experimental evaluation of S-sensitive w-event differential privacy
-using two IEEE research datasets:
-
-  1. MCEC-Thai: Multi-Circuit Electric Consumption from a Thailand home
-     - 11 circuit breakers publishing voltage, current, power readings
-     - Scenario: smart building energy monitoring pub/sub
-
-  2. Colorado Springs Traffic Intersection: Multi-sensor object detection
-     - 4 EVO radar + 2 OS1 lidar sensors at a traffic intersection
-     - Scenario: smart city traffic monitoring pub/sub
-
-Each dataset is loaded, converted into realistic aggregate pub/sub streams
-(multiple publishers -> topic -> aggregate), and run through the DP engine
-to evaluate privacy-utility tradeoffs on real-world IoT data.
-
-Usage:
-  python run_real_data_experiment.py                # full sweep on both datasets
-  python run_real_data_experiment.py --quick         # reduced parameter sweep
-  python run_real_data_experiment.py --dataset energy # only energy dataset
-  python run_real_data_experiment.py --dataset traffic # only traffic dataset
-"""
 
 from __future__ import annotations
 
@@ -212,19 +190,6 @@ def build_traffic_streams(
     metric: str = "speed",
     window_seconds: int = 10,
 ) -> tuple[list[float], list[int], float]:
-    """
-    Build aggregate pub/sub streams from traffic sensor data.
-
-    Each sensor (radar/lidar) is a publisher. Per time window, we compute
-    the mean of the chosen metric across all sensors that reported data.
-
-    For 'object_count', we count unique ObjectIds per sensor per window.
-
-    Returns:
-        aggregates: mean metric value per window
-        pub_counts: number of sensors with data per window
-        payload_bound: range of the metric domain
-    """
     # Find the global time range across all sensors
     all_times = []
     for df in sensors.values():
@@ -360,9 +325,6 @@ def run_dp_on_stream(
     }
 
 
-# ---------------------------------------------------------------------------
-# Parameter Sweep
-# ---------------------------------------------------------------------------
 
 def sweep_real_data(
     dataset_name: str,
