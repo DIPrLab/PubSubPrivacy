@@ -1,68 +1,56 @@
 # ============================================================
 # PubSubPrivacy Configuration
-# S-Sensitive w-Event Differential Privacy for MQTT
+# Clamped w-event DP with P-allocation (paper Sections 3-5)
 # ============================================================
 
 broker:
   host: "localhost"
   port: 1883
-  # Raw topics from publishers arrive under this prefix
   raw_prefix: "factory/raw"
-  # Protected topics delivered to subscribers under this prefix
   protected_prefix: "factory/protected"
 
+# DP parameters (Section 3.1): operator-fixed; enter the privacy analysis.
+# Changing any of them changes the epsilon guarantee.
 privacy:
-  # Global privacy budget epsilon
-  epsilon: 1.0
-  # Window size w (number of timestamps in sliding window)
-  window_size: 10
-  # Sensitivity parameter S (minimum publishers per aggregate)
+  epsilon: 1.0              # sliding-window privacy budget
+  window_size: 10           # w = number of timestamps in the sliding window
+
+# Scheduling hyperparameters (Section 3.1): shape utility / latency only;
+# do NOT enter the DP calculation and can be tuned against a held-out trace.
+scheduling:
+  # Publisher threshold P for the P-allocation release gate (Section 5.3).
+  # Bounds attribution advantage at 1/P; does NOT appear in noise scale.
   min_publishers: 3
-  # Budget allocation strategy: "uniform", "sample", "budget_absorption"
-  budget_strategy: "uniform"
-  # Timestamp interval in seconds (how often aggregates are released)
+  # Budget-allocation strategy. Choices:
+  #   uniform, sample, budget_distribution, budget_absorption,
+  #   p_gated_uniform, p_gated_sample, p_gated_bd, p_gated_ba, n_weighted
+  budget_strategy: "p_gated_ba"
+  # BA similarity threshold theta (as a fraction of R).
+  ba_threshold: 0.1
+  # Base timestamp interval Delta_t in seconds (Definition 3.1).
   timestamp_interval: 5.0
+  # K_ext: max number of Delta_t extensions when n_tau < P; T_max = K_ext * Delta_t.
+  k_ext: 2
 
-factory:
-  # Number of production lines
-  num_lines: 2
-  # Machines per line
-  machines_per_line: 4
-  # Sensor types and their payload bounds [min, max]
-  sensors:
-    temperature:
-      unit: "celsius"
-      min: 15.0
-      max: 120.0
-      publish_interval: 5.0
-      noise_std: 0.5
-    vibration:
-      unit: "mm/s"
-      min: 0.0
-      max: 50.0
-      publish_interval: 5.0
-      noise_std: 0.3
-    power_draw:
-      unit: "kW"
-      min: 0.0
-      max: 500.0
-      publish_interval: 5.0
-      noise_std: 2.0
-    humidity:
-      unit: "percent"
-      min: 10.0
-      max: 95.0
-      publish_interval: 5.0
-      noise_std: 0.8
-
+# Parameter sweep for the offline experimental evaluation (all real-world).
 experiment:
-  # Total duration of the experiment in seconds
   duration: 120
-  # Values of S to sweep in the experiment
-  s_values: [1, 2, 3, 5, 8]
-  # Values of epsilon to sweep
-  epsilon_values: [0.1, 0.5, 1.0, 2.0, 5.0]
-  # Window sizes to sweep
-  w_values: [5, 10, 20]
-  # Budget strategies to compare
-  strategies: ["uniform", "sample", "budget_absorption"]
+  # Publisher-threshold grid (paper calls this P).
+  p_values: [1, 2, 4, 6]
+  epsilon_values: [0.5, 1.0, 2.0, 4.0]
+  w_values: [4, 8, 10, 12]
+  # All strategies exercised by run_experiment.py.
+  strategies:
+    - "uniform"
+    - "sample"
+    - "budget_distribution"
+    - "budget_absorption"
+    - "p_gated_ba"
+    - "n_weighted"
+  # Section 5.7 two-stage tuning.
+  tuning:
+    p_grid: [1, 2, 3, 4, 6, 8]
+    dt_multiplier_grid: [1, 2, 3, 4, 6]
+    utility_weight: 1.0
+    latency_weight: 0.2
+    strategy: "p_gated_ba"

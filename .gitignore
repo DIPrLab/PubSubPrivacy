@@ -1,4 +1,6 @@
 results/
 results_real_data/
+results_test/
+results_final/
 __pycache__/
 data/

@@ -1,14 +1,23 @@
 """
-MQTT Privacy Plugin — broker-side middleware that intercepts raw publisher
-messages, constructs per-subscription aggregate streams, applies S-sensitive
-w-event differential privacy, and republishes protected outputs.
+MQTT Privacy Plugin: broker-side middleware for clamped w-event DP with
+P-allocation (paper Sections 3-5).
 
-Architecture:
-  Publishers --> [raw topics] --> PrivacyPlugin --> [protected topics] --> Subscribers
+Pipeline:
 
-The plugin subscribes to all raw topics, buffers messages per timestamp
-interval, computes the mean aggregate, injects calibrated Laplace noise,
-and publishes the noisy aggregate on the corresponding protected topic.
+    Publishers --> [raw topics] --> PrivacyPlugin --> [protected topics] --> Subscribers
+
+The plugin:
+  1. Clamps each incoming payload to the publisher's declared interval
+     [a_p, b_p] (Definition 3.2, Option A; static operator-declared bounds).
+  2. Buffers messages per logical-timestamp interval Delta_t and adaptively
+     extends the interval up to T_max = K_ext * Delta_t if the leaf-scope
+     publisher count is below P (Section 5.6).
+  3. If n_tau < P at the leaf scope even after extension, walks up the topic
+     hierarchy (Algorithm 1) to the nearest clamp-compatible ancestor that
+     pools >= P publishers; otherwise defers.
+  4. Applies the Laplace mechanism with sensitivity Delta_f = R/n_tau for the
+     mean aggregation, using the configured budget-allocation strategy.
+  5. Delivers only (hat{e}_tau, t_start_tau) on the protected topic.
 """
 
 from __future__ import annotations
@@ -19,23 +28,25 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+from typing import Optional
 
 import paho.mqtt.client as mqtt
 
-from dp_engine import BudgetStrategy, PrivacyConfig, StreamState
+from dp_engine import BudgetStrategy, PrivacyConfig, StreamState, is_p_gated
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class TopicBuffer:
-    payloads: dict[str, float] = field(default_factory=dict)  # publisher_id -> value
+    """Per-timestamp buffer: publisher_id -> clamped value."""
+    payloads: dict[str, float] = field(default_factory=dict)
+    extensions: int = 0
 
     @property
     def num_publishers(self) -> int:
         return len(self.payloads)
 
-    @property
     def mean(self) -> float:
         if not self.payloads:
             return 0.0
@@ -44,11 +55,28 @@ class TopicBuffer:
     def add(self, publisher_id: str, value: float):
         self.payloads[publisher_id] = value
 
+    def merge_from(self, other: "TopicBuffer"):
+        self.payloads.update(other.payloads)
+
     def clear(self):
         self.payloads.clear()
+        self.extensions = 0
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
 
 class PrivacyPlugin:
+    """
+    Broker-side privacy middleware.  All constructor arguments map directly
+    onto the paper's parameter taxonomy (Section 3.1):
+
+      DP parameters: epsilon, window_size, sensor_bounds (R),
+      Scheduling:    timestamp_interval (Delta_t), min_publishers (P),
+                     k_ext (K_ext), strategy (A), ba_threshold (theta).
+    """
+
     def __init__(
         self,
         broker_host: str = "localhost",
@@ -60,7 +88,10 @@ class PrivacyPlugin:
         min_publishers: int = 3,
         strategy: str = "uniform",
         timestamp_interval: float = 5.0,
+        k_ext: int = 0,
+        ba_threshold: float = 0.1,
         sensor_bounds: dict[str, tuple[float, float]] | None = None,
+        publisher_clamps: dict[str, tuple[float, float]] | None = None,
     ):
         self.broker_host = broker_host
         self.broker_port = broker_port
@@ -71,14 +102,21 @@ class PrivacyPlugin:
         self.min_publishers = min_publishers
         self.strategy = BudgetStrategy(strategy)
         self.timestamp_interval = timestamp_interval
+        self.k_ext = int(k_ext)
+        self.ba_threshold = ba_threshold
+        # Per-sensor-type clamp bounds [a, b].  The global payload range R is
+        # derived as the max width across the bounds that apply to a topic.
         self.sensor_bounds = sensor_bounds or {}
+        # Per-publisher clamp intervals (Definition 3.2).  Keyed by publisher_id.
+        self.publisher_clamps: dict[str, tuple[float, float]] = publisher_clamps or {}
 
-        # Per-topic state
+        # Per-logical-topic buffering + DP state.  Keys are logical
+        # subscription scopes ("line01/machine01/temperature",
+        # "line01/machine01", ..., "") expanded lazily by the hierarchy walk.
         self._buffers: dict[str, TopicBuffer] = defaultdict(TopicBuffer)
         self._streams: dict[str, StreamState] = {}
         self._lock = threading.Lock()
 
-        # MQTT client
         self._client = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
             client_id="privacy-plugin",
@@ -88,34 +126,55 @@ class PrivacyPlugin:
 
         self._running = False
         self._timer_thread: threading.Thread | None = None
-
-        # Collected release log for experiment analysis
         self.release_log: list[dict] = []
 
-    def _get_payload_bound(self, topic: str) -> float:
-        """Determine B (payload range) for a topic based on sensor type."""
+    # -------------------------------------------------------------- clamp
+
+    def _clamp_bounds_for(self, topic: str, publisher_id: str) -> tuple[float, float]:
+        """Resolve [a_p, b_p] for a given publisher/topic (Definition 3.2)."""
+        if publisher_id in self.publisher_clamps:
+            return self.publisher_clamps[publisher_id]
         for sensor_type, (lo, hi) in self.sensor_bounds.items():
             if sensor_type in topic:
-                return hi - lo
+                return (lo, hi)
+        return (-1e9, 1e9)
+
+    def _payload_range_for(self, topic: str) -> float:
+        """Global clamp range R for a subscription scope.
+
+        Takes the sup over all sensor_bounds that match any substring of the
+        topic.  The scope-walk ensures only clamp-compatible publishers are
+        pooled (Algorithm 1), so R remains the paper's data-independent bound.
+        """
+        widths = [hi - lo for st, (lo, hi) in self.sensor_bounds.items() if st in topic]
+        if widths:
+            return float(max(widths))
+        # Fallback: sup across all known types.
+        if self.sensor_bounds:
+            return float(max(hi - lo for lo, hi in self.sensor_bounds.values()))
         return 100.0
+
+    # ------------------------------------------------------ stream state
 
     def _get_or_create_stream(self, topic: str) -> StreamState:
         if topic not in self._streams:
-            payload_bound = self._get_payload_bound(topic)
             config = PrivacyConfig(
                 epsilon=self.epsilon,
                 window_size=self.window_size,
                 min_publishers=self.min_publishers,
-                payload_bound=payload_bound,
+                payload_bound=self._payload_range_for(topic),
                 strategy=self.strategy,
+                ba_threshold=self.ba_threshold,
             )
             self._streams[topic] = StreamState(config=config)
         return self._streams[topic]
 
+    # -------------------------------------------------------- MQTT hooks
+
     def _on_connect(self, client, userdata, flags, rc, properties=None):
-        subscribe_topic = f"{self.raw_prefix}/#"
-        client.subscribe(subscribe_topic)
-        logger.info(f"Privacy plugin subscribed to {subscribe_topic}")
+        sub = f"{self.raw_prefix}/#"
+        client.subscribe(sub)
+        logger.info(f"Privacy plugin subscribed to {sub}")
 
     def _on_message(self, client, userdata, msg):
         try:
@@ -126,56 +185,153 @@ class PrivacyPlugin:
             logger.warning(f"Malformed message on {msg.topic}: {e}")
             return
 
-        logical_topic = msg.topic
-        if logical_topic.startswith(self.raw_prefix + "/"):
-            logical_topic = logical_topic[len(self.raw_prefix) + 1:]
+        logical = msg.topic
+        if logical.startswith(self.raw_prefix + "/"):
+            logical = logical[len(self.raw_prefix) + 1:]
+
+        lo, hi = self._clamp_bounds_for(logical, publisher_id)
+        clamped = _clamp(value, lo, hi)
 
         with self._lock:
-            self._buffers[logical_topic].add(publisher_id, value)
+            self._buffers[logical].add(publisher_id, clamped)
+
+    # --------------------------------- Algorithm 1: hierarchy walk ------
+
+    @staticmethod
+    def _ancestors(topic: str) -> list[str]:
+        """Return [topic, parent(topic), ..., ''] (root)."""
+        parts = topic.split("/")
+        out = []
+        for i in range(len(parts), 0, -1):
+            out.append("/".join(parts[:i]))
+        out.append("")  # root
+        return out
+
+    def _clamp_compatible_buffer(
+        self,
+        scope: str,
+        reference_bounds: tuple[float, float],
+        R: float,
+    ) -> TopicBuffer:
+        """Pool clamp-compatible publishers under `scope` (Definition 5.2).
+
+        A publisher is pooled if the hull of its clamp with the reference has
+        width <= R.
+        """
+        a_star, b_star = reference_bounds
+        merged = TopicBuffer()
+        prefix = scope + "/" if scope else ""
+        with self._lock:
+            for t, buf in self._buffers.items():
+                if scope != "" and not (t == scope or t.startswith(prefix)):
+                    continue
+                for pub_id, val in buf.payloads.items():
+                    a_p, b_p = self._clamp_bounds_for(t, pub_id)
+                    hull = max(b_star, b_p) - min(a_star, a_p)
+                    if hull <= R + 1e-9:
+                        merged.add(pub_id, val)
+        return merged
+
+    def _scope_walk(self, topic: str) -> tuple[str, TopicBuffer]:
+        """Walk up the topic tree to the first clamp-compatible ancestor with
+        |P_tau^R(s)| >= P.  Returns (scope, pooled_buffer).
+
+        If the root is reached without meeting P, returns the last visited
+        scope + buffer (caller decides to defer).
+        """
+        R = self._payload_range_for(topic)
+        # Reference clamp: use the leaf-topic's declared bounds.
+        a_star, b_star = 0.0, 0.0
+        for st, (lo, hi) in self.sensor_bounds.items():
+            if st in topic:
+                a_star, b_star = lo, hi
+                break
+        ref = (a_star, b_star) if (a_star, b_star) != (0.0, 0.0) else (-R / 2, R / 2)
+
+        last_scope, last_buf = topic, TopicBuffer()
+        for scope in self._ancestors(topic):
+            buf = self._clamp_compatible_buffer(scope, ref, R)
+            last_scope, last_buf = scope, buf
+            if buf.num_publishers >= self.min_publishers:
+                return scope, buf
+        return last_scope, last_buf
+
+    # ------------------------------------------------- release pipeline
 
     def _flush_and_release(self):
         with self._lock:
-            topics_to_process = list(self._buffers.keys())
+            # Snapshot leaf-level topics currently holding buffered messages.
+            leaf_topics = [t for t, buf in self._buffers.items() if buf.num_publishers > 0]
+            # Preserve empty topics (still counted as logical timestamps).
+            leaf_topics += [t for t in self._buffers if t not in leaf_topics]
 
-        for logical_topic in topics_to_process:
+        for leaf in leaf_topics:
+            needs_walk = is_p_gated(self.strategy) or self.strategy == BudgetStrategy.N_WEIGHTED
             with self._lock:
-                buf = self._buffers[logical_topic]
-                num_pub = buf.num_publishers
-                aggregate = buf.mean
-                buf.clear()
+                buf_leaf = self._buffers[leaf]
+                leaf_n = buf_leaf.num_publishers
 
-            stream = self._get_or_create_stream(logical_topic)
-            released = stream.release(aggregate, num_pub)
+            # Adaptive interval extension (Section 5.6): hold the current buffer
+            # open longer if leaf_n < P and we have extensions left.
+            if needs_walk and leaf_n < self.min_publishers and self.k_ext > 0:
+                with self._lock:
+                    if buf_leaf.extensions < self.k_ext:
+                        buf_leaf.extensions += 1
+                        # Do not release yet; wait for another Delta_t tick.
+                        continue
+
+            scope, pooled = (leaf, buf_leaf)
+            if needs_walk and leaf_n < self.min_publishers:
+                scope, pooled = self._scope_walk(leaf)
+
+            aggregate = pooled.mean()
+            n_tau = pooled.num_publishers
+
+            # Clear the LEAF buffer after either a release at `leaf` or a walk.
+            # Pooled ancestor buffers are not cleared here; the next tick for
+            # those leaves will still drain normally.
+            with self._lock:
+                self._buffers[leaf].clear()
+
+            # Use the leaf's DP stream state (each subscription binding is a
+            # distinct stream in the paper; here we key by subscribed topic).
+            stream = self._get_or_create_stream(leaf)
+            released = stream.release(aggregate, n_tau)
 
             if released is not None:
-                protected_topic = f"{self.protected_prefix}/{logical_topic}"
+                protected_topic = f"{self.protected_prefix}/{leaf}"
                 out = {
-                    "timestamp": stream.current_tau,
+                    "t_start": stream.current_tau,
                     "value": round(released, 4),
-                    "num_publishers": num_pub,
-                    "suppressed": num_pub < self.min_publishers,
                 }
                 self._client.publish(protected_topic, json.dumps(out))
                 logger.debug(
-                    f"[tau={stream.current_tau}] {logical_topic}: "
-                    f"true={aggregate:.4f} noisy={released:.4f} "
-                    f"pubs={num_pub}"
+                    f"[tau={stream.current_tau}] {leaf} "
+                    f"(scope={scope or 'root'}, n_tau={n_tau}): "
+                    f"true={aggregate:.4f} -> noisy={released:.4f}"
                 )
 
             self.release_log.append({
-                "topic": logical_topic,
+                "leaf_topic": leaf,
+                "release_scope": scope or "root",
                 "tau": stream.current_tau,
                 "true_aggregate": aggregate,
                 "released_value": released,
-                "num_publishers": num_pub,
-                "suppressed": num_pub < self.min_publishers,
+                "n_tau": n_tau,
+                "walk_up": scope != leaf,
+                "deferred": released == stream.last_released and n_tau == 0,
             })
 
     def _timer_loop(self):
         while self._running:
             time.sleep(self.timestamp_interval)
             if self._running:
-                self._flush_and_release()
+                try:
+                    self._flush_and_release()
+                except Exception as exc:
+                    logger.exception(f"release loop error: {exc}")
+
+    # -------------------------------------------------- lifecycle
 
     def start(self):
         self._client.connect(self.broker_host, self.broker_port)
@@ -185,7 +341,8 @@ class PrivacyPlugin:
         self._timer_thread.start()
         logger.info(
             f"Privacy plugin started (epsilon={self.epsilon}, w={self.window_size}, "
-            f"S={self.min_publishers}, strategy={self.strategy.value})"
+            f"P={self.min_publishers}, strategy={self.strategy.value}, "
+            f"K_ext={self.k_ext}, T_max={self.k_ext * self.timestamp_interval}s)"
         )
 
     def stop(self):
