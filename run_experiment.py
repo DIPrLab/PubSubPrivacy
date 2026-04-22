@@ -3,7 +3,11 @@
 End-to-end experimental pipeline for clamped w-event DP with P-allocation,
 run exclusively on real-world public datasets (no synthetic data).
 
-For every dataset registered in `run_real_data_experiment.DATASETS` this script:
+All dataset ingestion, stream construction, and clamp application live in
+``data_streams.py``.  This module is just the experimental runner: sweeps,
+figures, tuning, and cross-dataset aggregation.
+
+For every dataset registered in ``data_streams.DATASETS`` this script:
   1. Runs the full parameter sweep (all strategies x P x eps x w x sensor).
   2. Produces the paper's four intro figures (two extremes + U-shape + KL bar).
   3. Runs Section 5.7 two-stage hyperparameter tuning across ALL strategies
@@ -39,11 +43,10 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import json
 import logging
 import os
 import sys
-from collections import defaultdict
-from typing import Callable
 
 import matplotlib
 matplotlib.use("Agg")
@@ -64,6 +67,12 @@ from dp_engine import (
     compute_windowed_kl_divergence,
     is_p_gated,
 )
+from data_streams import (
+    DATASETS,
+    build_topic_manifest,
+    prepare_dataset,
+)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -74,6 +83,8 @@ ALL_STRATEGIES = [
     "sample",
     "budget_distribution",
     "budget_absorption",
+    "p_gated_uniform",
+    "p_gated_sample",
     "p_gated_ba",
     "n_weighted",
 ]
@@ -81,850 +92,8 @@ ALL_STRATEGIES = [
 # ═════════════════════════════════════════════════════════════════════════
 #  Data loaders for every real-world dataset we evaluate on
 # ═════════════════════════════════════════════════════════════════════════
-
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-ENERGY_CSV = os.path.join(
-    DATA_DIR,
-    "Multi-Circuit Electric Consumption Data for Application of Energy Disaggregation.csv",
-)
-TRAFFIC_DIR = os.path.join(DATA_DIR, "2024_12_20")
-WEARABLE_CSV = os.path.join(DATA_DIR, "Wearable IoT Health Dataset.csv")
-PUNE_CSV = os.path.join(DATA_DIR, "Pune_SmartCity_Test_Dataset.csv")
-MOBILITY_CSV = os.path.join(DATA_DIR, "smart_mobility_dataset.csv")
-MANUFACTURING_CSV = os.path.join(DATA_DIR, "Manufacturing_dataset.csv")
-
-
-# ── Energy dataset (MCEC-Thai) ────────────────────────────────────────────
-
-ENERGY_CIRCUITS = [
-    "CT1", "CT2", "CT3", "CT4", "CT5",
-    "CT6", "CT7", "CT8", "CT9", "CT10",
-    "CT13", "CT17",
-]
-ENERGY_SENSORS = {
-    "power_kw":       {"col_suffix": "_kW",    "unit": "kW"},
-    "voltage":        {"col_suffix": "_V",     "unit": "V"},
-    "current":        {"col_suffix": "_A",     "unit": "A"},
-    "reactive_power": {"col_suffix": "_kVar+", "unit": "kVar"},
-    "power_factor":   {"col_suffix": "_PF",    "unit": "PF"},
-}
-
-
-def load_energy_dataset(max_timestamps: int | None = None) -> pd.DataFrame:
-    logger.info(f"Loading energy dataset from {ENERGY_CSV}")
-    df = pd.read_csv(ENERGY_CSV, low_memory=False)
-    df["Time"] = pd.to_datetime(df["Time"], format="mixed", dayfirst=False)
-    df = df.sort_values("Time").reset_index(drop=True)
-    if max_timestamps and len(df) > max_timestamps:
-        df = df.iloc[:max_timestamps]
-    logger.info(f"  Loaded {len(df)} timestamps, {df['Time'].min()} to {df['Time'].max()}")
-    return df
-
-
-def build_energy_streams(df, sensor_type="power_kw", window_minutes=5):
-    col_suffix = ENERGY_SENSORS[sensor_type]["col_suffix"]
-    circuit_cols = [f"{ct}{col_suffix}" for ct in ENERGY_CIRCUITS
-                    if f"{ct}{col_suffix}" in df.columns]
-    if not circuit_cols:
-        raise ValueError(f"No columns found for sensor type {sensor_type}")
-    for col in circuit_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.set_index("Time")
-    resampled = df[circuit_cols].resample(f"{window_minutes}min")
-    aggregates, pub_counts, all_values = [], [], []
-    for _, window_df in resampled:
-        if window_df.empty:
-            continue
-        means_per_circuit = window_df.mean()
-        active = means_per_circuit.dropna()
-        active = active[active != 0]
-        if len(active) > 0:
-            aggregates.append(float(active.mean()))
-            pub_counts.append(len(active))
-            all_values.extend(active.values)
-        else:
-            aggregates.append(0.0); pub_counts.append(0)
-    payload_bound = float(np.ptp(all_values)) if all_values else 1.0
-    if payload_bound == 0:
-        payload_bound = 1.0
-    logger.info(f"  Energy [{sensor_type}]: {len(aggregates)} windows, "
-                f"B={payload_bound:.4f}, avg pubs={np.mean(pub_counts):.1f}")
-    return aggregates, pub_counts, payload_bound
-
-
-def build_energy_per_publisher(df, sensor_type="power_kw", window_minutes=5):
-    col_suffix = ENERGY_SENSORS[sensor_type]["col_suffix"]
-    circuit_cols = {ct: f"{ct}{col_suffix}" for ct in ENERGY_CIRCUITS
-                    if f"{ct}{col_suffix}" in df.columns}
-    if not circuit_cols:
-        raise ValueError(f"No columns found for sensor type {sensor_type}")
-    for col in circuit_cols.values():
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.set_index("Time")
-    resampled = df[list(circuit_cols.values())].resample(f"{window_minutes}min")
-    per_pub: dict[str, list[float | None]] = {ct: [] for ct in circuit_cols}
-    all_values = []
-    for _, window_df in resampled:
-        if window_df.empty:
-            for ct in circuit_cols:
-                per_pub[ct].append(None)
-            continue
-        for ct, col in circuit_cols.items():
-            val = window_df[col].mean()
-            if pd.notna(val) and val != 0:
-                per_pub[ct].append(float(val)); all_values.append(float(val))
-            else:
-                per_pub[ct].append(None)
-    payload_bound = float(np.ptp(all_values)) if all_values else 1.0
-    if payload_bound == 0:
-        payload_bound = 1.0
-    return per_pub, payload_bound
-
-
-# ── Traffic dataset (Colorado Springs) ───────────────────────────────────
-
-def load_traffic_dataset(max_rows_per_file: int | None = None):
-    logger.info(f"Loading traffic dataset from {TRAFFIC_DIR}")
-    sensors = {}
-    for fname in sorted(os.listdir(TRAFFIC_DIR)):
-        if not fname.endswith(".csv") or fname == "PARAMS.csv":
-            continue
-        fpath = os.path.join(TRAFFIC_DIR, fname)
-        sensor_name = fname.replace(".csv", "")
-        df = pd.read_csv(fpath, low_memory=False)
-        df["Time"] = pd.to_datetime(df["Time"], format="mixed")
-        df = df.sort_values("Time").reset_index(drop=True)
-        if max_rows_per_file and len(df) > max_rows_per_file:
-            df = df.iloc[:max_rows_per_file]
-        sensors[sensor_name] = df
-        logger.info(f"  {sensor_name}: {len(df)} detections")
-    return sensors
-
-
-def build_traffic_streams(sensors, metric="speed", window_seconds=10):
-    all_times = []
-    for df in sensors.values():
-        all_times.extend(df["Time"].values)
-    t_min = pd.Timestamp(min(all_times))
-    t_max = pd.Timestamp(max(all_times))
-    freq = pd.Timedelta(seconds=window_seconds)
-    bins = pd.date_range(start=t_min, end=t_max + freq, freq=freq)
-    aggregates, pub_counts, all_values = [], [], []
-    for i in range(len(bins) - 1):
-        w_start, w_end = bins[i], bins[i + 1]
-        sensor_values = []
-        for sensor_name, df in sensors.items():
-            window_df = df[(df["Time"] >= w_start) & (df["Time"] < w_end)]
-            if window_df.empty:
-                continue
-            if metric == "object_count":
-                val = float(window_df["ObjectId"].nunique())
-            elif metric == "speed":
-                val = float(window_df["Speed"].mean())
-            elif metric == "position_x":
-                val = float(window_df["PositionX"].mean())
-            elif metric == "heading":
-                col = "HeadingDeg_DERIVED" if "HeadingDeg_DERIVED" in window_df.columns else "HeadingDeg"
-                if col not in window_df.columns:
-                    continue
-                val = float(window_df[col].mean())
-            else:
-                raise ValueError(f"Unknown traffic metric: {metric}")
-            if np.isfinite(val):
-                sensor_values.append(val)
-        if sensor_values:
-            aggregates.append(float(np.mean(sensor_values)))
-            pub_counts.append(len(sensor_values))
-            all_values.extend(sensor_values)
-        else:
-            aggregates.append(0.0); pub_counts.append(0)
-    payload_bound = float(np.ptp(all_values)) if all_values else 1.0
-    if payload_bound == 0:
-        payload_bound = 1.0
-    logger.info(f"  Traffic [{metric}]: {len(aggregates)} windows, "
-                f"B={payload_bound:.2f}, avg pubs={np.mean(pub_counts):.1f}")
-    return aggregates, pub_counts, payload_bound
-
-
-def build_traffic_per_publisher(sensors, metric="speed", window_seconds=10):
-    all_times = []
-    for df in sensors.values():
-        all_times.extend(df["Time"].values)
-    t_min = pd.Timestamp(min(all_times))
-    t_max = pd.Timestamp(max(all_times))
-    freq = pd.Timedelta(seconds=window_seconds)
-    bins = pd.date_range(start=t_min, end=t_max + freq, freq=freq)
-    per_pub: dict[str, list[float | None]] = {name: [] for name in sensors}
-    all_values = []
-    for i in range(len(bins) - 1):
-        w_start, w_end = bins[i], bins[i + 1]
-        for sensor_name, df in sensors.items():
-            window_df = df[(df["Time"] >= w_start) & (df["Time"] < w_end)]
-            if window_df.empty:
-                per_pub[sensor_name].append(None); continue
-            if metric == "object_count":
-                val = float(window_df["ObjectId"].nunique())
-            elif metric == "speed":
-                val = float(window_df["Speed"].mean())
-            elif metric == "position_x":
-                val = float(window_df["PositionX"].mean())
-            else:
-                per_pub[sensor_name].append(None); continue
-            if np.isfinite(val):
-                per_pub[sensor_name].append(val); all_values.append(val)
-            else:
-                per_pub[sensor_name].append(None)
-    payload_bound = float(np.ptp(all_values)) if all_values else 1.0
-    if payload_bound == 0:
-        payload_bound = 1.0
-    return per_pub, payload_bound
-
-
-# ── Wearable IoT Healthcare (Kaggle dcsavinod) ────────────────────────────
-
-WEARABLE_SENSORS = {
-    "heart_rate":      {"col": "Heart_Rate",      "unit": "bpm"},
-    "steps":           {"col": "Steps",           "unit": "count"},
-    "temperature":     {"col": "Temperature",     "unit": "C"},
-    "humidity":        {"col": "Humidity",        "unit": "%"},
-    "calories_burned": {"col": "Calories_Burned", "unit": "kcal"},
-}
-
-
-def load_wearable_dataset(max_rows: int | None = None):
-    logger.info(f"Loading wearable dataset from {WEARABLE_CSV}")
-    df = pd.read_csv(WEARABLE_CSV, low_memory=False)
-    df = df.sort_values(["Device_ID", "Timestamp"]).reset_index(drop=True)
-    df["tau"] = df.groupby("Device_ID").cumcount()
-    if max_rows and len(df) > max_rows:
-        df = df.iloc[:max_rows]
-    logger.info(f"  {len(df)} readings, {df['Device_ID'].nunique()} devices, "
-                f"{df['tau'].nunique()} logical timestamps")
-    return df
-
-
-def build_wearable_streams(df, sensor_type="heart_rate"):
-    if sensor_type not in WEARABLE_SENSORS:
-        raise ValueError(f"Unknown wearable sensor: {sensor_type}")
-    col = WEARABLE_SENSORS[sensor_type]["col"]
-    if col not in df.columns:
-        raise ValueError(f"Column {col} missing from wearable CSV")
-    collapsed = df.groupby(["tau", "Device_ID"])[col].mean().reset_index()
-    collapsed = collapsed[pd.to_numeric(collapsed[col], errors="coerce").notna()]
-    taus = sorted(collapsed["tau"].unique())
-    aggregates, pub_counts, all_values = [], [], []
-    for t in taus:
-        w = collapsed[collapsed["tau"] == t]
-        if w.empty:
-            aggregates.append(0.0); pub_counts.append(0); continue
-        aggregates.append(float(w[col].mean()))
-        pub_counts.append(int(w["Device_ID"].nunique()))
-        all_values.extend(w[col].tolist())
-    payload_bound = float(np.ptp(all_values)) if all_values else 1.0
-    if payload_bound == 0:
-        payload_bound = 1.0
-    logger.info(f"  Wearable [{sensor_type}]: {len(aggregates)} windows, "
-                f"B={payload_bound:.2f}, avg pubs={np.mean(pub_counts):.1f}")
-    return aggregates, pub_counts, payload_bound
-
-
-def build_wearable_per_publisher(df, sensor_type="heart_rate"):
-    col = WEARABLE_SENSORS[sensor_type]["col"]
-    collapsed = df.groupby(["tau", "Device_ID"])[col].mean().reset_index()
-    taus = sorted(collapsed["tau"].unique())
-    devices = sorted(df["Device_ID"].unique())
-    per_pub: dict[str, list[float | None]] = {d: [] for d in devices}
-    all_values = []
-    for t in taus:
-        w = collapsed[collapsed["tau"] == t].set_index("Device_ID")[col]
-        for d in devices:
-            v = w.get(d)
-            if v is not None and pd.notna(v):
-                per_pub[d].append(float(v)); all_values.append(float(v))
-            else:
-                per_pub[d].append(None)
-    payload_bound = float(np.ptp(all_values)) if all_values else 1.0
-    if payload_bound == 0:
-        payload_bound = 1.0
-    return per_pub, payload_bound
-
-
-# ── Pune Smart City (Kaggle akshman) ─────────────────────────────────────
-
-PUNE_SENSORS = {
-    "humidity":     {"cols": ["HUMIDITY"],                         "unit": "%"},
-    "temperature":  {"cols": ["TEMPRATURE_MAX", "TEMPRATURE_MIN"], "unit": "C"},
-    "pm10":         {"cols": ["PM10_MAX", "PM10_MIN"],             "unit": "ug/m3"},
-    "pm2":          {"cols": ["PM2_MAX", "PM2_MIN"],               "unit": "ug/m3"},
-    "ozone":        {"cols": ["OZONE_MAX", "OZONE_MIN"],           "unit": "ppb"},
-    "co2":          {"cols": ["CO2_MAX", "CO2_MIN"],               "unit": "ppm"},
-    "sound":        {"cols": ["SOUND"],                            "unit": "dB"},
-    "air_pressure": {"cols": ["AIR_PRESSURE"],                     "unit": "atm"},
-}
-
-
-def load_pune_dataset(max_rows: int | None = None):
-    logger.info(f"Loading Pune dataset from {PUNE_CSV}")
-    df = pd.read_csv(PUNE_CSV, low_memory=False)
-    df["Time"] = pd.to_datetime(df["LASTUPDATEDATETIME"], format="%d/%m/%y %H:%M", errors="coerce")
-    df = df.dropna(subset=["Time"]).sort_values("Time").reset_index(drop=True)
-    if max_rows and len(df) > max_rows:
-        df = df.iloc[:max_rows]
-    logger.info(f"  {len(df)} readings, {df['NAME'].nunique()} stations, "
-                f"{df['Time'].min()} to {df['Time'].max()}")
-    return df
-
-
-def _pune_metric_values(df, sensor_type):
-    cols = PUNE_SENSORS[sensor_type]["cols"]
-    present = [c for c in cols if c in df.columns]
-    if not present:
-        raise ValueError(f"Pune: no columns for sensor {sensor_type} ({cols})")
-    return df[present].apply(pd.to_numeric, errors="coerce").mean(axis=1)
-
-
-def build_pune_streams(df, sensor_type="pm10", window_minutes=60):
-    df = df.copy()
-    df["_v"] = _pune_metric_values(df, sensor_type)
-    df = df.dropna(subset=["_v"])
-    df["_bin"] = df["Time"].dt.floor(f"{window_minutes}min")
-    binned = df.groupby(["_bin", "NAME"])["_v"].mean().reset_index()
-    bins = sorted(binned["_bin"].unique())
-    aggregates, pub_counts, all_values = [], [], []
-    for b in bins:
-        w = binned[binned["_bin"] == b]
-        if w.empty:
-            aggregates.append(0.0); pub_counts.append(0); continue
-        aggregates.append(float(w["_v"].mean()))
-        pub_counts.append(int(w["NAME"].nunique()))
-        all_values.extend(w["_v"].tolist())
-    payload_bound = float(np.ptp(all_values)) if all_values else 1.0
-    if payload_bound == 0:
-        payload_bound = 1.0
-    logger.info(f"  Pune [{sensor_type}]: {len(aggregates)} windows "
-                f"({window_minutes}min), B={payload_bound:.2f}, "
-                f"avg pubs={np.mean(pub_counts):.1f}")
-    return aggregates, pub_counts, payload_bound
-
-
-def build_pune_per_publisher(df, sensor_type="pm10", window_minutes=60):
-    df = df.copy()
-    df["_v"] = _pune_metric_values(df, sensor_type)
-    df = df.dropna(subset=["_v"])
-    df["_bin"] = df["Time"].dt.floor(f"{window_minutes}min")
-    binned = df.groupby(["_bin", "NAME"])["_v"].mean().reset_index()
-    stations = sorted(df["NAME"].unique())
-    bins = sorted(binned["_bin"].unique())
-    per_pub: dict[str, list[float | None]] = {s: [] for s in stations}
-    all_values = []
-    for b in bins:
-        w = binned[binned["_bin"] == b].set_index("NAME")["_v"]
-        for s in stations:
-            v = w.get(s)
-            if v is not None and pd.notna(v):
-                per_pub[s].append(float(v)); all_values.append(float(v))
-            else:
-                per_pub[s].append(None)
-    payload_bound = float(np.ptp(all_values)) if all_values else 1.0
-    if payload_bound == 0:
-        payload_bound = 1.0
-    return per_pub, payload_bound
-
-
-# ── Smart Mobility (Kaggle ziya07) ────────────────────────────────────────
-
-MOBILITY_SENSORS = {
-    "vehicle_count":  {"col": "Vehicle_Count",         "unit": "count"},
-    "traffic_speed":  {"col": "Traffic_Speed_kmh",     "unit": "km/h"},
-    "road_occupancy": {"col": "Road_Occupancy_%",      "unit": "%"},
-    "emission":       {"col": "Emission_Levels_g_km",  "unit": "g/km"},
-    "energy":         {"col": "Energy_Consumption_L_h","unit": "L/h"},
-}
-MOBILITY_GRID = 4
-
-
-def load_mobility_dataset(max_rows: int | None = None):
-    logger.info(f"Loading mobility dataset from {MOBILITY_CSV}")
-    df = pd.read_csv(MOBILITY_CSV, low_memory=False)
-    df["Time"] = pd.to_datetime(df["Timestamp"], errors="coerce")
-    df = df.dropna(subset=["Time"]).sort_values("Time").reset_index(drop=True)
-    lat_bins = pd.qcut(df["Latitude"], MOBILITY_GRID, labels=False, duplicates="drop")
-    lon_bins = pd.qcut(df["Longitude"], MOBILITY_GRID, labels=False, duplicates="drop")
-    df["cell_id"] = (
-        "cell_" + lat_bins.astype("Int64").astype(str)
-        + "_" + lon_bins.astype("Int64").astype(str)
-    )
-    if max_rows and len(df) > max_rows:
-        df = df.iloc[:max_rows]
-    logger.info(f"  {len(df)} readings, {df['cell_id'].nunique()} virtual cells, "
-                f"{df['Time'].min()} to {df['Time'].max()}")
-    return df
-
-
-def build_mobility_streams(df, sensor_type="traffic_speed", window_minutes=30):
-    if sensor_type not in MOBILITY_SENSORS:
-        raise ValueError(f"Unknown mobility sensor: {sensor_type}")
-    col = MOBILITY_SENSORS[sensor_type]["col"]
-    if col not in df.columns:
-        raise ValueError(f"Column {col} missing from mobility CSV")
-    df = df.copy()
-    df["_v"] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["_v"])
-    df["_bin"] = df["Time"].dt.floor(f"{window_minutes}min")
-    binned = df.groupby(["_bin", "cell_id"])["_v"].mean().reset_index()
-    bins = sorted(binned["_bin"].unique())
-    aggregates, pub_counts, all_values = [], [], []
-    for b in bins:
-        w = binned[binned["_bin"] == b]
-        if w.empty:
-            aggregates.append(0.0); pub_counts.append(0); continue
-        aggregates.append(float(w["_v"].mean()))
-        pub_counts.append(int(w["cell_id"].nunique()))
-        all_values.extend(w["_v"].tolist())
-    payload_bound = float(np.ptp(all_values)) if all_values else 1.0
-    if payload_bound == 0:
-        payload_bound = 1.0
-    logger.info(f"  Mobility [{sensor_type}]: {len(aggregates)} windows "
-                f"({window_minutes}min), B={payload_bound:.2f}, "
-                f"avg pubs={np.mean(pub_counts):.1f}")
-    return aggregates, pub_counts, payload_bound
-
-
-def build_mobility_per_publisher(df, sensor_type="traffic_speed", window_minutes=30):
-    col = MOBILITY_SENSORS[sensor_type]["col"]
-    df = df.copy()
-    df["_v"] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["_v"])
-    df["_bin"] = df["Time"].dt.floor(f"{window_minutes}min")
-    binned = df.groupby(["_bin", "cell_id"])["_v"].mean().reset_index()
-    cells = sorted(df["cell_id"].unique())
-    bins = sorted(binned["_bin"].unique())
-    per_pub: dict[str, list[float | None]] = {c: [] for c in cells}
-    all_values = []
-    for b in bins:
-        w = binned[binned["_bin"] == b].set_index("cell_id")["_v"]
-        for c in cells:
-            v = w.get(c)
-            if v is not None and pd.notna(v):
-                per_pub[c].append(float(v)); all_values.append(float(v))
-            else:
-                per_pub[c].append(None)
-    payload_bound = float(np.ptp(all_values)) if all_values else 1.0
-    if payload_bound == 0:
-        payload_bound = 1.0
-    return per_pub, payload_bound
-
-
-# ── Smart Manufacturing (Kaggle programmer3) ──────────────────────────────
-
-MANUFACTURING_SENSORS = {
-    "temperature":   {"match": "Temperature",       "unit": "C"},
-    "machine_speed": {"match": "Machine Speed",     "unit": "RPM"},
-    "quality":       {"match": "Production Quality","unit": "score"},
-    "vibration":     {"match": "Vibration Level",   "unit": "mm/s"},
-    "energy":        {"match": "Energy Consumption","unit": "kWh"},
-}
-
-
-def _manufacturing_col(df, sensor_type):
-    needle = MANUFACTURING_SENSORS[sensor_type]["match"]
-    for c in df.columns:
-        if c.startswith(needle):
-            return c
-    raise ValueError(f"Manufacturing: no column matches {needle!r}")
-
-
-def load_manufacturing_dataset(max_rows: int | None = None):
-    logger.info(f"Loading manufacturing dataset from {MANUFACTURING_CSV}")
-    df = pd.read_csv(MANUFACTURING_CSV, low_memory=False)
-    df["Time"] = pd.to_datetime(df["Timestamp"], errors="coerce")
-    df = df.dropna(subset=["Time"]).sort_values("Time").reset_index(drop=True)
-    if max_rows and len(df) > max_rows:
-        df = df.iloc[:max_rows]
-    logger.info(f"  {len(df)} minute-rows, {df['Time'].min()} to {df['Time'].max()}")
-    return df
-
-
-def build_manufacturing_streams(df, sensor_type="temperature", window_minutes=10):
-    col = _manufacturing_col(df, sensor_type)
-    df = df.copy()
-    df["_v"] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["_v"])
-    df["_bin"] = df["Time"].dt.floor(f"{window_minutes}min")
-    df["_sub"] = df.groupby("_bin").cumcount().astype(str).radd("sub_")
-    bins = sorted(df["_bin"].unique())
-    aggregates, pub_counts, all_values = [], [], []
-    for b in bins:
-        w = df[df["_bin"] == b]
-        if w.empty:
-            aggregates.append(0.0); pub_counts.append(0); continue
-        aggregates.append(float(w["_v"].mean()))
-        pub_counts.append(int(w["_sub"].nunique()))
-        all_values.extend(w["_v"].tolist())
-    payload_bound = float(np.ptp(all_values)) if all_values else 1.0
-    if payload_bound == 0:
-        payload_bound = 1.0
-    logger.info(f"  Manufacturing [{sensor_type}]: {len(aggregates)} windows "
-                f"({window_minutes}min), B={payload_bound:.2f}, "
-                f"avg pubs={np.mean(pub_counts):.1f}")
-    return aggregates, pub_counts, payload_bound
-
-
-def build_manufacturing_per_publisher(df, sensor_type="temperature", window_minutes=10):
-    col = _manufacturing_col(df, sensor_type)
-    df = df.copy()
-    df["_v"] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["_v"])
-    df["_bin"] = df["Time"].dt.floor(f"{window_minutes}min")
-    df["_sub"] = df.groupby("_bin").cumcount().astype(str).radd("sub_")
-    subs = [f"sub_{i}" for i in range(window_minutes)]
-    bins = sorted(df["_bin"].unique())
-    per_pub: dict[str, list[float | None]] = {s: [] for s in subs}
-    all_values = []
-    for b in bins:
-        w = df[df["_bin"] == b].set_index("_sub")["_v"]
-        for s in subs:
-            v = w.get(s)
-            if v is not None and pd.notna(v):
-                per_pub[s].append(float(v)); all_values.append(float(v))
-            else:
-                per_pub[s].append(None)
-    payload_bound = float(np.ptp(all_values)) if all_values else 1.0
-    if payload_bound == 0:
-        payload_bound = 1.0
-    return per_pub, payload_bound
-
-
-# ═════════════════════════════════════════════════════════════════════════
-#  Dataset registry
-# ═════════════════════════════════════════════════════════════════════════
-
-DATASETS = {
-    "energy": {
-        "label": "Smart Building Energy (MCEC-Thai)",
-        "sensors": ["power_kw", "voltage", "current"],
-        "loader": load_energy_dataset,
-        "loader_row_arg": "max_timestamps",
-        "copy_load_per_sensor": True,
-        "build_streams": lambda d, s: build_energy_streams(d, s, window_minutes=5),
-        "build_per_pub": lambda d, s: build_energy_per_publisher(d, s, window_minutes=5),
-        # Option A operator-declared [a_p, b_p] from residential breaker datasheets.
-        "static_clamps": {
-            "power_kw": (0.0, 50.0),
-            "voltage": (180.0, 260.0),
-            "current": (0.0, 100.0),
-        },
-        # Public fallback M for Option B: loose physical ceiling used only as a
-        # data-independent bound on the Laplace noise of the clamp calibration.
-        "fallback_M": {"power_kw": 100.0, "voltage": 300.0, "current": 200.0},
-        # Normative MQTT topic hierarchy: energy/{site}/{circuit}/{metric}.
-        "topic_root": "energy/building01",
-        "publisher_topic": lambda pub_id, sensor: f"energy/building01/{pub_id}/{sensor}",
-        "subscriber_filters": [
-            "energy/building01/#",           # whole-building dashboard
-            "energy/building01/+/power_kw",  # load monitor across circuits
-            "energy/building01/CT1/#",       # single circuit (main service)
-        ],
-    },
-    "traffic": {
-        "label": "Smart City Intersection (Colorado Springs)",
-        "sensors": ["speed", "object_count"],
-        "loader": load_traffic_dataset,
-        "loader_row_arg": "max_rows_per_file",
-        "copy_load_per_sensor": False,
-        "build_streams": lambda d, s: build_traffic_streams(d, s, window_seconds=10),
-        "build_per_pub": lambda d, s: build_traffic_per_publisher(d, s, window_seconds=10),
-        "static_clamps": {
-            "speed":        (0.0, 50.0),
-            "object_count": (0.0, 50.0),
-        },
-        "fallback_M": {"speed": 100.0, "object_count": 100.0},
-        # Hierarchy: traffic/{intersection}/{sensor-class}/{sensor-id}/{metric}.
-        "topic_root": "traffic/intersection01",
-        "publisher_topic": lambda pub_id, sensor: (
-            f"traffic/intersection01/{'radar' if 'RADAR' in pub_id else 'lidar'}/"
-            f"{pub_id}/{sensor}"
-        ),
-        "subscriber_filters": [
-            "traffic/intersection01/#",                       # city ops dashboard
-            "traffic/intersection01/+/+/speed",               # speed across sensors
-            "traffic/intersection01/radar/#",                 # radar-only analytics
-            "traffic/intersection01/+/EVO_RADAR_1/#",         # one sensor's full feed
-        ],
-    },
-    "wearable": {
-        "label": "Wearable IoT Healthcare (Kaggle dcsavinod)",
-        "sensors": ["heart_rate", "steps", "temperature", "calories_burned"],
-        "loader": load_wearable_dataset,
-        "loader_row_arg": "max_rows",
-        "copy_load_per_sensor": False,
-        "build_streams": lambda d, s: build_wearable_streams(d, s),
-        "build_per_pub": lambda d, s: build_wearable_per_publisher(d, s),
-        "static_clamps": {
-            "heart_rate":      (30.0, 220.0),
-            "steps":           (0.0, 5000.0),
-            "temperature":     (15.0, 45.0),
-            "calories_burned": (0.0, 50.0),
-        },
-        "fallback_M": {
-            "heart_rate": 250.0, "steps": 10000.0,
-            "temperature": 60.0, "calories_burned": 100.0,
-        },
-        # Hierarchy: health/{site}/{device}/{metric}.
-        "topic_root": "health/clinic01",
-        "publisher_topic": lambda pub_id, sensor: f"health/clinic01/{pub_id}/{sensor}",
-        "subscriber_filters": [
-            "health/clinic01/#",                 # hospital-wide RPM dashboard
-            "health/clinic01/+/heart_rate",      # cardiac alerts across all patients
-            "health/clinic01/Device_5/#",        # one patient's full telemetry
-            "health/clinic01/+/steps",           # activity analytics
-        ],
-    },
-    "pune": {
-        "label": "Pune Smart City Air Quality (Kaggle akshman)",
-        "sensors": ["pm10", "pm2", "humidity", "sound", "ozone"],
-        "loader": load_pune_dataset,
-        "loader_row_arg": "max_rows",
-        "copy_load_per_sensor": False,
-        "build_streams": lambda d, s: build_pune_streams(d, s, window_minutes=60),
-        "build_per_pub": lambda d, s: build_pune_per_publisher(d, s, window_minutes=60),
-        "static_clamps": {
-            "pm10":     (0.0, 1000.0),
-            "pm2":      (0.0, 500.0),
-            "humidity": (0.0, 100.0),
-            "sound":    (20.0, 140.0),
-            "ozone":    (0.0, 500.0),
-        },
-        "fallback_M": {
-            "pm10": 2000.0, "pm2": 1000.0, "humidity": 100.0,
-            "sound": 200.0, "ozone": 1000.0,
-        },
-        # Hierarchy: air_quality/{city}/{station}/{pollutant}.  Station names in
-        # the CSV carry spaces/underscores; we slugify them in the topic.
-        "topic_root": "air_quality/pune",
-        "publisher_topic": lambda pub_id, sensor: (
-            f"air_quality/pune/{pub_id.replace(' ', '_')}/{sensor}"
-        ),
-        "subscriber_filters": [
-            "air_quality/pune/#",                  # municipal dashboard
-            "air_quality/pune/+/pm10",             # city-wide PM10 alerts
-            "air_quality/pune/Hadapsar_Gadital_01/#",  # one station's feed
-        ],
-    },
-    "mobility": {
-        "label": "Smart Mobility Traffic (Kaggle ziya07)",
-        "sensors": ["traffic_speed", "vehicle_count", "road_occupancy", "emission"],
-        "loader": load_mobility_dataset,
-        "loader_row_arg": "max_rows",
-        "copy_load_per_sensor": False,
-        "build_streams": lambda d, s: build_mobility_streams(d, s, window_minutes=30),
-        "build_per_pub": lambda d, s: build_mobility_per_publisher(d, s, window_minutes=30),
-        "static_clamps": {
-            "traffic_speed":  (0.0, 120.0),
-            "vehicle_count":  (0.0, 500.0),
-            "road_occupancy": (0.0, 100.0),
-            "emission":       (0.0, 800.0),
-        },
-        "fallback_M": {
-            "traffic_speed": 200.0, "vehicle_count": 1000.0,
-            "road_occupancy": 100.0, "emission": 2000.0,
-        },
-        # Hierarchy: mobility/{city}/{zone}/{cell}/{metric}.  zone is the
-        # coarse quadrant (NW/NE/SW/SE) and cell is the 4x4 grid label.
-        "topic_root": "mobility/nyc",
-        "publisher_topic": lambda pub_id, sensor: (
-            # pub_id = "cell_<lat>_<lon>".  Map lat 0/1 -> south, 2/3 -> north
-            # and lon 0/1 -> west, 2/3 -> east for a coarser 2-level scope.
-            f"mobility/nyc/"
-            f"{'N' if int(pub_id.split('_')[1]) >= 2 else 'S'}"
-            f"{'E' if int(pub_id.split('_')[2]) >= 2 else 'W'}/"
-            f"{pub_id}/{sensor}"
-        ),
-        "subscriber_filters": [
-            "mobility/nyc/#",                        # city-wide flow
-            "mobility/nyc/+/+/traffic_speed",        # speed everywhere
-            "mobility/nyc/NE/#",                     # one quadrant
-            "mobility/nyc/+/+/emission",             # environmental reporting
-        ],
-    },
-    "manufacturing": {
-        "label": "Smart Manufacturing Process (Kaggle programmer3)",
-        "sensors": ["temperature", "machine_speed", "quality", "vibration", "energy"],
-        "loader": load_manufacturing_dataset,
-        "loader_row_arg": "max_rows",
-        "copy_load_per_sensor": False,
-        "build_streams": lambda d, s: build_manufacturing_streams(d, s, window_minutes=10),
-        "build_per_pub": lambda d, s: build_manufacturing_per_publisher(d, s, window_minutes=10),
-        "static_clamps": {
-            "temperature":   (0.0, 200.0),
-            "machine_speed": (0.0, 5000.0),
-            "quality":       (0.0, 10.0),
-            "vibration":     (0.0, 1.0),
-            "energy":        (0.0, 10.0),
-        },
-        "fallback_M": {
-            "temperature": 500.0, "machine_speed": 10000.0,
-            "quality": 20.0, "vibration": 5.0, "energy": 50.0,
-        },
-        # Hierarchy: factory/{line}/{machine}/{sensor}.  The source dataset
-        # is a single machine, so we map the sub_i sub-publishers to distinct
-        # virtual machines m01..m10 on the same line.
-        "topic_root": "factory/line1",
-        "publisher_topic": lambda pub_id, sensor: (
-            f"factory/line1/{pub_id.replace('sub_', 'machine')}/{sensor}"
-        ),
-        "subscriber_filters": [
-            "factory/line1/#",                      # line-level dashboard
-            "factory/line1/+/vibration",            # predictive-maintenance
-            "factory/line1/machine01/#",            # single-machine feed
-            "factory/line1/+/quality",              # QC rollup
-        ],
-    },
-}
-
-
-def load_dataset_object(name: str, max_rows: int | None = None):
-    spec = DATASETS[name]
-    kwargs = {}
-    if max_rows is not None and spec["loader_row_arg"]:
-        kwargs[spec["loader_row_arg"]] = max_rows
-    return spec["loader"](**kwargs)
-
-
-def build_sensor_streams(name: str, obj, sensors: list[str] | None = None):
-    spec = DATASETS[name]
-    sensors = sensors or spec["sensors"]
-    streams, per_pubs = {}, {}
-    for sensor in sensors:
-        arg = obj.copy() if spec["copy_load_per_sensor"] else obj
-        try:
-            agg, pub, B = spec["build_streams"](arg, sensor)
-            if len(agg) > 10 and B > 0.01:
-                streams[sensor] = (agg, pub, B)
-        except Exception as e:
-            logger.warning(f"  Skipping {name}/{sensor} (streams): {e}")
-        try:
-            arg2 = obj.copy() if spec["copy_load_per_sensor"] else obj
-            pp, Bpp = spec["build_per_pub"](arg2, sensor)
-            per_pubs[sensor] = (pp, Bpp)
-        except Exception as e:
-            logger.warning(f"  Skipping {name}/{sensor} (per-pub): {e}")
-    return streams, per_pubs
-
-
-def build_topic_manifest(name: str, per_pubs: dict) -> pd.DataFrame:
-    """Render the full topic hierarchy for this dataset as a concrete table.
-
-    Each row is one publisher × sensor → topic mapping.  The operator can
-    read this CSV to see every MQTT topic the mechanism will publish on.
-    """
-    spec = DATASETS[name]
-    topic_of = spec.get("publisher_topic")
-    if topic_of is None:
-        return pd.DataFrame()
-    rows = []
-    for sensor, (pp, _B) in per_pubs.items():
-        for pub_id in pp.keys():
-            try:
-                topic = topic_of(pub_id, sensor)
-            except Exception:
-                topic = f"{spec.get('topic_root','unknown')}/{pub_id}/{sensor}"
-            rows.append({
-                "dataset": name,
-                "publisher_id": pub_id,
-                "sensor": sensor,
-                "raw_topic": topic,
-                "protected_topic": topic.replace(spec.get("topic_root", ""), "").lstrip("/"),
-            })
-    return pd.DataFrame(rows)
-
-
-# ═════════════════════════════════════════════════════════════════════════
-#  Clamp modes (Definition 3.2): Option A static + Option B DP-released
-# ═════════════════════════════════════════════════════════════════════════
-#
-# Option A ("static"): operator-declared [a_p, b_p] from datasheets / schema.
-#   No budget charged; clamp is a public constant.
-# Option B ("dp_released"): per-publisher min/max released under Laplace
-#   noise scaled by a public fallback M and a separate budget eps_clip.
-#   After release the noisy (a_hat, b_hat) are treated as public constants
-#   (DP post-processing), and the clamp is applied to every payload.  Total
-#   DP cost composes to eps + eps_clip; the effective per-release budget
-#   that enters the w-event accounting is (eps - eps_clip) when we subtract.
-
-def _clamp_static(per_pub, static_range):
-    lo, hi = static_range
-    out = {}
-    for p, series in per_pub.items():
-        out[p] = [min(max(v, lo), hi) if v is not None else None for v in series]
-    R = float(hi - lo)
-    meta = {"mode": "static", "a_global": float(lo), "b_global": float(hi),
-            "R": R, "eps_clip": 0.0}
-    return out, R, meta
-
-
-def _clamp_dp_released(per_pub, fallback_M, eps_clip, seed=0):
-    """Option B: per-publisher DP-released min/max with Laplace(M/eps_clip)."""
-    rng = np.random.default_rng(seed)
-    M = float(fallback_M)
-    out = {}
-    per_pub_clamps = {}
-    max_width = 0.0
-    for p, series in per_pub.items():
-        vals = [v for v in series if v is not None]
-        if not vals:
-            out[p] = series
-            per_pub_clamps[p] = (-M, M)
-            max_width = max(max_width, 2 * M)
-            continue
-        true_min = float(min(vals)); true_max = float(max(vals))
-        a_hat = true_min + rng.laplace(scale=M / eps_clip)
-        b_hat = true_max + rng.laplace(scale=M / eps_clip)
-        a_hat = max(-M, min(a_hat, M))
-        b_hat = max(a_hat, min(b_hat, M))
-        per_pub_clamps[p] = (a_hat, b_hat)
-        max_width = max(max_width, b_hat - a_hat)
-        out[p] = [min(max(v, a_hat), b_hat) if v is not None else None for v in series]
-    meta = {"mode": "dp_released", "M": M, "eps_clip": float(eps_clip),
-            "per_pub_clamps": per_pub_clamps, "R": float(max_width)}
-    return out, float(max_width), meta
-
-
-def apply_clamp_option(
-    per_pub: dict[str, list[float | None]],
-    sensor_type: str,
-    dataset_spec: dict,
-    mode: str,
-    eps_clip: float = 0.1,
-    seed: int = 0,
-) -> tuple[dict, float, dict]:
-    """Apply the operator's clamp choice from Definition 3.2."""
-    if mode == "static":
-        static = dataset_spec["static_clamps"].get(sensor_type)
-        if static is None:
-            raise ValueError(f"No static clamp configured for {sensor_type}")
-        return _clamp_static(per_pub, static)
-    if mode == "dp_released":
-        M = dataset_spec["fallback_M"].get(sensor_type)
-        if M is None:
-            raise ValueError(f"No fallback_M configured for {sensor_type}")
-        return _clamp_dp_released(per_pub, M, eps_clip, seed=seed)
-    raise ValueError(f"Unknown clamp mode: {mode}")
-
-
-def _aggregate_from_per_pub(per_pub: dict[str, list[float | None]]):
-    """Re-derive (aggregates, pub_counts) from a per-publisher table.
-
-    Used after applying clamp options so the downstream sweep sees the clamped
-    values rather than the raw ones.
-    """
-    T = len(next(iter(per_pub.values())))
-    agg, cnt = [], []
-    for tau in range(T):
-        vals = [per_pub[p][tau] for p in per_pub if per_pub[p][tau] is not None]
-        agg.append(float(np.mean(vals)) if vals else 0.0)
-        cnt.append(len(vals))
-    return agg, cnt
+# Dataset loading, stream construction, and the clamp options of
+# Definition 3.2 all live in ``data_streams.py``.  See the imports above.
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1349,28 +518,33 @@ def dynamic_interval_experiment(
         merged_cnt: list[int] = []
         merged_wait: list[int] = []    # how many base intervals elapsed
         pending_vals: list[float] = []
+        pending_pubs: set[str] = set()
         pending_waits = 0
 
+        def flush():
+            if pending_vals:
+                merged_agg.append(float(np.mean(pending_vals)))
+            else:
+                merged_agg.append(0.0)
+            merged_cnt.append(len(pending_pubs))
+            merged_wait.append(pending_waits)
+
         for tau in range(T):
-            active = [per_pub[p][tau] for p in per_pub if per_pub[p][tau] is not None]
-            pending_vals.extend(active)
+            for p, series in per_pub.items():
+                v = series[tau]
+                if v is not None:
+                    pending_vals.append(v)
+                    pending_pubs.add(p)
             pending_waits += 1
 
-            if len(set(range(len(pending_vals)))) >= P or pending_waits > k_ext:
-                if pending_vals:
-                    merged_agg.append(float(np.mean(pending_vals)))
-                    merged_cnt.append(len(pending_vals))
-                else:
-                    merged_agg.append(0.0)
-                    merged_cnt.append(0)
-                merged_wait.append(pending_waits)
+            if len(pending_pubs) >= P or pending_waits > k_ext:
+                flush()
                 pending_vals = []
+                pending_pubs = set()
                 pending_waits = 0
 
         if pending_vals:
-            merged_agg.append(float(np.mean(pending_vals)))
-            merged_cnt.append(len(pending_vals))
-            merged_wait.append(pending_waits)
+            flush()
 
         res = run_dp_on_stream(
             merged_agg, merged_cnt, epsilon=epsilon, window_size=w,
@@ -1506,18 +680,6 @@ def _rebuild_stream_with_dt(
         # any message during the block, matching P_tau in the paper.
         cnt.append(len(contrib_pubs))
     return agg, cnt
-
-
-def _pareto_front(nmae: np.ndarray, latency: np.ndarray) -> np.ndarray:
-    pts = list(zip(nmae, latency))
-    is_pareto = []
-    for i, (u_i, l_i) in enumerate(pts):
-        dominated = any(
-            (u_j <= u_i and l_j <= l_i) and (u_j < u_i or l_j < l_i)
-            for j, (u_j, l_j) in enumerate(pts) if j != i
-        )
-        is_pareto.append(not dominated)
-    return np.array(is_pareto)
 
 
 def _evaluate_P(
@@ -1935,6 +1097,7 @@ def figure1_reproduction(
 
 INTRO_EPSILON = 1.0
 INTRO_W = 8
+INTRO_N_TRIALS = 20   # seed average for Figure 1 (Laplace noise is high-variance)
 
 
 def _apply_dp(aggregates, pub_counts, epsilon, w, min_publishers,
@@ -2184,9 +1347,6 @@ def kl_extremes_vs_ours(sensor_streams, per_pub_all, P_our,
     return results
 
 
-INTRO_N_TRIALS = 20   # seed average for Figure 1 (Laplace noise is high-variance)
-
-
 def _kl_of(true_vals, noisy_vals):
     tc = [v for v in true_vals if v is not None]
     nc = [v for v in noisy_vals if v is not None]
@@ -2388,39 +1548,6 @@ def _dataset_dirs(output_dir: str, name: str, clamp_mode: str) -> dict:
     return dirs
 
 
-def _reclamp_streams_and_pubs(
-    streams, per_pubs, dataset_spec, clamp_mode, eps_clip, seed=0,
-):
-    """
-    Apply Definition 3.2 Option A/B to every sensor in a dataset.
-
-    For each sensor:
-      1. apply_clamp_option() yields clamped per_pub + updated payload_bound R.
-      2. re-derive (aggregates, pub_counts) from the clamped per_pub so the
-         downstream sweep sees the clamped values, not the raw ones.
-
-    Returns (clamped_streams, clamped_per_pubs, clamp_meta_per_sensor).
-    """
-    clamped_streams: dict = {}
-    clamped_per_pubs: dict = {}
-    meta_per_sensor: dict = {}
-    for sensor, (pp, _B_raw) in per_pubs.items():
-        try:
-            new_pp, R, meta = apply_clamp_option(
-                pp, sensor, dataset_spec, clamp_mode,
-                eps_clip=eps_clip, seed=seed + hash(sensor) % 10000,
-            )
-        except ValueError as e:
-            logger.warning(f"    clamp {clamp_mode} failed for {sensor}: {e}")
-            continue
-        meta_per_sensor[sensor] = meta
-        clamped_per_pubs[sensor] = (new_pp, R)
-        new_agg, new_cnt = _aggregate_from_per_pub(new_pp)
-        if len(new_agg) > 10 and R > 0.0:
-            clamped_streams[sensor] = (new_agg, new_cnt, R)
-    return clamped_streams, clamped_per_pubs, meta_per_sensor
-
-
 def run_dataset(
     name: str,
     s_values, eps_values, w_values, strategies, output_dir, args,
@@ -2436,16 +1563,20 @@ def run_dataset(
     logger.info(f"{name.upper()} / clamp_mode={clamp_mode} :: {spec['label']}")
     logger.info("=" * 72)
 
-    obj = load_dataset_object(name, max_rows=_dataset_max_rows(name, args))
-    raw_streams, raw_per_pubs = build_sensor_streams(name, obj)
-    if not raw_streams:
-        logger.error(f"No valid {name} streams; skipping."); return {}
-
-    streams, per_pubs, clamp_meta = _reclamp_streams_and_pubs(
-        raw_streams, raw_per_pubs, spec, clamp_mode, args.eps_clip, seed=args.seed,
+    prepared = prepare_dataset(
+        name,
+        clamp_mode=clamp_mode,
+        eps_clip=args.eps_clip,
+        seed=args.seed,
+        max_rows=_dataset_max_rows(name, args),
     )
-    if not streams:
+    if prepared is None:
+        return {}
+    if not prepared.raw_streams:
+        logger.error(f"No valid {name} streams; skipping."); return {}
+    if prepared.is_empty:
         logger.error(f"No valid {name} streams after {clamp_mode} clamping"); return {}
+    streams, per_pubs, clamp_meta = prepared.streams, prepared.per_pubs, prepared.clamp_meta
 
     # Log the clamp decisions so a reader can audit R per sensor.
     logger.info(f"  clamp[{clamp_mode}] R per sensor:")
@@ -2647,23 +1778,19 @@ EXPERIMENT_C_EPS_VALUES = [0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
 
 
 def _iter_clamped_per_sensor(datasets, clamp_mode, eps_clip, seed, args):
-    """Yield (ds_name, sensor, pp, B, R, streams_agg_cnt) per sensor of each dataset."""
+    """Yield (ds_name, sensor, pp, R, (agg, cnt)) for every sensor of each dataset."""
     for ds_name in datasets:
-        spec = DATASETS[ds_name]
-        try:
-            obj = load_dataset_object(ds_name, max_rows=_dataset_max_rows(ds_name, args))
-        except FileNotFoundError as e:
-            logger.warning(f"Skipping {ds_name}: {e}")
-            continue
-        raw_streams, raw_per_pubs = build_sensor_streams(ds_name, obj)
-        if not raw_per_pubs:
-            continue
-        streams, per_pubs, _ = _reclamp_streams_and_pubs(
-            raw_streams, raw_per_pubs, spec, clamp_mode, eps_clip, seed=seed,
+        prepared = prepare_dataset(
+            ds_name,
+            clamp_mode=clamp_mode,
+            eps_clip=eps_clip,
+            seed=seed,
+            max_rows=_dataset_max_rows(ds_name, args),
         )
-        for sensor in streams:
-            agg, cnt, R = streams[sensor]
-            pp = per_pubs[sensor][0]
+        if prepared is None or not prepared.raw_per_pubs:
+            continue
+        for sensor, (agg, cnt, R) in prepared.streams.items():
+            pp = prepared.per_pubs[sensor][0]
             yield ds_name, sensor, pp, R, (agg, cnt)
 
 
@@ -2696,11 +1823,15 @@ def experiment_A_greedy_vs_brute(
                     "dataset": ds_name, "sensor": sensor, "strategy": strat,
                     "clamp_mode": clamp_mode,
                     "epsilon": eps, "w": w, "p_max": p_max,
+                    "payload_bound": R,
+                    "alpha": args.alpha,
+                    "I_max": args.I_max,
                     "greedy_P": int(g_best["P"]),
                     "greedy_loss": float(g_best["tuning_loss"]),
                     "greedy_nmae": g_best["normalized_mae"],
                     "greedy_kl": g_best["kl_divergence"],
                     "greedy_release_rate": g_best["release_rate"],
+                    "greedy_attribution_advantage": g_best["attribution_advantage"],
                     "greedy_evaluations": g["evaluations"],
                     "greedy_seed_P": g["seed_P"],
                     "brute_P": int(b_best["P"]),
@@ -2708,6 +1839,7 @@ def experiment_A_greedy_vs_brute(
                     "brute_nmae": b_best["normalized_mae"],
                     "brute_kl": b_best["kl_divergence"],
                     "brute_release_rate": b_best["release_rate"],
+                    "brute_attribution_advantage": b_best["attribution_advantage"],
                     "brute_evaluations": int(p_max),
                     "gap_loss": float(g_best["tuning_loss"] - b_best["tuning_loss"]),
                     "gap_P": int(g_best["P"] - b_best["P"]),
@@ -2768,16 +1900,32 @@ def experiment_B_vary_w(
                     strategy=combo["strategy"], seed=77,
                 )
                 m = res["metrics"]
+                # Restrict avg_n_tau to eligible timestamps (n_tau > 0), matching
+                # the paper's theoretical Laplace-scale derivation.
+                elig_n = [n for n in cnt if n > 0]
+                avg_n = float(np.mean(elig_n)) if elig_n else 0.0
+                # Paper Thm 5.1 + Uniform allocation: lambda = R * w / (n * eps);
+                # expected NMAE = E|Lap(lambda)| / R = lambda / R = w / (n * eps).
+                pred_lambda = R * w / (avg_n * combo["epsilon"]) if avg_n > 0 else float("nan")
+                pred_nmae = w / (avg_n * combo["epsilon"]) if avg_n > 0 else float("nan")
                 rows.append({
                     "dataset": ds_name, "sensor": sensor,
                     "clamp_mode": clamp_mode,
                     "strategy": combo["strategy"], "P": combo["P"],
                     "epsilon": combo["epsilon"], "w": w,
+                    "payload_bound": R,
                     "normalized_mae": m["normalized_mae"],
+                    "predicted_nmae_uniform": pred_nmae,
+                    "predicted_laplace_scale": pred_lambda,
                     "kl_divergence": m["kl_divergence"],
                     "release_rate": m["release_rate"],
                     "attribution_advantage": m["attribution_advantage"],
+                    "avg_n_tau_eligible": avg_n,
                     "avg_n_tau": float(np.mean(cnt)) if cnt else 0.0,
+                    "mae": m["mae"],
+                    "deferrals": m["deferrals"],
+                    "num_timestamps": len(agg),
+                    "seed": 77,
                 })
     df = pd.DataFrame(rows)
     exp_dir = os.path.join(output_dir, "experiments", "B_vary_w")
@@ -2811,16 +1959,31 @@ def experiment_C_vary_epsilon(
                     strategy=combo["strategy"], seed=77,
                 )
                 m = res["metrics"]
+                elig_n = [n for n in cnt if n > 0]
+                avg_n = float(np.mean(elig_n)) if elig_n else 0.0
+                # Paper Thm 5.1 + Uniform allocation: lambda = R * w / (n * eps);
+                # expected NMAE = lambda / R = w / (n * eps). Halving lambda
+                # when eps doubles is the paper's inverse-in-eps hypothesis.
+                pred_lambda = (R * combo["w"] / (avg_n * eps)) if avg_n > 0 else float("nan")
+                pred_nmae = (combo["w"] / (avg_n * eps)) if avg_n > 0 else float("nan")
                 rows.append({
                     "dataset": ds_name, "sensor": sensor,
                     "clamp_mode": clamp_mode,
                     "strategy": combo["strategy"], "P": combo["P"],
                     "w": combo["w"], "epsilon": eps,
+                    "payload_bound": R,
                     "normalized_mae": m["normalized_mae"],
+                    "predicted_nmae_uniform": pred_nmae,
+                    "predicted_laplace_scale": pred_lambda,
                     "kl_divergence": m["kl_divergence"],
                     "release_rate": m["release_rate"],
                     "attribution_advantage": m["attribution_advantage"],
+                    "avg_n_tau_eligible": avg_n,
                     "avg_n_tau": float(np.mean(cnt)) if cnt else 0.0,
+                    "mae": m["mae"],
+                    "deferrals": m["deferrals"],
+                    "num_timestamps": len(agg),
+                    "seed": 77,
                 })
     df = pd.DataFrame(rows)
     exp_dir = os.path.join(output_dir, "experiments", "C_vary_epsilon")
@@ -2835,6 +1998,348 @@ def experiment_C_vary_epsilon(
         logx=True,
     )
     return df
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  Experiment D: plugin end-to-end via _on_message (in-process, stubbed MQTT)
+# ═════════════════════════════════════════════════════════════════════════
+#
+# Drives the broker-side `PrivacyPlugin` without an actual MQTT broker:
+#   1. Swaps `plugin._client` with a stub that captures publishes.
+#   2. Monkey-patches `plugin.time.time` so interval timing is deterministic.
+#   3. For every logical timestamp tau, calls `_on_message` once per active
+#      publisher (clamp + buffer) and then `_flush_and_release` (DP release).
+# Two scenarios per dataset:
+#   - pooled    : every publisher on a shared leaf topic; no scope walk, single
+#                 StreamState.  Under the same seed the plugin's released
+#                 values must match `run_dp_on_stream` byte-for-byte, which
+#                 verifies the DP math on the plugin path.
+#   - hierarchy : per-publisher leaves under the dataset's normative topic
+#                 tree; P>1 forces Algorithm 1 walk-ups on every release.
+#                 Verifies the scope walk fires, walked t_start is wall-clock,
+#                 and no release happens with n_tau < P.
+
+from plugin import PrivacyPlugin  # noqa: E402  (imported here to keep the
+                                   # main pipeline import-light; plugin pulls in paho)
+
+
+class _MockMQTTClient:
+    """Stub for paho.mqtt.client.Client used by Experiment D."""
+
+    def __init__(self):
+        self.published: list[dict] = []
+        self.subscribed: list[str] = []
+
+    def connect(self, *_a, **_kw): pass
+    def disconnect(self, *_a, **_kw): pass
+    def loop_start(self, *_a, **_kw): pass
+    def loop_stop(self, *_a, **_kw): pass
+
+    def subscribe(self, topic):
+        self.subscribed.append(topic)
+
+    def publish(self, topic, payload):
+        data = json.loads(payload) if isinstance(payload, (str, bytes)) else dict(payload)
+        self.published.append({"topic": topic, **data})
+
+
+class _FakeMsg:
+    """Minimal paho MQTTMessage stand-in; plugin uses `.topic` and `.payload`."""
+
+    __slots__ = ("topic", "payload")
+
+    def __init__(self, topic: str, payload: bytes):
+        self.topic = topic
+        self.payload = payload
+
+
+def _drive_plugin_scenario(
+    per_pub: dict[str, list[float | None]],
+    sensor: str,
+    dataset_spec: dict,
+    scenario: str,
+    *,
+    epsilon: float,
+    w: int,
+    P: int,
+    delta_t: float,
+    n_steps: int,
+    seed: int,
+):
+    """Feed a per-publisher trace into a PrivacyPlugin; return the plugin, the
+    mock client, and the per-tau true-aggregate log for post-hoc comparison.
+    """
+    import plugin as _plug  # local for monkey-patching
+
+    if scenario not in ("pooled", "hierarchy"):
+        raise ValueError(f"unknown scenario: {scenario}")
+
+    root = dataset_spec.get("topic_root") or f"{scenario}/ds"
+    lo, hi = dataset_spec["static_clamps"][sensor]
+
+    if scenario == "pooled":
+        # All publishers emit on one shared leaf; plugin pools them there.
+        def _leaf_of(_pub_id: str) -> str:
+            return f"{root}/{sensor}"
+        plugin_P = 1  # never triggers walk
+    else:
+        topic_of = dataset_spec["publisher_topic"]
+        def _leaf_of(pub_id: str) -> str:
+            return topic_of(pub_id, sensor)
+        plugin_P = max(2, P)  # force walk-up (each leaf has n=1)
+
+    # p_gated_uniform so the plugin's gate + Algorithm 1 walk logic actually
+    # fires in the hierarchy scenario.  For pooled (plugin_P=1) the gate is a
+    # no-op and the allocation dispatches to plain Uniform, so offline
+    # comparison against strategy="uniform" still matches byte-for-byte.
+    plugin = PrivacyPlugin(
+        raw_prefix="raw",
+        protected_prefix="protected",
+        epsilon=epsilon,
+        window_size=w,
+        min_publishers=plugin_P,
+        strategy="p_gated_uniform",
+        timestamp_interval=delta_t,
+        k_ext=0,
+        sensor_bounds={sensor: (lo, hi)},
+    )
+    mock = _MockMQTTClient()
+    plugin._client = mock
+
+    # Deterministic clock.
+    clock = [0.0]
+    orig_time = _plug.time.time
+    _plug.time.time = lambda: clock[0]
+
+    tau_log: list[dict] = []
+    try:
+        np.random.seed(seed)
+        publishers = list(per_pub.keys())
+        T = min(n_steps, len(per_pub[publishers[0]]))
+
+        for tau in range(T):
+            clock[0] = tau * delta_t
+            for pub_id in publishers:
+                v = per_pub[pub_id][tau]
+                if v is None:
+                    continue
+                topic = f"raw/{_leaf_of(pub_id)}"
+                payload = json.dumps({"publisher_id": str(pub_id),
+                                      "value": float(v)}).encode("utf-8")
+                plugin._on_message(None, None, _FakeMsg(topic, payload))
+            clock[0] = (tau + 1) * delta_t
+            plugin._flush_and_release()
+
+            # True clamped aggregate for this tau (comparison only).
+            active = [min(max(per_pub[p][tau], lo), hi)
+                      for p in publishers if per_pub[p][tau] is not None]
+            tau_log.append({
+                "tau": tau,
+                "true_clamped_mean": float(np.mean(active)) if active else 0.0,
+                "n_active": len(active),
+                "t_start_expected": tau * delta_t,
+            })
+    finally:
+        _plug.time.time = orig_time
+
+    return {"plugin": plugin, "mock": mock, "tau_log": tau_log, "plugin_P": plugin_P}
+
+
+def experiment_D_plugin_path(
+    datasets,
+    clamp_mode,
+    output_dir,
+    args,
+    *,
+    epsilon: float = 1.0,
+    w: int = 8,
+    P: int = 2,
+    delta_t: float = 1.0,
+    n_steps: int = 200,
+    seed: int = 123,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Exp D: plugin end-to-end vs offline DP engine on a stubbed MQTT path.
+
+    Per dataset × scenario in {pooled, hierarchy} we record every release's
+    (tau, t_start, scope, value, n_tau, walk_up, deferred), plus a per-run
+    summary including:
+
+      - ``release_rate`` / ``walkup_rate`` / ``deferred_count``
+      - ``t_start_monotonic`` & spacing stats (paper Def 3.1 wall-clock)
+      - ``p_gate_violations``: any released message with n_tau < plugin_P
+        (must be 0 — otherwise the release gate is broken)
+      - ``max_abs_diff_vs_offline`` for pooled only: the byte-level match
+        between plugin release values and ``run_dp_on_stream`` under the
+        same seed.  Near-zero means the plugin's DP math on the full path
+        agrees with the standalone DP engine.
+    """
+    rows, summary_rows = [], []
+    for ds_name in datasets:
+        prepared = prepare_dataset(
+            ds_name,
+            clamp_mode=clamp_mode,
+            eps_clip=args.eps_clip,
+            seed=args.seed,
+            max_rows=_dataset_max_rows(ds_name, args),
+        )
+        if prepared is None or not prepared.per_pubs:
+            continue
+
+        # Pick first sensor with >=2 publishers AND a configured static clamp.
+        sensor = next(
+            (s for s in prepared.spec["sensors"]
+             if s in prepared.per_pubs
+             and s in prepared.spec["static_clamps"]
+             and len(prepared.per_pubs[s][0]) >= 2),
+            None,
+        )
+        if sensor is None:
+            logger.warning(f"[exp D] no suitable sensor in {ds_name}; skip")
+            continue
+
+        per_pub = prepared.per_pubs[sensor][0]
+
+        for scenario in ("pooled", "hierarchy"):
+            result = _drive_plugin_scenario(
+                per_pub, sensor, prepared.spec, scenario,
+                epsilon=epsilon, w=w, P=P,
+                delta_t=delta_t, n_steps=n_steps, seed=seed,
+            )
+            plugin = result["plugin"]
+            mock = result["mock"]
+            tau_log = result["tau_log"]
+            log = plugin.release_log
+
+            released = [r for r in log if not r["deferred"] and r["released_value"] is not None]
+            deferred = [r for r in log if r["deferred"]]
+            walkups = [r for r in log if r["walk_up"]]
+            p_violations = sum(1 for r in released if r["n_tau"] < result["plugin_P"])
+
+            # Wall-clock t_start sanity: every published msg carries a t_start
+            # that matches (tau-1)*delta_t for its interval and is monotone
+            # non-decreasing across publications.
+            published_t = [m["t_start"] for m in mock.published]
+            monotonic = all(published_t[i+1] >= published_t[i]
+                            for i in range(len(published_t) - 1))
+            spacings = [published_t[i+1] - published_t[i]
+                        for i in range(len(published_t) - 1)]
+
+            # Offline comparison (pooled only — hierarchy has one stream per
+            # publisher, which diverges from run_dp_on_stream's single-stream
+            # semantics).
+            max_diff_offline = float("nan")
+            if scenario == "pooled" and released:
+                # Reconstruct the pooled aggregate stream from tau_log and
+                # replay offline with the SAME seed.  Only include taus up to
+                # the simulation horizon; n_tau per tau is the count of active
+                # publishers (post-clamp, as the plugin sees it).
+                agg = [e["true_clamped_mean"] for e in tau_log]
+                cnt = [e["n_active"] for e in tau_log]
+                # Payload bound: static-clamp width for this sensor.
+                lo, hi = prepared.spec["static_clamps"][sensor]
+                B = float(hi - lo)
+                offline = run_dp_on_stream(
+                    agg, cnt, epsilon=epsilon, window_size=w,
+                    min_publishers=result["plugin_P"],
+                    payload_bound=B, strategy="uniform", seed=seed,
+                )
+                # Pair plugin releases with offline's noisy_values by tau.
+                offline_by_tau = {i: v for i, v in enumerate(offline["noisy_values"])
+                                  if v is not None}
+                diffs = []
+                for r in released:
+                    # plugin's current_tau counts from 1; tau_log entries from 0.
+                    i = r["tau"] - 1
+                    if i in offline_by_tau and offline_by_tau[i] is not None:
+                        diffs.append(abs(r["released_value"] - offline_by_tau[i]))
+                max_diff_offline = max(diffs) if diffs else float("nan")
+
+            # Per-release rows.
+            for r in log:
+                rows.append({
+                    "dataset": ds_name,
+                    "scenario": scenario,
+                    "sensor": sensor,
+                    "clamp_mode": clamp_mode,
+                    "tau": r["tau"],
+                    "t_start": r["t_start"],
+                    "leaf_topic": r["leaf_topic"],
+                    "release_scope": r["release_scope"],
+                    "true_aggregate": r["true_aggregate"],
+                    "released_value": r["released_value"],
+                    "n_tau": r["n_tau"],
+                    "walk_up": r["walk_up"],
+                    "deferred": r["deferred"],
+                })
+
+            summary_rows.append({
+                "dataset": ds_name,
+                "scenario": scenario,
+                "sensor": sensor,
+                "clamp_mode": clamp_mode,
+                "plugin_P": result["plugin_P"],
+                "num_taus": len(log),
+                "num_releases": len(released),
+                "num_deferrals": len(deferred),
+                "num_walkups": len(walkups),
+                "release_rate": len(released) / max(1, len(log)),
+                "walkup_rate": len(walkups) / max(1, len(log)),
+                "t_start_monotonic": monotonic,
+                "t_start_spacing_mean": float(np.mean(spacings)) if spacings else float("nan"),
+                "t_start_spacing_std": float(np.std(spacings)) if spacings else float("nan"),
+                "p_gate_violations": p_violations,
+                "max_abs_diff_vs_offline": max_diff_offline,
+                "num_published": len(mock.published),
+            })
+
+            logger.info(
+                f"[exp D] {ds_name}/{sensor} scenario={scenario}: "
+                f"releases={len(released)}/{len(log)} "
+                f"walkups={len(walkups)} "
+                f"p_violations={p_violations} "
+                f"max_diff_offline={max_diff_offline}"
+            )
+
+    exp_dir = os.path.join(output_dir, "experiments", "D_plugin_path")
+    os.makedirs(exp_dir, exist_ok=True)
+    df_rel = pd.DataFrame(rows)
+    df_sum = pd.DataFrame(summary_rows)
+    df_rel.to_csv(os.path.join(exp_dir, "experiment_D_plugin_releases.csv"),
+                  index=False)
+    df_sum.to_csv(os.path.join(exp_dir, "experiment_D_plugin_summary.csv"),
+                  index=False)
+    logger.info(f"  Experiment D wrote {len(df_rel)} release rows, "
+                f"{len(df_sum)} summary rows -> {exp_dir}")
+
+    if not df_sum.empty:
+        datasets_present = sorted(df_sum["dataset"].unique())
+        scenarios = ["pooled", "hierarchy"]
+        x = np.arange(len(datasets_present))
+        bw = 0.38
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+        for i, (metric, ylabel) in enumerate([
+            ("release_rate", "release rate"),
+            ("walkup_rate", "walk-up rate (Algorithm 1 fires)"),
+            ("max_abs_diff_vs_offline", "|plugin - offline|  (pooled only)"),
+        ]):
+            ax = axes[i]
+            for j, scen in enumerate(scenarios):
+                vals = []
+                for ds in datasets_present:
+                    sub = df_sum[(df_sum["dataset"] == ds) & (df_sum["scenario"] == scen)]
+                    vals.append(float(sub[metric].iloc[0]) if not sub.empty else float("nan"))
+                ax.bar(x + (j - 0.5) * bw, vals, bw, label=scen, alpha=0.85)
+            ax.set(xticks=x, xlabel="dataset", ylabel=ylabel, title=ylabel)
+            ax.set_xticklabels(datasets_present, rotation=30, fontsize=8)
+            ax.grid(True, alpha=0.3, axis="y")
+            ax.legend(fontsize=8)
+        fig.suptitle(f"Experiment D: plugin end-to-end [clamp={clamp_mode}]",
+                     fontsize=12)
+        plt.tight_layout()
+        plt.savefig(os.path.join(exp_dir, "experiment_D_plugin_path.png"), dpi=150)
+        plt.close()
+
+    return df_rel, df_sum
 
 
 def _plot_single_axis_experiment(df, x_col, x_label, path, title, logx=False):
@@ -2884,9 +2389,9 @@ def _plot_single_axis_experiment(df, x_col, x_label, path, title, logx=False):
 
 
 def run_single_axis_experiments(
-    datasets, clamp_modes, output_dir, args, strategies, which="ABC",
+    datasets, clamp_modes, output_dir, args, strategies, which="ABCD",
 ):
-    """Drive Experiments A, B, and C (subset selectable via `which`)."""
+    """Drive Experiments A, B, C, and D (subset selectable via `which`)."""
     for clamp_mode in clamp_modes:
         logger.info(f"===== Experiments [clamp={clamp_mode}] =====")
         if "A" in which:
@@ -2903,6 +2408,12 @@ def run_single_axis_experiments(
             )
         if "C" in which:
             experiment_C_vary_epsilon(
+                datasets, clamp_mode,
+                os.path.join(output_dir, "cross_dataset", clamp_mode),
+                args,
+            )
+        if "D" in which:
+            experiment_D_plugin_path(
                 datasets, clamp_mode,
                 os.path.join(output_dir, "cross_dataset", clamp_mode),
                 args,
@@ -2958,12 +2469,13 @@ def main():
                         help="Only run the Section 5.7 hyperparameter tuning")
     parser.add_argument(
         "--experiment",
-        choices=["full", "sweep", "tune", "A", "B", "C", "ABC", "none"],
+        choices=["full", "sweep", "tune", "A", "B", "C", "D", "ABC", "ABCD", "none"],
         default="full",
-        help="'full' runs sweep + intro + tuning + experiments A/B/C.  "
+        help="'full' runs sweep + intro + tuning + experiments A/B/C/D.  "
              "'sweep' is the main grid only.  'tune' is just Algorithm 2 / "
-             "brute-force tuning.  A/B/C pick one single-axis experiment.  "
-             "'ABC' runs all three single-axis experiments only.",
+             "brute-force tuning.  A/B/C/D pick one single-axis experiment "
+             "(D is the end-to-end plugin path).  'ABC' or 'ABCD' runs the "
+             "single-axis experiments only.",
     )
     args = parser.parse_args()
 
@@ -2994,23 +2506,22 @@ def main():
     if args.tune_only:
         for clamp_mode in clamp_modes:
             for name in targets:
-                spec = DATASETS[name]
-                try:
-                    obj = load_dataset_object(name, max_rows=_dataset_max_rows(name, args))
-                except FileNotFoundError as e:
-                    logger.warning(f"Skipping {name}: {e}"); continue
-                first_sensor = spec["sensors"][0]
-                raw_streams, raw_per_pubs = build_sensor_streams(
-                    name, obj, sensors=[first_sensor])
-                if first_sensor not in raw_per_pubs:
-                    logger.warning(f"Skipping {name} tuning: no per-pub stream"); continue
-                streams_c, per_pubs_c, _ = _reclamp_streams_and_pubs(
-                    raw_streams, raw_per_pubs, spec, clamp_mode,
-                    args.eps_clip, seed=args.seed,
+                first_sensor = DATASETS[name]["sensors"][0]
+                prepared = prepare_dataset(
+                    name,
+                    clamp_mode=clamp_mode,
+                    eps_clip=args.eps_clip,
+                    seed=args.seed,
+                    max_rows=_dataset_max_rows(name, args),
+                    sensors=[first_sensor],
                 )
-                if first_sensor not in per_pubs_c:
+                if prepared is None:
                     continue
-                pp, B = per_pubs_c[first_sensor]
+                if first_sensor not in prepared.raw_per_pubs:
+                    logger.warning(f"Skipping {name} tuning: no per-pub stream"); continue
+                if first_sensor not in prepared.per_pubs:
+                    continue
+                pp, B = prepared.per_pubs[first_sensor]
                 dirs = _dataset_dirs(args.output_dir, name, clamp_mode)
                 tune = tune_hyperparameters(
                     pp, B, name, first_sensor, dirs["tuning"],
@@ -3030,7 +2541,7 @@ def main():
         return
 
     run_main_pipeline = args.experiment in ("full", "sweep")
-    run_single_axis = args.experiment in ("full", "ABC", "A", "B", "C")
+    run_single_axis = args.experiment in ("full", "ABC", "ABCD", "A", "B", "C", "D")
 
     if run_main_pipeline:
         for clamp_mode in clamp_modes:
@@ -3060,7 +2571,12 @@ def main():
                                     greedy_frames, brute_frames, gap_frames)
 
     if run_single_axis:
-        which = "ABC" if args.experiment in ("full", "ABC") else args.experiment
+        if args.experiment in ("full", "ABCD"):
+            which = "ABCD"
+        elif args.experiment == "ABC":
+            which = "ABC"
+        else:
+            which = args.experiment
         run_single_axis_experiments(
             targets, clamp_modes, args.output_dir, args, strategies, which=which,
         )

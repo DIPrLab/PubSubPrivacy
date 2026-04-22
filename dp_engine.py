@@ -109,6 +109,16 @@ class StreamState:
     last_released: Optional[float] = None
     last_true_aggregate: Optional[float] = None
     absorbed_budget: float = 0.0
+    # Budget Distribution forward buffer (paper Algorithm 4 lines 11-18).
+    # Index 0 is the share landing at the current tau; when we skip at tau
+    # we add (eps/w)/(w-1) to indices 1..w-1; when we release at tau we
+    # consume index 0. Maintained at length w: popleft() + append(0.0) per
+    # tick keeps the indexing aligned with the logical timestamp.
+    bd_forward: deque = field(default_factory=deque)
+    # Set by _record on every release() call so callers (e.g. plugin.py) can
+    # distinguish a fresh Laplace release from a repeat-of-previous deferral
+    # without relying on numerical-equality heuristics.
+    last_was_deferred: bool = False
     # History used for offline analysis / plotting
     true_values: list = field(default_factory=list)
     noisy_values: list = field(default_factory=list)
@@ -118,8 +128,18 @@ class StreamState:
     releases: int = 0      # count of actual Laplace releases
 
     def __post_init__(self):
-        self.budget_window = deque(maxlen=self.config.window_size)
-        self.n_window = deque(maxlen=self.config.window_size)
+        # Budget/n windows store the past entries that share the current w-event
+        # window with the timestamp being allocated, i.e. w-1 entries.  Using
+        # maxlen=w here would carry one already-expired slot and over-subtract
+        # from the remaining budget / inflate the n-weighted denominator
+        # (still sound, just wastes utility and drifts from the paper's
+        # exact formula in Sec. 5.4 eq. 5).
+        past_window = max(0, self.config.window_size - 1)
+        self.budget_window = deque(maxlen=past_window)
+        self.n_window = deque(maxlen=past_window)
+        # BD forward buffer: length w, zero-initialized, no maxlen so we can
+        # safely popleft + append per tick.
+        self.bd_forward = deque([0.0] * self.config.window_size)
 
     # ---- budget bookkeeping ---------------------------------------------
 
@@ -142,24 +162,35 @@ class StreamState:
 
     def _alloc_budget_distribution(self, aggregate: float) -> tuple[float, bool]:
         """
-        BD (Kellaris et al.): If the aggregate is similar to the last released
-        value, skip this release and DISTRIBUTE the unused share uniformly
-        across all remaining eligible slots inside the current window. The
-        subscriber repeats the last output at the skipped timestamp.
+        BD (Kellaris et al., paper Algorithm 4 lines 11-18).
+
+        The caller ticks ``bd_forward`` exactly once per tau in ``release()``
+        (setting ``_bd_pending_now`` to the share landing at this tau), so
+        this method never shifts the deque itself.
+
+          - Skip (|e_tau - last_rel| < theta*R): forward the base share
+            eps/w equally across fwd[tau+1..tau+w-1]; return (0, skip).
+            The ``pending_now`` share for this tau is lost (paper: fwd is
+            only drained on release).
+          - Release: spend eps/w + pending_now; return that, false.
         """
+        w = self.config.window_size
+        pending_now = getattr(self, "_bd_pending_now", 0.0)
+
         if self.last_true_aggregate is not None:
             change = abs(aggregate - self.last_true_aggregate)
             threshold = self.config.ba_threshold * self.config.payload_bound
             if change < threshold:
-                # Forfeit this slot (subscriber repeats previous output).
+                # Distribute eps/w equally across fwd[tau+1..tau+w-1].
+                if w > 1 and len(self.bd_forward) >= w - 1:
+                    per_slot = (self.config.epsilon / w) / (w - 1)
+                    for i in range(w - 1):
+                        self.bd_forward[i] += per_slot
                 return 0.0, True
 
-        # The remaining-eligible-slot count is approximated as (w - slots spent in window).
-        slots_left = max(
-            1,
-            self.config.window_size - sum(1 for b in self.budget_window if b > 0),
-        )
-        share = self._budget_remaining() / slots_left
+        share = self.config.epsilon / w + pending_now
+        # The sliding-window budget check downstream in release() still caps
+        # at remaining budget, so this cannot violate (Eq. 4).
         share = min(share, self.config.epsilon)
         return max(share, 0.0), False
 
@@ -186,12 +217,15 @@ class StreamState:
     def _alloc_n_weighted(self, n_tau: int) -> tuple[float, bool]:
         """n-weighted P-allocation (paper Section 5.4).
 
-          eps_tau = eps * n_tau / sum_{j in eligible window} n_j.
+          eps_tau = eps * n_tau / sum_{j=tau-w+1}^{tau} n_j.
 
-        During warm-up (fewer than w eligible timestamps collected so far) we
-        fall back to the Uniform share eps/w, as recommended in the paper.
+        During warm-up (fewer than w eligible timestamps observed) we fall
+        back to the Uniform share eps/w, as recommended in the paper.
+        n_window has maxlen = w-1 and holds prior eligible timestamps, so
+        when it is at capacity we have a full w-long window once n_tau is
+        added to the denominator.
         """
-        if len(self.n_window) < self.config.window_size:
+        if len(self.n_window) < self.n_window.maxlen:
             return self._alloc_uniform()
         total_n = sum(self.n_window) + n_tau
         if total_n <= 0:
@@ -238,6 +272,15 @@ class StreamState:
         """
         self.current_tau += 1
 
+        # Tick the BD forward-distribution buffer on every tau (whether or not
+        # BD runs at this release), so its indexing stays aligned with the
+        # logical timestamp under any P-gate or inner-strategy composition.
+        if self.bd_forward:
+            self._bd_pending_now = self.bd_forward.popleft()
+            self.bd_forward.append(0.0)
+        else:
+            self._bd_pending_now = 0.0
+
         # --- P-allocation release gate ---------------------------------
         if is_p_gated(self.config.strategy) and n_tau < self.config.min_publishers:
             self._record(aggregate, self.last_released, 0.0, n_tau, deferred=True)
@@ -272,6 +315,7 @@ class StreamState:
         return released
 
     def _record(self, aggregate, released, eps_tau, n_tau, deferred):
+        self.last_was_deferred = bool(deferred)
         self.budget_window.append(eps_tau)
         # Only eligible (budget-spending) timestamps enter n_window, matching
         # the paper's causal definition for n-weighted allocation.

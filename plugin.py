@@ -39,9 +39,17 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TopicBuffer:
-    """Per-timestamp buffer: publisher_id -> clamped value."""
+    """Per-timestamp buffer: publisher_id -> clamped value.
+
+    ``start_time`` is the wall-clock moment the current interval began
+    accumulating messages, stamped on the first add after a clear.  Paper
+    Definition 3.1 says adaptive extensions change the closing boundary
+    but never the start, so we do NOT touch ``start_time`` across
+    extensions — only ``clear()`` resets it.
+    """
     payloads: dict[str, float] = field(default_factory=dict)
     extensions: int = 0
+    start_time: Optional[float] = None
 
     @property
     def num_publishers(self) -> int:
@@ -52,15 +60,23 @@ class TopicBuffer:
             return 0.0
         return sum(self.payloads.values()) / len(self.payloads)
 
-    def add(self, publisher_id: str, value: float):
+    def add(self, publisher_id: str, value: float, now: Optional[float] = None):
+        if self.start_time is None:
+            self.start_time = now if now is not None else time.time()
         self.payloads[publisher_id] = value
 
     def merge_from(self, other: "TopicBuffer"):
         self.payloads.update(other.payloads)
+        # Inherit the earliest observed start_time; useful when a scope walk
+        # pools buffers whose intervals began at slightly different moments.
+        if other.start_time is not None:
+            if self.start_time is None or other.start_time < self.start_time:
+                self.start_time = other.start_time
 
     def clear(self):
         self.payloads.clear()
         self.extensions = 0
+        self.start_time = None
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -192,8 +208,9 @@ class PrivacyPlugin:
         lo, hi = self._clamp_bounds_for(logical, publisher_id)
         clamped = _clamp(value, lo, hi)
 
+        now = time.time()
         with self._lock:
-            self._buffers[logical].add(publisher_id, clamped)
+            self._buffers[logical].add(publisher_id, clamped, now=now)
 
     # --------------------------------- Algorithm 1: hierarchy walk ------
 
@@ -216,20 +233,30 @@ class PrivacyPlugin:
         """Pool clamp-compatible publishers under `scope` (Definition 5.2).
 
         A publisher is pooled if the hull of its clamp with the reference has
-        width <= R.
+        width <= R.  The pooled buffer inherits the earliest ``start_time``
+        among the contributing source buffers so the walked-up release still
+        carries the real wall-clock interval start (paper Def 3.1), not the
+        moment the walk happened to run.
         """
         a_star, b_star = reference_bounds
         merged = TopicBuffer()
+        earliest_start: Optional[float] = None
         prefix = scope + "/" if scope else ""
         with self._lock:
             for t, buf in self._buffers.items():
                 if scope != "" and not (t == scope or t.startswith(prefix)):
                     continue
+                contributed = False
                 for pub_id, val in buf.payloads.items():
                     a_p, b_p = self._clamp_bounds_for(t, pub_id)
                     hull = max(b_star, b_p) - min(a_star, a_p)
                     if hull <= R + 1e-9:
-                        merged.add(pub_id, val)
+                        merged.payloads[pub_id] = val
+                        contributed = True
+                if contributed and buf.start_time is not None:
+                    if earliest_start is None or buf.start_time < earliest_start:
+                        earliest_start = buf.start_time
+        merged.start_time = earliest_start
         return merged
 
     def _scope_walk(self, topic: str) -> tuple[str, TopicBuffer]:
@@ -286,6 +313,11 @@ class PrivacyPlugin:
 
             aggregate = pooled.mean()
             n_tau = pooled.num_publishers
+            # Capture the wall-clock start of the interval BEFORE the clear
+            # (Def. 3.1: t_start is the start of the buffering interval, and
+            # is NOT shifted by K_ext extensions).  Fallback to current wall
+            # clock when the buffer is empty or never populated.
+            t_start = pooled.start_time if pooled.start_time is not None else time.time()
 
             # Clear the LEAF buffer after either a release at `leaf` or a walk.
             # Pooled ancestor buffers are not cleared here; the next tick for
@@ -297,29 +329,34 @@ class PrivacyPlugin:
             # distinct stream in the paper; here we key by subscribed topic).
             stream = self._get_or_create_stream(leaf)
             released = stream.release(aggregate, n_tau)
+            deferred = stream.last_was_deferred
 
             if released is not None:
                 protected_topic = f"{self.protected_prefix}/{leaf}"
+                # Paper Def 3.4: the delivered pair is (noisy aggregate,
+                # wall-clock start time of the construction interval).
                 out = {
-                    "t_start": stream.current_tau,
+                    "t_start": t_start,
                     "value": round(released, 4),
                 }
                 self._client.publish(protected_topic, json.dumps(out))
                 logger.debug(
-                    f"[tau={stream.current_tau}] {leaf} "
+                    f"[tau={stream.current_tau}, t_start={t_start:.3f}] {leaf} "
                     f"(scope={scope or 'root'}, n_tau={n_tau}): "
                     f"true={aggregate:.4f} -> noisy={released:.4f}"
+                    f"{' [DEFERRED]' if deferred else ''}"
                 )
 
             self.release_log.append({
                 "leaf_topic": leaf,
                 "release_scope": scope or "root",
                 "tau": stream.current_tau,
+                "t_start": t_start,
                 "true_aggregate": aggregate,
                 "released_value": released,
                 "n_tau": n_tau,
                 "walk_up": scope != leaf,
-                "deferred": released == stream.last_released and n_tau == 0,
+                "deferred": deferred,
             })
 
     def _timer_loop(self):

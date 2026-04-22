@@ -61,9 +61,10 @@ Publishers (IoT sensors)
 
 | File | Description |
 |------|-------------|
-| `dp_engine.py` | Core DP engine. Laplace mechanism, sliding-window budget, all six budget strategies (Uniform, Sample, BD, BA, P-gated BA, n-weighted), utility metrics, attribution advantage. |
-| `plugin.py` | MQTT privacy plugin. Per-publisher clamping, Algorithm 1 hierarchy walk, dynamic interval extension. |
-| `run_experiment.py` | Single entry-point for the full pipeline: per-dataset parameter sweep, strategy comparison, paper's four intro figures, n-weighted spotlight, collusion experiment, K_ext sweep, Section 5.7 multi-strategy hyperparameter tuning, and cross-dataset aggregates (combined sweep, combined tuning, and a Figure-1 averaged across every real dataset). |
+| `dp_engine.py` | Core DP engine. Laplace mechanism, sliding-window budget, all eight budget strategies exercised by the paper (Uniform, Sample, BD with the Algorithm 4 forward buffer, BA, P-gated Uniform/Sample/BA, n-weighted), utility metrics (MAE/NMAE, windowed + global KL), attribution advantage. |
+| `plugin.py` | MQTT privacy plugin. Per-publisher clamping (Def. 3.2), Algorithm 1 hierarchy walk with clamp-compatibility, dynamic interval extension (Section 5.6), delivery of only `(ê_τ, t_start_τ)` pairs per Def. 3.4. |
+| `data_streams.py` | Dataset ingestion, stream construction, `DATASETS` registry (six real-world datasets), and the Definition 3.2 clamp options (static / DP-released). |
+| `run_experiment.py` | Single entry-point for the full pipeline: per-dataset parameter sweep, strategy comparison, paper's four intro figures, n-weighted spotlight, collusion experiment, K_ext sweep, Section 5.7 multi-strategy hyperparameter tuning, Experiments A/B/C/D (Section 6.5–6.8), and cross-dataset aggregates. |
 | `config.yaml` | Configuration mirroring the paper's DP / scheduling parameter taxonomy. |
 
 ## Parameter taxonomy (paper §3.1)
@@ -100,9 +101,9 @@ identity protection against latency and scope coarsening.
 |------|-------------|
 | `uniform` | `ε_τ = ε/w` for every release (Kellaris et al., Section 5.2). |
 | `sample` | Spend full ε once per window; repeat previous output otherwise. |
-| `budget_distribution` (BD) | Skip value-similar timestamps; distribute unused share across remaining slots. |
-| `budget_absorption` (BA) | Skip value-similar timestamps; absorb unused share into next release with a large change. |
-| `p_gated_uniform` / `p_gated_sample` / `p_gated_bd` / `p_gated_ba` | P-allocation wrappers (Section 5.3) — only spend budget when `n_τ ≥ P`, otherwise repeat the last output. |
+| `budget_distribution` (BD) | Kellaris et al. Algorithm 4 lines 11–18: on a value-similar skip, forward the base share `(ε/w)/(w−1)` into each of the next `w−1` slots via a `fwd` buffer; on a release spend `ε/w + fwd[τ]` and reset that slot. |
+| `budget_absorption` (BA) | Kellaris et al. Algorithm 4 lines 20–28: skip value-similar timestamps, absorb the unused share into a pot, drain the pot on the next value-different release. |
+| `p_gated_uniform` / `p_gated_sample` / `p_gated_ba` | P-allocation wrappers (Section 5.3) — only spend budget when `n_τ ≥ P`, otherwise repeat the last output (deferred). |
 | `n_weighted` | **Paper Section 5.4 contribution**: `ε_τ = ε · n_τ / Σ_j n_j`; dense-pool timestamps get more budget so Laplace scale shrinks quadratically in `n_τ`. |
 
 ## Quick start
@@ -117,11 +118,19 @@ pip install -r requirements.txt
 
 ```bash
 # FULL paper pipeline on every dataset in both clamp modes (Option A + B).
-# This is the canonical run that produces every artifact referenced in the
-# paper, including the intro figures, cross-dataset Figure 1, the Algorithm 2
-# greedy-vs-brute-force tuning comparison, and the Option A vs Option B clamp
-# experiment.  Expect ~15-45 minutes depending on hardware.
-python run_experiment.py --clamp-mode both --alpha 0.25 --eps-clip 0.1 \
+# Produces every artifact referenced in the paper: the main sweep,
+# intro figures (Section 1.3), Section 5.7 greedy-vs-brute tuning, the
+# Option A vs B clamp comparison, the n-weighted / collusion / K_ext
+# auxiliary probes, and Experiments A/B/C/D (Section 6.5–6.8).
+python run_experiment.py --experiment full --clamp-mode both \
+                        --alpha 0.25 --eps-clip 0.1 \
+                        --output-dir results
+
+# Same pipeline, sequential over every single-axis experiment explicitly.
+# `--experiment full` already covers this; use ABCD when you want to skip
+# the main sweep and only run the four single-axis experiments.
+python run_experiment.py --experiment ABCD --clamp-mode both \
+                        --alpha 0.25 --eps-clip 0.1 \
                         --output-dir results
 
 # Quick demo on every dataset (reduced grid) in both clamp modes.
@@ -159,19 +168,23 @@ python run_experiment.py --eps-clip 0.05       # Tighter Option B calibration
 python run_experiment.py --experiment A        # greedy vs naive P-tuning
 python run_experiment.py --experiment B        # vary w, fix (P, eps, strategy)
 python run_experiment.py --experiment C        # vary eps, fix (P, w, strategy)
-python run_experiment.py --experiment ABC      # all three, no main sweep
+python run_experiment.py --experiment D        # plugin end-to-end vs offline
+python run_experiment.py --experiment ABC      # all three single-axis, no main sweep
+python run_experiment.py --experiment ABCD     # ABC plus plugin end-to-end
 ```
 
-Every invocation produces, for each dataset:
+Every `--experiment full` invocation produces, for each dataset × clamp mode:
 
 * the full parameter sweep (all strategies × P × ε × w),
 * the four paper intro figures (two extremes + U-shape + KL bar),
 * Section 5.7 hyperparameter tuning across **all** strategies,
 * the n-weighted spotlight, collusion experiment, and K_ext sweep,
+* Experiments A/B/C/D (Section 6.5–6.8, single-axis + plugin end-to-end),
 
 plus cross-dataset aggregates: combined sweep CSV, combined tuning CSV, the
-best `(strategy, P, Δt)` per dataset, and an aggregated Figure 1 averaging
-KL across every evaluated dataset.
+best `(strategy, P, Δt)` per dataset, an aggregated Figure 1 averaging KL
+across every evaluated dataset, and combined CSVs per single-axis experiment
+(A/B/C/D) under `cross_dataset/<clamp_mode>/experiments/`.
 
 ## Output layout
 
@@ -398,24 +411,46 @@ empirical optimality gap is visible at a glance.
 
 **Experiment B — Vary w (`--experiment B`).** Fixes `(P, ε, strategy)` at
 five canonical combinations (e.g. `P=2, ε=1.0, uniform`) and sweeps
-`w ∈ {4, 6, 8, 10, 12, 16}`. Each row is a single DP run; outputs NMAE and
-KL curves per dataset/combo.
+`w ∈ {4, 6, 8, 10, 12, 16}`. Each row logs the observed NMAE and KL, the
+payload bound `R`, the theoretical `λ = R·w / (n·ε)`, and the predicted
+NMAE `w / (n·ε)` so the paper's linear-in-w hypothesis (Section 6.6) is
+mechanically verifiable from the CSV alone.
 
 **Experiment C — Vary ε (`--experiment C`).** Fixes `(P, w, strategy)` at
-five combinations and sweeps `ε ∈ {0.1, 0.25, 0.5, 1, 2, 4, 8}`. Verifies
-the DP-mechanism monotonicity: NMAE must decrease as ε increases. Plotted
-on a log-x axis.
+five combinations and sweeps `ε ∈ {0.1, 0.25, 0.5, 1, 2, 4, 8}`. Same
+logging as B (R, predicted λ, predicted NMAE) to mechanically verify the
+inverse-in-ε hypothesis (Section 6.7). Plotted on a log-x axis.
 
-All three write per-dataset CSVs and a cross-dataset aggregate under
-`results/cross_dataset/<clamp_mode>/experiments/{A,B,C}_*/`. `--experiment ABC`
-runs all three without the main sweep; `--experiment full` (default) runs
-the main sweep plus A/B/C.
+**Experiment D — Plugin path end-to-end (`--experiment D`).** Exercises
+the broker-side `PrivacyPlugin` on a stubbed MQTT client (no external
+broker needed), driving every captured trace through `_on_message` and
+`_flush_and_release`. For each dataset it runs two scenarios:
+
+* `pooled` — all publishers on a single shared leaf topic; no scope walk,
+  one DP stream. Verifies the plugin's full pipeline (clamp → buffer →
+  `StreamState` → Laplace) matches `run_dp_on_stream` byte-for-byte under
+  the same seed (`max_abs_diff_vs_offline` column).
+* `hierarchy` — each publisher on its own leaf topic under the dataset's
+  normative MQTT tree; `plugin_P > 1` forces Algorithm 1 walk-ups every
+  release. Verifies the walk fires, walked releases carry the true
+  wall-clock `t_start` (Def. 3.1), and no release slips past the gate
+  (`p_gate_violations` column must be 0).
+
+Outputs a per-release CSV, a per-run summary (release/walk-up/deferral
+counts, `t_start` monotonicity + spacing stats, P-gate audit), and a 3-
+panel comparison PNG. Landing under
+`results/cross_dataset/<clamp_mode>/experiments/D_plugin_path/`.
+
+All four write per-dataset CSVs and a cross-dataset aggregate under
+`results/cross_dataset/<clamp_mode>/experiments/{A,B,C,D}_*/`.
+`--experiment ABCD` runs all four without the main sweep; `--experiment full`
+(default) runs the main sweep plus A/B/C/D.
 
 ## Adding a new dataset
 
 Append a loader + `build_streams` + `build_per_publisher` triplet and a
 `DATASETS` entry (with `static_clamps` and `fallback_M`) inside
-`run_experiment.py`. Every downstream step — sweep, intro figures, tuning,
+`data_streams.py`. Every downstream step — sweep, intro figures, tuning,
 cross-dataset aggregates — picks it up automatically.
 
 ## Message format
@@ -429,10 +464,34 @@ cross-dataset aggregates — picks it up automatically.
 **Subscriber (protected) — paper Definition 3.4:**
 
 ```json
-{"t_start": 15, "value": 73.12}
+{"t_start": 1711720800.0, "value": 73.12}
 ```
 
-Only `(ê_τ, t_start_τ)` is delivered. The pool size `n_τ`, release scope,
-and all other runtime quantities remain broker-internal.
+`t_start` is the **wall-clock start** of the construction interval (seconds
+since Unix epoch), as required by Def. 3.1 — not the logical index `τ`.
+Adaptive `K_ext` extensions move the closing boundary of an interval but
+never shift its `t_start`, per Def. 3.1. Only `(ê_τ, t_start_τ)` is
+delivered; the pool size `n_τ`, release scope, logical `τ`, and all other
+runtime quantities remain broker-internal.
 
- ```python run_experiment.py --experiment full --quick --clamp-mode both --max-energy-timestamps 3000 --max-traffic-rows 30000 --max-rows 5000 --output-dir results_test 2>&1```       
+## Reproducing the paper end-to-end
+
+The canonical command that runs every artifact the paper references, on
+every dataset, in both clamp modes, sequentially, and saves every CSV /
+PNG under `results/`:
+
+```bash
+python run_experiment.py --experiment full --clamp-mode both \
+                        --alpha 0.25 --eps-clip 0.1 \
+                        --output-dir results
+```
+
+For a faster smoke-test of the pipeline (reduced grids, capped row counts,
+separate output tree) use:
+
+```bash
+python run_experiment.py --experiment full --quick --clamp-mode both \
+                        --max-energy-timestamps 3000 \
+                        --max-traffic-rows 30000 --max-rows 5000 \
+                        --output-dir results_test
+```
