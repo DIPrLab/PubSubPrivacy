@@ -108,6 +108,7 @@ class PrivacyPlugin:
         ba_threshold: float = 0.1,
         sensor_bounds: dict[str, tuple[float, float]] | None = None,
         publisher_clamps: dict[str, tuple[float, float]] | None = None,
+        client_id: str | None = None,
     ):
         self.broker_host = broker_host
         self.broker_port = broker_port
@@ -133,9 +134,11 @@ class PrivacyPlugin:
         self._streams: dict[str, StreamState] = {}
         self._lock = threading.Lock()
 
+        import uuid as _uuid
+        self.client_id = client_id or f"privacy-plugin-{_uuid.uuid4().hex[:8]}"
         self._client = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-            client_id="privacy-plugin",
+            client_id=self.client_id,
         )
         self._client.on_connect = self._on_connect
         self._client.on_message = self._on_message

@@ -42,11 +42,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import itertools
 import json
 import logging
 import os
 import sys
+import threading
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import matplotlib
@@ -246,6 +249,83 @@ def _run_parallel_tasks(
     return results
 
 
+# Generic named-stream pool used by every post-sweep phase (figure1, u-shape,
+# extremes, collusion, k_ext, tuning).  Streams keyed by an arbitrary hashable
+# tag are stashed in a worker global so each task only ships the tag + params.
+_WORKER_NAMED_STREAMS: dict | None = None
+
+
+def _init_named_streams_worker(named_streams):
+    global _WORKER_NAMED_STREAMS
+    _WORKER_NAMED_STREAMS = named_streams
+
+
+def _plot_dp_task(task):
+    """DP run for plot_results: returns the three arrays the plots consume
+    (noisy_arr, budgets_spent, kl_windowed), all as float32 to keep IPC cheap.
+    task = (idx, key, strategy, P, eps, w, seed).
+    """
+    idx, key, strategy, P, eps, w, seed = task
+    agg, cnt, B = _WORKER_NAMED_STREAMS[key]
+    res = run_dp_on_stream(
+        agg, cnt,
+        epsilon=float(eps), window_size=int(w), min_publishers=int(P),
+        payload_bound=float(B), strategy=strategy, seed=int(seed),
+    )
+    nv = res["noisy_values"]
+    return {
+        "idx": idx,
+        "key": key,
+        "strategy": strategy,
+        "seed": int(seed),
+        "noisy_arr": np.array(
+            [v if v is not None else np.nan for v in nv], dtype=np.float32,
+        ),
+        "budgets_spent": np.asarray(res["budgets_spent"], dtype=np.float32),
+        "kl_windowed": np.asarray(res["kl_windowed"], dtype=np.float32),
+    }
+
+
+def _dp_named_task(task):
+    """Run run_dp_on_stream on a worker-cached (agg, cnt, B) tuple.
+
+    task = (idx, key, strategy, P, epsilon, w, seed, return_mode).
+    return_mode ∈ {"metrics", "self_kl", "noisy"}:
+      metrics -- return only the built-in metrics KL (filter: budget_spent>0).
+      self_kl -- also return _kl_of-style KL (filter: non-None only); needed for
+                 u_shaped_curve / kl_extremes_vs_ours numerical parity.
+      noisy   -- additionally return a compact float32 noisy_values array so the
+                 caller can compute KL against a different reference stream
+                 (used by the global/extreme regimes and collusion).
+    """
+    idx, key, strategy, P, eps, w, seed, return_mode = task
+    agg, cnt, B = _WORKER_NAMED_STREAMS[key]
+    res = run_dp_on_stream(
+        agg, cnt,
+        epsilon=float(eps), window_size=int(w), min_publishers=int(P),
+        payload_bound=float(B), strategy=strategy, seed=int(seed),
+    )
+    m = res["metrics"]
+    out = {
+        "idx": idx,
+        "key": key,
+        "kl": m["kl_divergence"],
+        "mae": m["mae"],
+        "nmae": m["normalized_mae"],
+        "release_rate": m["release_rate"],
+        "deferrals": m["deferrals"],
+        "attribution_advantage": m["attribution_advantage"],
+    }
+    if return_mode in ("self_kl", "noisy"):
+        out["kl_self"] = _kl_of(res["true_values"], res["noisy_values"])
+    if return_mode == "noisy":
+        out["noisy_arr"] = np.array(
+            [v if v is not None else np.nan for v in res["noisy_values"]],
+            dtype=np.float32,
+        )
+    return out
+
+
 # ═════════════════════════════════════════════════════════════════════════
 #  Parameter sweep
 # ═════════════════════════════════════════════════════════════════════════
@@ -327,6 +407,7 @@ def plot_results(
     dataset_name: str,
     output_dir: str,
     streams: dict[str, tuple[list[float], list[int], float]],
+    workers: int = 1,
 ):
     os.makedirs(output_dir, exist_ok=True)
     sensors = sorted(df["sensor"].unique())
@@ -337,6 +418,45 @@ def plot_results(
     p_mid = int(sorted(df["P"].unique())[len(df["P"].unique()) // 2])
     ncols = min(3, len(sensors))
     nrows = (len(sensors) + ncols - 1) // ncols
+
+    # Pre-dispatch every DP run needed by panels 4 / 5 / 8 so the plot loop
+    # reads from a cache instead of running ~30 DP passes serially.  Panel 4
+    # and panel 8 share (strategy, seed=99); panel 5 uses seed=42 across all
+    # strategies.
+    panel_4_8_strats = [s for s in ("uniform", "n_weighted") if s in strategies]
+    plot_tasks: list = []
+    idx = 0
+    task_index: dict[tuple, int] = {}  # (sensor, strategy, seed) -> task idx
+    for sensor in sensors:
+        for strat in panel_4_8_strats:
+            key = (sensor, strat, 99)
+            if key not in task_index:
+                task_index[key] = idx
+                plot_tasks.append((idx, sensor, strat, p_mid,
+                                   eps_mid, w_mid, 99))
+                idx += 1
+        for strat in strategies:
+            key = (sensor, strat, 42)
+            if key not in task_index:
+                task_index[key] = idx
+                plot_tasks.append((idx, sensor, strat, p_mid,
+                                   eps_mid, w_mid, 42))
+                idx += 1
+
+    logger.info(f"  [{dataset_name}] plot_results: dispatching "
+                f"{len(plot_tasks)} DP runs (panels 4/5/8) across "
+                f"{min(workers, len(plot_tasks)) if plot_tasks else 1} worker(s)")
+    plot_results_arr = _run_parallel_tasks(
+        plot_tasks, _plot_dp_task,
+        workers=min(workers, max(len(plot_tasks), 1)),
+        initializer=_init_named_streams_worker,
+        initargs=(streams,),
+        progress_label=f"  [{dataset_name}] plot-dp",
+        progress_every=max(5, len(plot_tasks) // 10 or 1),
+    )
+    plot_cache: dict[tuple, dict] = {
+        k: plot_results_arr[i] for k, i in task_index.items()
+    }
 
     # 1 -- MAE vs epsilon, one panel per strategy.
     fig, axes = plt.subplots(1, len(strategies), figsize=(4 * len(strategies), 4.5), sharey=True)
@@ -398,10 +518,9 @@ def plot_results(
         for strat, color in zip(["uniform", "n_weighted"], ["tab:red", "tab:green"]):
             if strat not in strategies:
                 continue
-            res = run_dp_on_stream(agg, cnt, epsilon=eps_mid, window_size=w_mid,
-                                   min_publishers=p_mid, payload_bound=B,
-                                   strategy=strat, seed=99)
-            ny = [(i, v) for i, v in enumerate(res["noisy_values"][:show_len]) if v is not None]
+            noisy_arr = plot_cache[(sensor, strat, 99)]["noisy_arr"][:show_len]
+            ny = [(i, float(noisy_arr[i])) for i in range(len(noisy_arr))
+                  if np.isfinite(noisy_arr[i])]
             if ny:
                 ax.plot([p[0] for p in ny], [p[1] for p in ny], color=color,
                          alpha=0.5, label=strat, lw=1)
@@ -419,12 +538,13 @@ def plot_results(
         ax = axes[idx // ncols][idx % ncols]
         agg, cnt, B = streams[sensor]
         for strat in strategies:
-            res = run_dp_on_stream(agg, cnt, epsilon=eps_mid, window_size=w_mid,
-                                   min_publishers=p_mid, payload_bound=B,
-                                   strategy=strat, seed=42)
-            budgets = res["budgets_spent"]
-            wsums = [sum(budgets[max(0, i - w_mid + 1):i + 1]) for i in range(min(200, len(budgets)))]
-            ax.plot(range(len(wsums)), wsums, label=strat, alpha=0.8, lw=1)
+            budgets = plot_cache[(sensor, strat, 42)]["budgets_spent"]
+            n = min(200, len(budgets))
+            # Trailing-window sum of eps_tau over the last w_mid timestamps.
+            wsums = np.zeros(n, dtype=float)
+            for i in range(n):
+                wsums[i] = float(budgets[max(0, i - w_mid + 1):i + 1].sum())
+            ax.plot(range(n), wsums, label=strat, alpha=0.8, lw=1)
         ax.axhline(y=eps_mid, color="red", ls="--", alpha=0.5, label=f"eps={eps_mid}")
         ax.set(xlabel="Window", ylabel="Budget spent", title=sensor)
         ax.legend(fontsize=6); ax.grid(True, alpha=0.3)
@@ -490,14 +610,10 @@ def plot_results(
     fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4 * nrows), squeeze=False)
     for idx, sensor in enumerate(sensors):
         ax = axes[idx // ncols][idx % ncols]
-        agg, cnt, B = streams[sensor]
         for strat, color in zip(["uniform", "n_weighted"], ["tab:red", "tab:green"]):
             if strat not in strategies:
                 continue
-            res = run_dp_on_stream(agg, cnt, epsilon=eps_mid, window_size=w_mid,
-                                   min_publishers=p_mid, payload_bound=B,
-                                   strategy=strat, seed=99)
-            kl_w = res["kl_windowed"]
+            kl_w = plot_cache[(sensor, strat, 99)]["kl_windowed"]
             n = min(200, len(kl_w))
             ax.plot(range(n), kl_w[:n], color=color, alpha=0.7, lw=1, label=strat)
         ax.set(xlabel="Window", ylabel="U__tau", title=sensor)
@@ -588,6 +704,66 @@ def n_weighted_spotlight(
 #  Dynamic timestamp-interval extension (K_ext sweep)
 # ═════════════════════════════════════════════════════════════════════════
 
+_WORKER_PER_PUB: dict | None = None
+
+
+def _init_per_pub_worker(per_pub):
+    global _WORKER_PER_PUB
+    _WORKER_PER_PUB = per_pub
+
+
+def _k_ext_task(task):
+    """One k_ext merge + DP run.  per_pub is cached in worker global."""
+    k_ext, epsilon, w, P, payload_bound, seed = task
+    per_pub = _WORKER_PER_PUB
+    T = len(next(iter(per_pub.values())))
+    merged_agg: list[float] = []
+    merged_cnt: list[int] = []
+    merged_wait: list[int] = []
+    pending_vals: list[float] = []
+    pending_pubs: set[str] = set()
+    pending_waits = 0
+
+    for tau in range(T):
+        for p, series in per_pub.items():
+            v = series[tau]
+            if v is not None:
+                pending_vals.append(v)
+                pending_pubs.add(p)
+        pending_waits += 1
+
+        if len(pending_pubs) >= P or pending_waits > k_ext:
+            merged_agg.append(float(np.mean(pending_vals)) if pending_vals else 0.0)
+            merged_cnt.append(len(pending_pubs))
+            merged_wait.append(pending_waits)
+            pending_vals = []
+            pending_pubs = set()
+            pending_waits = 0
+
+    if pending_vals:
+        merged_agg.append(float(np.mean(pending_vals)))
+        merged_cnt.append(len(pending_pubs))
+        merged_wait.append(pending_waits)
+
+    res = run_dp_on_stream(
+        merged_agg, merged_cnt, epsilon=epsilon, window_size=w,
+        min_publishers=P, payload_bound=payload_bound,
+        strategy="p_gated_ba", seed=seed,
+    )
+    m = res["metrics"]
+    return {
+        "K_ext": k_ext,
+        "T_max_over_dt": k_ext + 1,
+        "num_releases": len(merged_agg),
+        "release_rate": m["release_rate"],
+        "mean_wait_dt": float(np.mean(merged_wait)) if merged_wait else float("nan"),
+        "max_wait_dt": max(merged_wait) if merged_wait else 0,
+        "mae": m["mae"],
+        "kl_divergence": m["kl_divergence"],
+        "normalized_mae": m["normalized_mae"],
+    }
+
+
 def dynamic_interval_experiment(
     per_pub: dict[str, list[float | None]],
     payload_bound: float,
@@ -598,6 +774,7 @@ def dynamic_interval_experiment(
     w: int = 8,
     P: int = 3,
     k_ext_values: list[int] = (0, 1, 2, 4),
+    workers: int = 1,
 ) -> pd.DataFrame:
     """
     Simulate adaptive timestamp extension (Section 5.6) by merging k_ext
@@ -605,59 +782,20 @@ def dynamic_interval_experiment(
     is below P.  Reports release rate, KL divergence, and per-release
     wall-clock latency in units of the base interval Delta_t.
     """
-    T = len(next(iter(per_pub.values())))
-    rows = []
-
-    for k_ext in k_ext_values:
-        merged_agg: list[float] = []
-        merged_cnt: list[int] = []
-        merged_wait: list[int] = []    # how many base intervals elapsed
-        pending_vals: list[float] = []
-        pending_pubs: set[str] = set()
-        pending_waits = 0
-
-        def flush():
-            if pending_vals:
-                merged_agg.append(float(np.mean(pending_vals)))
-            else:
-                merged_agg.append(0.0)
-            merged_cnt.append(len(pending_pubs))
-            merged_wait.append(pending_waits)
-
-        for tau in range(T):
-            for p, series in per_pub.items():
-                v = series[tau]
-                if v is not None:
-                    pending_vals.append(v)
-                    pending_pubs.add(p)
-            pending_waits += 1
-
-            if len(pending_pubs) >= P or pending_waits > k_ext:
-                flush()
-                pending_vals = []
-                pending_pubs = set()
-                pending_waits = 0
-
-        if pending_vals:
-            flush()
-
-        res = run_dp_on_stream(
-            merged_agg, merged_cnt, epsilon=epsilon, window_size=w,
-            min_publishers=P, payload_bound=payload_bound,
-            strategy="p_gated_ba", seed=13 + k_ext,
-        )
-        m = res["metrics"]
-        rows.append({
-            "K_ext": k_ext,
-            "T_max_over_dt": k_ext + 1,
-            "num_releases": len(merged_agg),
-            "release_rate": m["release_rate"],
-            "mean_wait_dt": float(np.mean(merged_wait)) if merged_wait else float("nan"),
-            "max_wait_dt": max(merged_wait) if merged_wait else 0,
-            "mae": m["mae"],
-            "kl_divergence": m["kl_divergence"],
-            "normalized_mae": m["normalized_mae"],
-        })
+    tasks = [(int(k_ext), float(epsilon), int(w), int(P), float(payload_bound),
+              13 + int(k_ext))
+             for k_ext in k_ext_values]
+    logger.info(f"  [{dataset_name}/{sensor_name}] K_ext sweep: dispatching "
+                f"{len(tasks)} tasks across {min(workers, len(tasks))} worker(s)")
+    # K_ext tasks are few (4-5); cap worker count to avoid idle processes.
+    rows = _run_parallel_tasks(
+        tasks, _k_ext_task,
+        workers=min(workers, len(tasks)),
+        initializer=_init_per_pub_worker,
+        initargs=(per_pub,),
+        progress_label=f"  [{dataset_name}/{sensor_name}] k_ext",
+        progress_every=1,
+    )
 
     out = pd.DataFrame(rows)
     out.to_csv(os.path.join(output_dir, f"{dataset_name}_{sensor_name}_k_ext_sweep.csv"), index=False)
@@ -696,6 +834,7 @@ def collusion_experiment(
     P: int = 2,
     c_values: list[int] = (1, 2, 4, 8, 16),
     trials_per_c: int = 32,
+    workers: int = 1,
 ) -> pd.DataFrame:
     """
     Empirically verify the sqrt(c) noise reduction: c independent noisy
@@ -704,20 +843,51 @@ def collusion_experiment(
     sensor = next(iter(streams))
     agg, cnt, B = streams[sensor]
 
+    # Each (trial, k) pair runs one independent Laplace-noise DP stream; we
+    # then fold them into `c`-sized collusion averages for every c >= k+1.
+    # The upper bound of unique DP runs is trials_per_c * max(c) because
+    # original seeds were 1000*trial + k, shared across c values.
+    max_c = max(c_values)
+    named = {("collusion",): (agg, cnt, B)}
+    tasks: list = []
+    idx = 0
+    for trial in range(trials_per_c):
+        for k in range(max_c):
+            seed = 1_000 * trial + k
+            tasks.append((idx, ("collusion",), "uniform", P,
+                          epsilon, w, seed, "noisy"))
+            idx += 1
+
+    logger.info(f"  [{dataset_name}] collusion_experiment: dispatching "
+                f"{len(tasks)} DP runs across {workers} worker(s)")
+    results = _run_parallel_tasks(
+        tasks, _dp_named_task,
+        workers=workers,
+        initializer=_init_named_streams_worker,
+        initargs=(named,),
+        progress_label=f"  [{dataset_name}] collusion",
+        progress_every=max(50, len(tasks) // 20),
+    )
+
+    # Index (trial, k) -> noisy_arr for fast lookup.
+    noisy_by_tk: dict[tuple[int, int], np.ndarray] = {}
+    t_idx = 0
+    for trial in range(trials_per_c):
+        for k in range(max_c):
+            noisy_by_tk[(trial, k)] = results[t_idx]["noisy_arr"]
+            t_idx += 1
+
+    true_arr = np.array(
+        [t if t is not None else np.nan for t in agg], dtype=float,
+    )
     rows = []
     for c in c_values:
         maes = []
         for trial in range(trials_per_c):
-            avg_noisy = None
+            avg_noisy = np.zeros_like(true_arr, dtype=float)
             for k in range(c):
-                res = run_dp_on_stream(agg, cnt, epsilon, w, P, B, "uniform",
-                                        seed=1_000 * trial + k)
-                arr = np.array([v if v is not None else np.nan for v in res["noisy_values"]],
-                               dtype=float)
-                avg_noisy = arr if avg_noisy is None else avg_noisy + arr
+                avg_noisy += noisy_by_tk[(trial, k)]
             avg_noisy /= c
-            true_arr = np.array([t if t is not None else np.nan for t in res["true_values"]],
-                                 dtype=float)
             mask = np.isfinite(avg_noisy) & np.isfinite(true_arr)
             maes.append(float(np.mean(np.abs(avg_noisy[mask] - true_arr[mask]))))
         rows.append({
@@ -777,12 +947,11 @@ def _rebuild_stream_with_dt(
     return agg, cnt
 
 
-def _evaluate_P(
-    per_pub, payload_bound, epsilon, w, P, strategy,
+def _evaluate_stream(
+    agg, cnt, payload_bound, epsilon, w, P, strategy,
     utility_weight=1.0, latency_weight=0.2, seed=77,
 ) -> dict:
-    """Single-point evaluator; corresponds to paper's Evaluate(trace, P)."""
-    agg, cnt = _rebuild_stream_with_dt(per_pub, 1)
+    """Stream-level evaluator; caller supplies the (agg, cnt) rebuild once."""
     if len(agg) < w + 2:
         return {
             "P": int(P), "strategy": strategy, "normalized_mae": float("nan"),
@@ -810,24 +979,64 @@ def _evaluate_P(
     }
 
 
-def greedy_tune_P(
-    per_pub, payload_bound, epsilon, w, strategy, p_max,
-    alpha=0.25, I_max=20, utility_weight=1.0, latency_weight=0.2,
-    loss_tie_tol: float = 1e-9,
+def _evaluate_P(
+    per_pub, payload_bound, epsilon, w, P, strategy,
+    utility_weight=1.0, latency_weight=0.2, seed=77,
 ) -> dict:
-    """Algorithm 2 from the paper: greedy hill-climb over P.
+    """Single-point evaluator; corresponds to paper's Evaluate(trace, P).
 
-    Seed P_0 = ceil(1/alpha) (smallest P that meets the attribution-advantage
-    target alpha).  At each step, evaluate P-1 and P+1, move to the better if
-    it strictly improves (within `loss_tie_tol`), else stop.  On a plateau the
-    walk stops at the seed, which is the conservative choice since increasing
-    P strengthens identity protection without any loss cost.
+    Compatibility shim: rebuilds the stream from per_pub, then delegates to
+    ``_evaluate_stream``.  Prefer the stream variant when the rebuild is
+    already cached (``tune_hyperparameters`` does this).
     """
+    agg, cnt = _rebuild_stream_with_dt(per_pub, 1)
+    return _evaluate_stream(agg, cnt, payload_bound, epsilon, w, P, strategy,
+                            utility_weight, latency_weight, seed)
+
+
+# Worker-side state for hyperparameter tuning: cached (agg, cnt, B, eps, w,
+# utility_weight, latency_weight).  Shared by brute-force and per-strategy
+# greedy walks so the rebuild runs exactly once.
+_WORKER_TUNE_CTX: tuple | None = None
+
+
+def _init_tune_worker(agg, cnt, payload_bound, epsilon, w,
+                      utility_weight, latency_weight):
+    global _WORKER_TUNE_CTX
+    _WORKER_TUNE_CTX = (agg, cnt, payload_bound, epsilon, w,
+                        utility_weight, latency_weight)
+
+
+def _tune_eval_task(task):
+    """Brute-force evaluator: (strategy, P, seed) -> row dict."""
+    strategy, P, seed = task
+    agg, cnt, B, eps, w, uw, lw = _WORKER_TUNE_CTX
+    return _evaluate_stream(agg, cnt, B, eps, w, P, strategy, uw, lw, seed)
+
+
+def _greedy_walk_task(task):
+    """One strategy's Algorithm-2 greedy walk, end-to-end in the worker."""
+    strategy, p_max, alpha, I_max, loss_tie_tol, seed = task
+    agg, cnt, B, eps, w, uw, lw = _WORKER_TUNE_CTX
+    return _greedy_walk_on_stream(
+        agg, cnt, B, eps, w, strategy, p_max,
+        alpha=alpha, I_max=I_max,
+        utility_weight=uw, latency_weight=lw,
+        loss_tie_tol=loss_tie_tol, seed=seed,
+    )
+
+
+def _greedy_walk_on_stream(
+    agg, cnt, payload_bound, epsilon, w, strategy, p_max,
+    alpha=0.25, I_max=20, utility_weight=1.0, latency_weight=0.2,
+    loss_tie_tol: float = 1e-9, seed: int = 77,
+) -> dict:
+    """Stream-level Algorithm 2 walk (per-eval stream rebuild removed)."""
     P_seed = max(1, int(np.ceil(1.0 / max(alpha, 1e-9))))
     P = min(P_seed, max(1, p_max))
     trajectory: list[dict] = []
-    best = _evaluate_P(per_pub, payload_bound, epsilon, w, P, strategy,
-                       utility_weight, latency_weight)
+    best = _evaluate_stream(agg, cnt, payload_bound, epsilon, w, P, strategy,
+                            utility_weight, latency_weight, seed)
     trajectory.append({**best, "iter": 0, "action": "seed"})
     seen = {P: best["tuning_loss"]}
 
@@ -839,8 +1048,8 @@ def greedy_tune_P(
             if P_nbr in seen:
                 neighbors.append({"P": P_nbr, "tuning_loss": seen[P_nbr], "_cached": True})
                 continue
-            r = _evaluate_P(per_pub, payload_bound, epsilon, w, P_nbr, strategy,
-                            utility_weight, latency_weight)
+            r = _evaluate_stream(agg, cnt, payload_bound, epsilon, w, P_nbr, strategy,
+                                 utility_weight, latency_weight, seed)
             seen[P_nbr] = r["tuning_loss"]
             neighbors.append({**r, "_cached": False})
             trajectory.append({**r, "iter": i, "action": f"probe_P={P_nbr}"})
@@ -854,8 +1063,8 @@ def greedy_tune_P(
             if "evaluated" in best_nbr:
                 best = {k: v for k, v in best_nbr.items() if not k.startswith("_")}
             else:
-                best = _evaluate_P(per_pub, payload_bound, epsilon, w, P, strategy,
-                                   utility_weight, latency_weight)
+                best = _evaluate_stream(agg, cnt, payload_bound, epsilon, w, P, strategy,
+                                        utility_weight, latency_weight, seed)
             trajectory.append({**best, "iter": i, "action": f"step_to_P={P}"})
         else:
             trajectory.append({**best, "iter": i, "action": "stop_local_optimum"})
@@ -867,15 +1076,41 @@ def greedy_tune_P(
     }
 
 
+def greedy_tune_P(
+    per_pub, payload_bound, epsilon, w, strategy, p_max,
+    alpha=0.25, I_max=20, utility_weight=1.0, latency_weight=0.2,
+    loss_tie_tol: float = 1e-9,
+) -> dict:
+    """Algorithm 2 from the paper: greedy hill-climb over P.
+
+    Compatibility shim: rebuilds the stream from ``per_pub`` and delegates
+    to ``_greedy_walk_on_stream``.  Callers with a cached stream should use
+    that helper directly.
+    """
+    agg, cnt = _rebuild_stream_with_dt(per_pub, 1)
+    return _greedy_walk_on_stream(
+        agg, cnt, payload_bound, epsilon, w, strategy, p_max,
+        alpha=alpha, I_max=I_max,
+        utility_weight=utility_weight, latency_weight=latency_weight,
+        loss_tie_tol=loss_tie_tol,
+    )
+
+
 def brute_force_tune_P(
     per_pub, payload_bound, epsilon, w, strategy, p_max,
     utility_weight=1.0, latency_weight=0.2,
 ) -> pd.DataFrame:
-    """Naive full enumeration: evaluate every P in [1, p_max] for one strategy."""
+    """Naive full enumeration: evaluate every P in [1, p_max] for one strategy.
+
+    Compatibility shim: rebuilds the stream once and delegates per-P to
+    ``_evaluate_stream``.  Callers with a cached stream should use the
+    parallel brute-force path in ``tune_hyperparameters`` instead.
+    """
+    agg, cnt = _rebuild_stream_with_dt(per_pub, 1)
     rows = []
     for P in range(1, int(p_max) + 1):
-        rows.append(_evaluate_P(per_pub, payload_bound, epsilon, w, P, strategy,
-                                utility_weight, latency_weight))
+        rows.append(_evaluate_stream(agg, cnt, payload_bound, epsilon, w, P, strategy,
+                                     utility_weight, latency_weight))
     return pd.DataFrame(rows)
 
 
@@ -893,6 +1128,7 @@ def tune_hyperparameters(
     utility_weight: float = 1.0,
     latency_weight: float = 0.2,
     p_max: int | None = None,
+    workers: int = 1,
 ) -> dict:
     """
     Stage 1 of Section 5.7: tune P per strategy using the paper's Algorithm 2
@@ -911,31 +1147,59 @@ def tune_hyperparameters(
     if isinstance(strategies, str):
         strategies = [strategies]
 
-    # p_max defaults to the maximum observed n_tau on the trace.
-    _, raw_cnt = _rebuild_stream_with_dt(per_pub, 1)
-    obs_max = max(raw_cnt) if raw_cnt else 1
+    # Rebuild the stream exactly once; every greedy probe + brute-force eval
+    # reuses the same cached (agg, cnt).  Worker processes see the same cached
+    # tuple via the initializer, so each task is a pure run_dp_on_stream call.
+    logger.info(f"  [{dataset_name}/{sensor_name}] tune_hyperparameters: rebuilding stream...")
+    agg, cnt = _rebuild_stream_with_dt(per_pub, 1)
+    obs_max = max(cnt) if cnt else 1
     if p_max is None:
         p_max = max(2, min(obs_max, len(per_pub)))
     p_max = int(p_max)
 
+    tune_init_args = (agg, cnt, payload_bound, epsilon, w,
+                      utility_weight, latency_weight)
+
+    # Brute-force: one task per (strategy, P).
+    brute_tasks = [(strat, P, 77)
+                   for strat in strategies
+                   for P in range(1, p_max + 1)]
+    logger.info(f"  [{dataset_name}/{sensor_name}] brute-force: dispatching "
+                f"{len(brute_tasks)} (strategy, P) tasks across {workers} worker(s)")
+    brute_rows_flat = _run_parallel_tasks(
+        brute_tasks, _tune_eval_task,
+        workers=workers,
+        initializer=_init_tune_worker,
+        initargs=tune_init_args,
+        progress_label=f"  [{dataset_name}/{sensor_name}] brute",
+        progress_every=max(10, len(brute_tasks) // 10),
+    )
+    brute_df = pd.DataFrame(brute_rows_flat)
+
+    # Greedy: one task per strategy (walks are serial within, but across
+    # strategies they're independent).
+    greedy_tasks = [(strat, p_max, alpha, I_max, 1e-9, 77)
+                    for strat in strategies]
+    logger.info(f"  [{dataset_name}/{sensor_name}] greedy: dispatching "
+                f"{len(greedy_tasks)} walks across "
+                f"{min(workers, len(greedy_tasks))} worker(s)")
+    greedy_out = _run_parallel_tasks(
+        greedy_tasks, _greedy_walk_task,
+        workers=min(workers, len(greedy_tasks)),
+        initializer=_init_tune_worker,
+        initargs=tune_init_args,
+        progress_label=f"  [{dataset_name}/{sensor_name}] greedy",
+        progress_every=1,
+    )
+
     greedy_rows: list[pd.DataFrame] = []
-    brute_rows: list[pd.DataFrame] = []
     greedy_results: dict[str, dict] = {}
-    for strat in strategies:
-        g = greedy_tune_P(per_pub, payload_bound, epsilon, w, strat, p_max,
-                          alpha=alpha, I_max=I_max,
-                          utility_weight=utility_weight, latency_weight=latency_weight)
+    for strat, g in zip(strategies, greedy_out):
         g["trajectory"]["strategy"] = strat
         greedy_rows.append(g["trajectory"])
         greedy_results[strat] = g
 
-        b = brute_force_tune_P(per_pub, payload_bound, epsilon, w, strat, p_max,
-                               utility_weight=utility_weight, latency_weight=latency_weight)
-        b["strategy"] = strat
-        brute_rows.append(b)
-
     greedy_df = pd.concat(greedy_rows, ignore_index=True) if greedy_rows else pd.DataFrame()
-    brute_df = pd.concat(brute_rows, ignore_index=True) if brute_rows else pd.DataFrame()
 
     greedy_df.to_csv(
         os.path.join(output_dir, f"{dataset_name}_{sensor_name}_tuning_greedy.csv"),
@@ -1048,6 +1312,7 @@ def figure1_reproduction(
     epsilon: float = 1.0,
     w: int = 8,
     n_trials: int = 20,
+    workers: int = 1,
 ) -> pd.DataFrame:
     """
     Reproduce paper Figure 1 on real data (cross-dataset aggregation input).
@@ -1061,6 +1326,7 @@ def figure1_reproduction(
     Returns a DataFrame with columns
     (dataset, P_scope, P_label, kl_divergence, epsilon, w, N).
     """
+    logger.info(f"  [{dataset_name}] figure1_reproduction: building tasks...")
     # Reconstruct the per-sensor aggregate streams from per_pub_all so we
     # don't need the original `streams` dict.
     sensor_streams: dict[str, tuple[list[float], list[int], float]] = {}
@@ -1076,74 +1342,107 @@ def figure1_reproduction(
     sensor_names = list(sensor_streams.keys())
     T = min(len(v[0]) for v in sensor_streams.values())
     N_pubs = max(len(pp) for pp, _ in per_pub_all.values())
-
-    # Per-publisher extreme (P=1): mean KL across every publisher × trial.
-    p1_kls = []
-    for s in sensor_names:
-        pp, B = per_pub_all[s]
-        for i, series in enumerate(pp.values()):
-            pa = [v if v is not None else 0.0 for v in series]
-            pc = [1 if v is not None else 0 for v in series]
-            for trial in range(n_trials):
-                r = run_dp_on_stream(
-                    pa, pc, epsilon=epsilon, window_size=w,
-                    min_publishers=1, payload_bound=B, strategy="uniform",
-                    seed=500_000 + i * 1000 + trial,
-                )
-                k = r["metrics"]["kl_divergence"]
-                if np.isfinite(k):
-                    p1_kls.append(k)
-    kl_p1 = float(np.mean(p1_kls)) if p1_kls else float("nan")
-
-    # Intermediate P: clamped aggregate with Uniform, averaged across sensors and trials.
     P_values = [p for p in [2, 3, 4, 6, 8] if p <= N_pubs]
-    mid_kls: dict[int, float] = {}
-    for P in P_values:
-        kls = []
-        for s in sensor_names:
-            agg, cnt, B = sensor_streams[s]
-            if max(cnt) < P:
-                continue
-            for trial in range(n_trials):
-                r = run_dp_on_stream(
-                    agg, cnt, epsilon=epsilon, window_size=w,
-                    min_publishers=P, payload_bound=B, strategy="uniform",
-                    seed=600_000 + P * 1000 + trial,
-                )
-                k = r["metrics"]["kl_divergence"]
-                if np.isfinite(k):
-                    kls.append(k)
-        mid_kls[P] = float(np.mean(kls)) if kls else float("nan")
 
-    # Global (Extreme 1): one stream per system, single noise per tau with
-    # R = sup(R) and n_tau = total publishers across metrics.
+    # Global (Extreme 1) stream: one stream per system, single noise per tau
+    # with R = sup(R) and n_tau = total publishers across metrics.
     all_B = max(B for _, B in per_pub_all.values())
-    cross_metric_true = []
-    num_pubs_total = []
+    cross_metric_true: list[float] = []
+    num_pubs_total: list[int] = []
     for tau in range(T):
         vals = [sensor_streams[s][0][tau] for s in sensor_names
                 if sensor_streams[s][1][tau] > 0]
         cross_metric_true.append(float(np.mean(vals)) if vals else 0.0)
         num_pubs_total.append(sum(sensor_streams[s][1][tau] for s in sensor_names))
 
-    g_kls = []
+    # Pack every stream the workers might need into one keyed dict.
+    named: dict = {}
+    for s, (pp, B) in per_pub_all.items():
+        for pub_id, series in pp.items():
+            pa = [v if v is not None else 0.0 for v in series]
+            pc = [1 if v is not None else 0 for v in series]
+            named[("pub", s, pub_id)] = (pa, pc, B)
+        named[("agg", s)] = sensor_streams[s]
+    named[("global",)] = (cross_metric_true, num_pubs_total, all_B)
+
+    # Build the task list.  Each task carries an "op" tag so we can bucket the
+    # results (p1 / mid[P] / global[sensor]) when everything finishes.
+    tasks: list = []
+    ops: list = []  # parallel to `tasks`
+    idx = 0
+    # Per-publisher extreme (P=1)
     for s in sensor_names:
-        true_stream = sensor_streams[s][0][:T]
+        pp, _ = per_pub_all[s]
+        for i, pub_id in enumerate(pp.keys()):
+            for trial in range(n_trials):
+                seed = 500_000 + i * 1000 + trial
+                tasks.append((idx, ("pub", s, pub_id), "uniform", 1,
+                              epsilon, w, seed, "metrics"))
+                ops.append(("p1",))
+                idx += 1
+    # Intermediate P on clamped aggregate
+    for P in P_values:
+        for s in sensor_names:
+            agg, cnt, _ = sensor_streams[s]
+            if max(cnt) < P:
+                continue
+            for trial in range(n_trials):
+                seed = 600_000 + P * 1000 + trial
+                tasks.append((idx, ("agg", s), "uniform", P,
+                              epsilon, w, seed, "metrics"))
+                ops.append(("mid", P))
+                idx += 1
+    # Global (Extreme 1) — need noisy_values back for custom KL vs per-metric truth
+    for s in sensor_names:
         for trial in range(n_trials):
-            r = run_dp_on_stream(
-                cross_metric_true, num_pubs_total,
-                epsilon=epsilon, window_size=w,
-                min_publishers=1, payload_bound=all_B, strategy="uniform",
-                seed=700_000 + hash(s) % 10000 + trial * 7919,
-            )
-            # Compare per-metric true against the cross-metric noisy global.
-            nvals = r["noisy_values"]
+            seed = 700_000 + hash(s) % 10000 + trial * 7919
+            tasks.append((idx, ("global",), "uniform", 1,
+                          epsilon, w, seed, "noisy"))
+            ops.append(("global", s))
+            idx += 1
+
+    logger.info(f"  [{dataset_name}] figure1_reproduction: dispatching "
+                f"{len(tasks)} DP runs across {workers} worker(s)")
+    results = _run_parallel_tasks(
+        tasks, _dp_named_task,
+        workers=workers,
+        initializer=_init_named_streams_worker,
+        initargs=(named,),
+        progress_label=f"  [{dataset_name}] figure1",
+        progress_every=max(50, len(tasks) // 20),
+    )
+
+    # Aggregate by bucket.
+    p1_kls: list[float] = []
+    mid_kls_buf: dict[int, list[float]] = {P: [] for P in P_values}
+    g_kls: list[float] = []
+    for op, res in zip(ops, results):
+        kind = op[0]
+        if kind == "p1":
+            k = res["kl"]
+            if np.isfinite(k):
+                p1_kls.append(k)
+        elif kind == "mid":
+            _, P = op
+            k = res["kl"]
+            if np.isfinite(k):
+                mid_kls_buf[P].append(k)
+        else:  # "global"
+            _, s = op
+            true_stream = sensor_streams[s][0][:T]
+            nvals = res["noisy_arr"]
             true_c = [v for v in true_stream if v is not None]
-            nc = [v for v in nvals if v is not None]
+            nc = [float(v) for v in nvals if np.isfinite(v)]
             if len(true_c) >= 10 and len(nc) >= 10:
                 k = compute_kl_divergence(true_c, nc)
                 if np.isfinite(k):
                     g_kls.append(k)
+
+    kl_p1 = float(np.mean(p1_kls)) if p1_kls else float("nan")
+    mid_kls: dict[int, float] = {
+        P: (float(np.mean(v)) if v else float("nan"))
+        for P, v in mid_kls_buf.items()
+    }
     kl_global = float(np.mean(g_kls)) if g_kls else float("nan")
 
     rows = [{"dataset": dataset_name, "P_scope": 1, "P_label": "per-pub",
@@ -1315,20 +1614,19 @@ def extreme2_per_publisher(per_pub, payload_bound, sensor_label,
 
 
 def kl_extremes_vs_ours(sensor_streams, per_pub_all, P_our,
-                        dataset_name, output_dir):
+                        dataset_name, output_dir, workers: int = 1):
     """Grouped bar of KL for Extreme 1 / Extreme 2 / Our-approach per sensor.
 
     All three regimes are averaged over `INTRO_N_TRIALS` noise seeds so the
     bars reflect the expected distortion, not a single-draw artefact.
     """
+    logger.info(f"  [{dataset_name}] kl_extremes_vs_ours: building tasks...")
     T = min(len(v[0]) for v in sensor_streams.values())
     sensor_names = list(sensor_streams.keys())
     global_B = max(v[2] for v in sensor_streams.values())
-    uniform = BudgetStrategy.UNIFORM
 
-    # Extreme 1 (paper §1.3): one stream per system.  Single Laplace release per
-    # tau with n_tau = total publishers across every metric and R = sup R.
-    global_true = []
+    # Extreme 1 (paper §1.3): one stream per system.
+    global_true: list[float] = []
     for tau in range(T):
         vals = [sensor_streams[s][0][tau] for s in sensor_names
                 if sensor_streams[s][1][tau] > 0]
@@ -1336,54 +1634,92 @@ def kl_extremes_vs_ours(sensor_streams, per_pub_all, P_our,
     num_pubs_global = [sum(sensor_streams[s][1][tau] for s in sensor_names)
                        for tau in range(T)]
 
-    e1: dict[str, list[float]] = {s: [] for s in sensor_names}
-    for trial in range(INTRO_N_TRIALS):
-        _, noisy_global = _apply_dp(global_true, num_pubs_global,
-                                    epsilon=INTRO_EPSILON, w=INTRO_W,
-                                    min_publishers=1, payload_bound=global_B,
-                                    seed=200_000 + trial * 13, strategy=uniform)
-        for s in sensor_names:
-            k = _kl_of(sensor_streams[s][0][:T], noisy_global)
-            if np.isfinite(k):
-                e1[s].append(k)
-    results = {"Extreme 1\n(global average)":
-               {s: float(np.mean(v)) if v else float("nan") for s, v in e1.items()}}
+    # Pack every keyed stream into the worker pool.
+    named: dict = {}
+    for s in sensor_names:
+        if s in per_pub_all:
+            pp, B = per_pub_all[s]
+            for pub_id, series in pp.items():
+                pa = [v if v is not None else 0.0 for v in series]
+                pc = [1 if v is not None else 0 for v in series]
+                named[("pub", s, pub_id)] = (pa, pc, B)
+        named[("agg", s)] = sensor_streams[s]
+    named[("global",)] = (global_true, num_pubs_global, global_B)
 
-    # Extreme 2: each publisher is its own stream; average KL across publishers.
-    e2: dict[str, list[float]] = {s: [] for s in sensor_names}
+    tasks: list = []
+    ops: list = []
+    idx = 0
+    # Extreme 1: INTRO_N_TRIALS global DP runs; KL per-sensor computed in caller.
+    for trial in range(INTRO_N_TRIALS):
+        seed = 200_000 + trial * 13
+        tasks.append((idx, ("global",), "uniform", 1,
+                      INTRO_EPSILON, INTRO_W, seed, "noisy"))
+        ops.append(("e1",))
+        idx += 1
+    # Extreme 2: per-publisher DP
     for s in sensor_names:
         if s not in per_pub_all:
             continue
-        pp, B = per_pub_all[s]
-        for i, series in enumerate(pp.values()):
-            pa = [v if v is not None else 0.0 for v in series]
-            pc = [1 if v is not None else 0 for v in series]
+        pp, _ = per_pub_all[s]
+        for i, pub_id in enumerate(pp.keys()):
             for trial in range(INTRO_N_TRIALS):
-                tv, nv = _apply_dp(pa, pc, epsilon=INTRO_EPSILON, w=INTRO_W,
-                                   min_publishers=1, payload_bound=B,
-                                   seed=300_000 + i * 1000 + trial,
-                                   strategy=uniform)
-                k = _kl_of(tv, nv)
-                if np.isfinite(k):
-                    e2[s].append(k)
-    results["Extreme 2\n(per-publisher)"] = {
-        s: float(np.mean(v)) if v else float("nan") for s, v in e2.items()
-    }
-
-    # Our approach: clamped aggregate with P-gated BA at P_our.
-    ours: dict[str, list[float]] = {s: [] for s in sensor_names}
+                seed = 300_000 + i * 1000 + trial
+                tasks.append((idx, ("pub", s, pub_id), "uniform", 1,
+                              INTRO_EPSILON, INTRO_W, seed, "self_kl"))
+                ops.append(("e2", s))
+                idx += 1
+    # Our approach: P-gated BA at P_our on each sensor's clamped aggregate
     for s in sensor_names:
-        agg, cnt, B = sensor_streams[s]
         for trial in range(INTRO_N_TRIALS):
-            tv, nv = _apply_dp(agg, cnt, epsilon=INTRO_EPSILON, w=INTRO_W,
-                               min_publishers=P_our, payload_bound=B,
-                               seed=400_000 + trial,
-                               strategy=BudgetStrategy.P_GATED_BA)
-            k = _kl_of(tv, nv)
+            seed = 400_000 + trial
+            tasks.append((idx, ("agg", s), "p_gated_ba", P_our,
+                          INTRO_EPSILON, INTRO_W, seed, "self_kl"))
+            ops.append(("ours", s))
+            idx += 1
+
+    logger.info(f"  [{dataset_name}] kl_extremes_vs_ours: dispatching "
+                f"{len(tasks)} DP runs across {workers} worker(s)")
+    run_results = _run_parallel_tasks(
+        tasks, _dp_named_task,
+        workers=workers,
+        initializer=_init_named_streams_worker,
+        initargs=(named,),
+        progress_label=f"  [{dataset_name}] extremes",
+        progress_every=max(50, len(tasks) // 20),
+    )
+
+    e1: dict[str, list[float]] = {s: [] for s in sensor_names}
+    e2: dict[str, list[float]] = {s: [] for s in sensor_names}
+    ours: dict[str, list[float]] = {s: [] for s in sensor_names}
+    for op, res in zip(ops, run_results):
+        kind = op[0]
+        if kind == "e1":
+            noisy_arr = res["noisy_arr"]
+            noisy_list = [float(v) if np.isfinite(v) else None for v in noisy_arr]
+            for s in sensor_names:
+                k = compute_kl_divergence(
+                    list(sensor_streams[s][0][:T]), noisy_list,
+                )
+                if np.isfinite(k):
+                    e1[s].append(k)
+        elif kind == "e2":
+            _, s = op
+            k = res["kl_self"]
+            if np.isfinite(k):
+                e2[s].append(k)
+        else:  # "ours"
+            _, s = op
+            k = res["kl_self"]
             if np.isfinite(k):
                 ours[s].append(k)
-    results[f"Our approach\n(P={P_our} topic pool)"] = {
-        s: float(np.mean(v)) if v else float("nan") for s, v in ours.items()
+
+    results = {
+        "Extreme 1\n(global average)":
+            {s: float(np.mean(v)) if v else float("nan") for s, v in e1.items()},
+        "Extreme 2\n(per-publisher)":
+            {s: float(np.mean(v)) if v else float("nan") for s, v in e2.items()},
+        f"Our approach\n(P={P_our} topic pool)":
+            {s: float(np.mean(v)) if v else float("nan") for s, v in ours.items()},
     }
 
     csv_rows = []
@@ -1451,7 +1787,8 @@ def _kl_of(true_vals, noisy_vals):
     return k if np.isfinite(k) else float("nan")
 
 
-def u_shaped_curve(sensor_streams, per_pub_all, dataset_name, output_dir):
+def u_shaped_curve(sensor_streams, per_pub_all, dataset_name, output_dir,
+                   workers: int = 1):
     """Reproduce paper Figure 1 on real data: KL vs aggregation scope P.
 
     All three regimes use Uniform budget allocation (paper §1.3: Figure 1 is
@@ -1459,78 +1796,110 @@ def u_shaped_curve(sensor_streams, per_pub_all, dataset_name, output_dir):
     Each (P, sensor) is averaged over INTRO_N_TRIALS noise seeds to suppress
     single-draw Laplace variance.
     """
+    logger.info(f"  [{dataset_name}] u_shaped_curve: building tasks...")
     sensor_names = list(sensor_streams.keys())
     T = min(len(v[0]) for v in sensor_streams.values())
-    uniform = BudgetStrategy.UNIFORM
-
-    # P=1 per-publisher: mean KL over (publisher, trial).
-    p1_kls = []
-    for s in sensor_names:
-        if s not in per_pub_all:
-            continue
-        pp, B = per_pub_all[s]
-        for i, series in enumerate(pp.values()):
-            pa = [v if v is not None else 0.0 for v in series]
-            pc = [1 if v is not None else 0 for v in series]
-            for trial in range(INTRO_N_TRIALS):
-                seed = 1_000_000 + i * 1000 + trial
-                tv, nv = _apply_dp(pa, pc, epsilon=INTRO_EPSILON, w=INTRO_W,
-                                   min_publishers=1, payload_bound=B,
-                                   seed=seed, strategy=uniform)
-                k = _kl_of(tv, nv)
-                if np.isfinite(k):
-                    p1_kls.append(k)
-    kl_p1 = float(np.mean(p1_kls)) if p1_kls else float("nan")
-
-    # Intermediate P: per-sensor clamped-aggregate with Uniform, averaged over trials.
     sweep_p = [2, 3, 4, 6, 8]
-    mid_kls: dict[int, float] = {}
-    for P in sweep_p:
-        kls = []
-        for s in sensor_names:
-            agg, cnt, B = sensor_streams[s]
-            if max(cnt) < P:
-                continue
-            for trial in range(INTRO_N_TRIALS):
-                seed = 2_000_000 + P * 1000 + trial
-                tv, nv = _apply_dp(agg, cnt, epsilon=INTRO_EPSILON, w=INTRO_W,
-                                   min_publishers=P, payload_bound=B,
-                                   seed=seed, strategy=uniform)
-                k = _kl_of(tv, nv)
-                if np.isfinite(k):
-                    kls.append(k)
-        mid_kls[P] = float(np.mean(kls)) if kls else float("nan")
 
-    # Paper Extreme 1 "one stream per system": collapse every publisher across
-    # every metric into a SINGLE database and publish one Laplace-noised mean
-    # per tau, with R = sup across metrics and n_tau = total active publishers.
-    # Every subscriber then gets this same global value regardless of topic.
+    # Cross-metric global stream (Extreme 1 / "one stream per system").
     all_B = max(v[2] for v in sensor_streams.values())
     num_pubs_total = [sum(v[1][tau] for v in sensor_streams.values())
                       for tau in range(T)]
-    cross_metric_true = []
+    cross_metric_true: list[float] = []
     for tau in range(T):
         vals = [sensor_streams[s][0][tau] for s in sensor_names
                 if sensor_streams[s][1][tau] > 0]
         cross_metric_true.append(float(np.mean(vals)) if vals else 0.0)
 
-    g_kls = []
+    # Pack every stream keyed for the worker pool.
+    named: dict = {}
     for s in sensor_names:
-        # A subscriber to topic `<s>` wanted the per-metric mean, but under
-        # Extreme 1 is handed the cross-metric global noise instead -- that
-        # mismatch is exactly the distortion the paper is calling out.
-        true_stream = sensor_streams[s][0][:T]
+        if s in per_pub_all:
+            pp, B = per_pub_all[s]
+            for pub_id, series in pp.items():
+                pa = [v if v is not None else 0.0 for v in series]
+                pc = [1 if v is not None else 0 for v in series]
+                named[("pub", s, pub_id)] = (pa, pc, B)
+        named[("agg", s)] = sensor_streams[s]
+    named[("global",)] = (cross_metric_true, num_pubs_total, all_B)
+
+    tasks: list = []
+    ops: list = []
+    idx = 0
+    # P=1 per-publisher uses kl_self (_kl_of semantics)
+    for s in sensor_names:
+        if s not in per_pub_all:
+            continue
+        pp, _ = per_pub_all[s]
+        for i, pub_id in enumerate(pp.keys()):
+            for trial in range(INTRO_N_TRIALS):
+                seed = 1_000_000 + i * 1000 + trial
+                tasks.append((idx, ("pub", s, pub_id), "uniform", 1,
+                              INTRO_EPSILON, INTRO_W, seed, "self_kl"))
+                ops.append(("p1",))
+                idx += 1
+    # Intermediate P on clamped aggregate
+    for P in sweep_p:
+        for s in sensor_names:
+            agg, cnt, _ = sensor_streams[s]
+            if max(cnt) < P:
+                continue
+            for trial in range(INTRO_N_TRIALS):
+                seed = 2_000_000 + P * 1000 + trial
+                tasks.append((idx, ("agg", s), "uniform", P,
+                              INTRO_EPSILON, INTRO_W, seed, "self_kl"))
+                ops.append(("mid", P))
+                idx += 1
+    # Global (Extreme 1) — compare sensor's true vs global-DP noisy
+    for s in sensor_names:
         for trial in range(INTRO_N_TRIALS):
             seed = 5_000_000 + hash(s) % 10000 + trial * 7919
-            _, noisy_global = _apply_dp(
-                cross_metric_true, num_pubs_total,
-                epsilon=INTRO_EPSILON, w=INTRO_W,
-                min_publishers=1, payload_bound=all_B,
-                seed=seed, strategy=uniform,
-            )
-            k = _kl_of(true_stream, noisy_global)
+            tasks.append((idx, ("global",), "uniform", 1,
+                          INTRO_EPSILON, INTRO_W, seed, "noisy"))
+            ops.append(("global", s))
+            idx += 1
+
+    logger.info(f"  [{dataset_name}] u_shaped_curve: dispatching "
+                f"{len(tasks)} DP runs across {workers} worker(s)")
+    results = _run_parallel_tasks(
+        tasks, _dp_named_task,
+        workers=workers,
+        initializer=_init_named_streams_worker,
+        initargs=(named,),
+        progress_label=f"  [{dataset_name}] u_shape",
+        progress_every=max(50, len(tasks) // 20),
+    )
+
+    p1_kls: list[float] = []
+    mid_kls_buf: dict[int, list[float]] = {P: [] for P in sweep_p}
+    g_kls: list[float] = []
+    for op, res in zip(ops, results):
+        kind = op[0]
+        if kind == "p1":
+            k = res["kl_self"]
+            if np.isfinite(k):
+                p1_kls.append(k)
+        elif kind == "mid":
+            _, P = op
+            k = res["kl_self"]
+            if np.isfinite(k):
+                mid_kls_buf[P].append(k)
+        else:  # "global": compare sensor's true vs cross-metric noisy
+            _, s = op
+            true_stream = sensor_streams[s][0][:T]
+            noisy_arr = res["noisy_arr"]
+            # Replicate _kl_of: compute_kl_divergence handles None/NaN filtering.
+            k = compute_kl_divergence(list(true_stream),
+                                      [float(v) if np.isfinite(v) else None
+                                       for v in noisy_arr])
             if np.isfinite(k):
                 g_kls.append(k)
+
+    kl_p1 = float(np.mean(p1_kls)) if p1_kls else float("nan")
+    mid_kls: dict[int, float] = {
+        P: (float(np.mean(v)) if v else float("nan"))
+        for P, v in mid_kls_buf.items()
+    }
     kl_global = float(np.mean(g_kls)) if g_kls else float("nan")
 
     P_labels = ["1\n(per-pub)"] + [str(p) for p in sweep_p] + ["all\n(global)"]
@@ -1578,7 +1947,8 @@ def u_shaped_curve(sensor_streams, per_pub_all, dataset_name, output_dir):
     logger.info(f"  saved {path}")
 
 
-def run_intro_figures(sensor_streams, per_pub_all, dataset_name, output_dir, P_our=4):
+def run_intro_figures(sensor_streams, per_pub_all, dataset_name, output_dir,
+                      P_our=4, workers: int = 1):
     """Produce the four paper-style intro figures for one dataset."""
     if not sensor_streams:
         return
@@ -1587,8 +1957,10 @@ def run_intro_figures(sensor_streams, per_pub_all, dataset_name, output_dir, P_o
         pp_sensor = next(iter(per_pub_all))
         pp_data, pp_B = per_pub_all[pp_sensor]
         extreme2_per_publisher(pp_data, pp_B, pp_sensor, dataset_name, output_dir)
-    kl_extremes_vs_ours(sensor_streams, per_pub_all, P_our, dataset_name, output_dir)
-    u_shaped_curve(sensor_streams, per_pub_all, dataset_name, output_dir)
+    kl_extremes_vs_ours(sensor_streams, per_pub_all, P_our, dataset_name, output_dir,
+                        workers=workers)
+    u_shaped_curve(sensor_streams, per_pub_all, dataset_name, output_dir,
+                   workers=workers)
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1726,34 +2098,45 @@ def run_dataset(
     df["eps_clip"] = args.eps_clip if clamp_mode == "dp_released" else 0.0
     df.to_csv(os.path.join(dirs["sweep"], "sweep_results.csv"), index=False)
     print_summary(df, f"{spec['label']} [clamp_mode={clamp_mode}]")
-    plot_results(df, name, dirs["sweep"], streams)
+    plot_results(df, name, dirs["sweep"], streams, workers=workers)
 
     results: dict = {"sweep": df}
-    run_intro_figures(streams, per_pubs, name, dirs["intro"], P_our=4)
+    logger.info(f"  [{name}/{clamp_mode}] --- phase: intro figures ---")
+    run_intro_figures(streams, per_pubs, name, dirs["intro"], P_our=4,
+                      workers=workers)
 
     if not skip_extras:
         w_mid = max(w_values) // 2
+        logger.info(f"  [{name}/{clamp_mode}] --- phase: n-weighted spotlight ---")
         n_weighted_spotlight(streams, name, dirs["extras"], epsilon=1.0, w=w_mid, P=2)
+        logger.info(f"  [{name}/{clamp_mode}] --- phase: figure1 reproduction ---")
         fig1_df = figure1_reproduction(per_pubs, name, dirs["intro"],
-                                       epsilon=1.0, w=w_mid)
+                                       epsilon=1.0, w=w_mid,
+                                       workers=workers)
         fig1_df = fig1_df.copy()
         fig1_df["clamp_mode"] = clamp_mode
         results["figure1"] = fig1_df
+        logger.info(f"  [{name}/{clamp_mode}] --- phase: collusion ---")
         collusion_experiment(streams, name, dirs["extras"], epsilon=1.0, w=w_mid, P=2,
-                             trials_per_c=16 if quick else 32)
+                             trials_per_c=16 if quick else 32,
+                             workers=workers)
         if per_pubs:
             sensor_name = next(iter(per_pubs))
             pp, B = per_pubs[sensor_name]
+            logger.info(f"  [{name}/{clamp_mode}] --- phase: K_ext sweep ({sensor_name}) ---")
             dynamic_interval_experiment(
                 pp, B, name, sensor_name, dirs["extras"],
                 epsilon=1.0, w=w_mid, P=3,
                 k_ext_values=(0, 1, 2, 4) if quick else (0, 1, 2, 4, 8),
+                workers=workers,
             )
+            logger.info(f"  [{name}/{clamp_mode}] --- phase: hyperparameter tuning ({sensor_name}) ---")
             tune = tune_hyperparameters(
                 pp, B, name, sensor_name, dirs["tuning"],
                 epsilon=1.0, w=w_mid,
                 strategies=strategies,
                 alpha=args.alpha, I_max=args.I_max,
+                workers=workers,
             )
             # Stamp each frame with (dataset, sensor, clamp_mode) for cross-agg.
             for key in ("greedy", "brute_force", "gap_summary"):
@@ -2465,6 +2848,649 @@ def experiment_D_plugin_path(
     return df_rel, df_sum
 
 
+# ═════════════════════════════════════════════════════════════════════════
+#  Experiment E: live MQTT broker sanity subset
+# ═════════════════════════════════════════════════════════════════════════
+#
+# Unlike Experiment D (stubbed MQTT + deterministic clock), Experiment E runs
+# every config end-to-end through a real MQTT broker (default localhost:1883).
+# For each config:
+#
+#   1. Spin up a PrivacyPlugin connected to the broker with a unique
+#      paho client_id and unique raw/protected topic prefixes.
+#   2. Spin up a paho subscriber on the protected prefix that logs every
+#      delivered release.
+#   3. Spin up a paho publisher that emits each tau's per-publisher readings
+#      on the raw prefix at a wall-clock cadence of `live_dt` seconds.
+#   4. Wait for the plugin's timer loop to drain the final window, then stop.
+#   5. Metrics are computed from plugin.release_log (the canonical in-process
+#      record, same as Experiment D).  The subscriber count is checked against
+#      the plugin's non-deferred release count to validate the broker path.
+#
+# Safe parallel execution: every config generates a UUID and uses it in both
+# its topic prefixes and its paho client_ids, so N configs can share a single
+# broker without cross-talk.  NMAE / KL / release_rate / attribution_advantage
+# are computed per config and compared to an offline `run_dp_on_stream` call
+# under the same seed; the delta is reported as a sanity metric.
+
+def _live_raw_topic(prefix: str, leaf: str) -> str:
+    return f"{prefix}/{leaf}"
+
+
+class _EmbeddedBroker:
+    """Embedded amqtt (pure-Python) MQTT broker, started on a background thread.
+
+    Used by ``--experiment E`` when no broker is already listening on the
+    requested (host, port).  Runs an asyncio loop in a daemon thread hosting
+    the ``amqtt.broker.Broker`` instance; ``stop()`` cleanly shuts both down.
+    """
+
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._broker = None
+        self._thread: threading.Thread | None = None
+        self._started = threading.Event()
+        self._start_error: BaseException | None = None
+
+    def start(self, timeout: float = 10.0) -> None:
+        import asyncio as _asyncio
+        try:
+            from amqtt.broker import Broker  # noqa: F401 (import-check only)
+        except ImportError as exc:
+            raise RuntimeError(
+                "amqtt is not installed; either install it "
+                "(`pip install amqtt`) or start an external MQTT broker "
+                "(e.g., mosquitto) before running --experiment E."
+            ) from exc
+
+        def _runner():
+            try:
+                loop = _asyncio.new_event_loop()
+                _asyncio.set_event_loop(loop)
+                self._loop = loop
+                from amqtt.broker import Broker
+                config = {
+                    "listeners": {
+                        "default": {
+                            "type": "tcp",
+                            "bind": f"{self.host}:{self.port}",
+                        }
+                    },
+                    "auth": {"allow-anonymous": True},
+                    # Disable the $SYS plugin's periodic reporting; it tries
+                    # to compare sys_interval (None) to 0 and spams warnings.
+                    "sys_interval": 0,
+                }
+
+                async def _bring_up():
+                    # Broker.__init__ and start() both need a running loop.
+                    self._broker = Broker(config=config)
+                    await self._broker.start()
+
+                loop.run_until_complete(_bring_up())
+                self._started.set()
+                loop.run_forever()
+            except BaseException as exc:  # pragma: no cover
+                self._start_error = exc
+                self._started.set()
+
+        self._thread = threading.Thread(
+            target=_runner, name="pubsubpriv-embedded-broker", daemon=True,
+        )
+        self._thread.start()
+        if not self._started.wait(timeout=timeout):
+            raise RuntimeError(
+                f"Embedded broker did not start within {timeout}s"
+            )
+        if self._start_error is not None:
+            raise self._start_error
+        # Give paho clients a beat to be able to connect reliably.
+        time.sleep(0.3)
+        logger.info(f"[exp E] embedded amqtt broker listening at {self.host}:{self.port}")
+
+    def stop(self, timeout: float = 5.0) -> None:
+        if self._loop is None:
+            return
+        loop = self._loop
+
+        async def _shutdown():
+            try:
+                if self._broker is not None:
+                    await self._broker.shutdown()
+            except Exception:
+                pass
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(_shutdown(), loop)
+            fut.result(timeout=timeout)
+        except Exception:
+            pass
+        loop.call_soon_threadsafe(loop.stop)
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+        self._loop = None
+        logger.info("[exp E] embedded broker stopped")
+
+
+def _broker_is_listening(host: str, port: int, timeout: float = 0.75) -> bool:
+    import socket
+    s = socket.socket()
+    s.settimeout(timeout)
+    try:
+        s.connect((host, port))
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def _ensure_broker(host: str, port: int, auto_start: bool) -> "_EmbeddedBroker | None":
+    """If a broker is already listening, return None.  Otherwise, start an
+    embedded amqtt broker on (host, port) and return a handle whose ``stop()``
+    tears it down when the experiment finishes.  Raises if ``auto_start`` is
+    false and no external broker is found.
+    """
+    if _broker_is_listening(host, port):
+        logger.info(f"[exp E] using existing broker at {host}:{port}")
+        return None
+    if not auto_start:
+        raise RuntimeError(
+            f"No MQTT broker listening at {host}:{port} and --no-auto-broker "
+            f"was specified.  Start mosquitto (or similar) first."
+        )
+    logger.info(
+        f"[exp E] no broker at {host}:{port}; starting embedded amqtt broker"
+    )
+    eb = _EmbeddedBroker(host, port)
+    eb.start()
+    return eb
+
+
+class _LiveSubscriber:
+    """paho subscriber that captures delivered releases on the protected prefix."""
+
+    def __init__(self, broker_host, broker_port, protected_prefix, client_id):
+        import paho.mqtt.client as mqtt  # local import: paho may not be installed
+        self._mqtt = mqtt
+        self.prefix = protected_prefix
+        self.received: list[dict] = []
+        self._ready = threading.Event()
+        self._client = mqtt.Client(
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+            client_id=client_id,
+        )
+
+        def _on_connect(client, *_a, **_kw):
+            client.subscribe(f"{self.prefix}/#")
+            self._ready.set()
+
+        def _on_message(_c, _u, msg):
+            try:
+                body = json.loads(msg.payload.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return
+            self.received.append({
+                "topic": msg.topic,
+                "t_start": float(body.get("t_start", 0.0)),
+                "value": float(body.get("value", 0.0)),
+                "wall_clock_recv": time.time(),
+            })
+
+        self._client.on_connect = _on_connect
+        self._client.on_message = _on_message
+        self._broker_host = broker_host
+        self._broker_port = broker_port
+
+    def start(self, connect_timeout: float = 5.0):
+        self._client.connect(self._broker_host, self._broker_port)
+        self._client.loop_start()
+        if not self._ready.wait(timeout=connect_timeout):
+            raise RuntimeError("Subscriber did not connect within timeout")
+
+    def stop(self):
+        self._client.loop_stop()
+        try:
+            self._client.disconnect()
+        except Exception:
+            pass
+
+
+class _LivePublisher:
+    """paho publisher that emits each tau's per-publisher readings at a wall-clock cadence."""
+
+    def __init__(self, broker_host, broker_port, raw_prefix, client_id):
+        import paho.mqtt.client as mqtt
+        self.prefix = raw_prefix
+        self._client = mqtt.Client(
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+            client_id=client_id,
+        )
+        self._ready = threading.Event()
+        self._client.on_connect = lambda *_a, **_kw: self._ready.set()
+        self._broker_host = broker_host
+        self._broker_port = broker_port
+        self.num_published = 0
+
+    def start(self, connect_timeout: float = 5.0):
+        self._client.connect(self._broker_host, self._broker_port)
+        self._client.loop_start()
+        if not self._ready.wait(timeout=connect_timeout):
+            raise RuntimeError("Publisher did not connect within timeout")
+
+    def publish_one(self, leaf: str, publisher_id: str, value: float):
+        topic = _live_raw_topic(self.prefix, leaf)
+        payload = json.dumps({"publisher_id": str(publisher_id),
+                              "value": float(value)}).encode("utf-8")
+        # QoS 1 so the plugin reliably sees every publish even under load.
+        info = self._client.publish(topic, payload, qos=1)
+        info.wait_for_publish(timeout=2.0)
+        self.num_published += 1
+
+    def stop(self):
+        self._client.loop_stop()
+        try:
+            self._client.disconnect()
+        except Exception:
+            pass
+
+
+def _drive_live_config(
+    per_pub: dict[str, list[float | None]],
+    sensor: str,
+    dataset_spec: dict,
+    *,
+    strategy: str,
+    epsilon: float,
+    w: int,
+    P: int,
+    broker_host: str,
+    broker_port: int,
+    live_dt: float,
+    n_steps: int,
+    seed: int,
+    drain_ticks: int = 3,
+) -> dict:
+    """Run one (strategy, epsilon, w, P) config end-to-end through a live broker.
+
+    Every component (plugin, publisher, subscriber) gets unique paho client_ids
+    and a unique topic-prefix UUID so parallel configs can share the broker.
+    Returns the plugin's release log, subscriber-received releases, and timing.
+    """
+    import uuid as _uuid
+
+    run_id = _uuid.uuid4().hex[:8]
+    raw_prefix = f"pubsubpriv/{run_id}/raw"
+    protected_prefix = f"pubsubpriv/{run_id}/protected"
+
+    lo, hi = dataset_spec["static_clamps"][sensor]
+    # Pooled scenario: every publisher emits on the SAME leaf topic, so the
+    # plugin aggregates all n_tau active publishers into a single release per
+    # tau.  This matches the offline `run_dp_on_stream` reference exactly
+    # (single stream over the mean of all active publishers).  The per-leaf
+    # hierarchical scenario with walk-ups is already covered by Experiment D;
+    # Experiment E's purpose is to verify the DP math behaves identically
+    # when the mechanism is driven through a live broker.
+    pooled_leaf = f"{sensor}"
+
+    def _leaf_of(_pub_id: str) -> str:
+        return pooled_leaf
+
+    plugin = PrivacyPlugin(
+        broker_host=broker_host,
+        broker_port=broker_port,
+        raw_prefix=raw_prefix,
+        protected_prefix=protected_prefix,
+        epsilon=epsilon,
+        window_size=w,
+        min_publishers=P,
+        strategy=strategy,
+        timestamp_interval=live_dt,
+        k_ext=0,
+        sensor_bounds={sensor: (lo, hi)},
+        client_id=f"plugin-{run_id}",
+    )
+    subscriber = _LiveSubscriber(broker_host, broker_port, protected_prefix,
+                                 client_id=f"sub-{run_id}")
+    publisher = _LivePublisher(broker_host, broker_port, raw_prefix,
+                               client_id=f"pub-{run_id}")
+
+    np.random.seed(seed)
+    publishers = list(per_pub.keys())
+    T = min(n_steps, len(per_pub[publishers[0]]))
+    tau_truth: list[dict] = []
+    t0_wall = None
+
+    try:
+        subscriber.start()
+        plugin.start()
+        publisher.start()
+
+        # Give the broker a moment to finish subscription ack-and-route before
+        # the first publish.  This avoids a race where tau=0 messages arrive
+        # before the plugin's subscription is live.
+        time.sleep(max(0.2, live_dt))
+
+        t0_wall = time.time()
+        for tau in range(T):
+            tau_start_wall = time.time()
+            active_values = []
+            for pub_id in publishers:
+                v = per_pub[pub_id][tau]
+                if v is None:
+                    continue
+                publisher.publish_one(_leaf_of(pub_id), pub_id, float(v))
+                active_values.append(max(lo, min(hi, float(v))))
+            tau_truth.append({
+                "tau": tau,
+                "true_clamped_mean": float(np.mean(active_values)) if active_values else 0.0,
+                "n_active": len(active_values),
+                "wall_clock_publish": tau_start_wall,
+            })
+            # Pace to one publish burst per live_dt so the plugin timer groups
+            # this tau's messages into one flush.
+            elapsed = time.time() - tau_start_wall
+            if elapsed < live_dt:
+                time.sleep(live_dt - elapsed)
+
+        # Drain the tail: let the plugin timer fire a few more times so the
+        # final window is released.
+        time.sleep(drain_ticks * live_dt + 0.2)
+    finally:
+        try:
+            plugin.stop()
+        finally:
+            publisher.stop()
+            subscriber.stop()
+
+    return {
+        "plugin_log": list(plugin.release_log),
+        "subscriber_received": list(subscriber.received),
+        "tau_truth": tau_truth,
+        "run_id": run_id,
+        "raw_prefix": raw_prefix,
+        "protected_prefix": protected_prefix,
+        "num_published": publisher.num_published,
+        "t0_wall": t0_wall,
+    }
+
+
+def experiment_E_live_broker(
+    dataset_name: str,
+    output_dir: str,
+    args,
+    *,
+    broker_host: str = "localhost",
+    broker_port: int = 1883,
+    live_dt: float = 0.1,
+    n_steps: int = 120,
+    seed: int = 123,
+    auto_start_broker: bool = True,
+) -> pd.DataFrame:
+    """Exp E: small sanity grid through a live MQTT broker.
+
+    Grid (9 configs): 3 strategies × 3 epsilons × 1 (dataset, sensor, w, P).
+    Intended for the smallest datasets ('wearable' default); do NOT run on
+    'energy' (~36k windows per sensor -> hours of broker traffic).
+
+    If no broker is listening at (broker_host, broker_port) and
+    ``auto_start_broker`` is True, spins up an embedded amqtt broker on the
+    same (host, port) for the duration of the experiment.
+    """
+    if dataset_name == "energy":
+        logger.warning(
+            "[exp E] 'energy' has ~36k windows/sensor; that is ~1 hour per "
+            "config at live_dt=0.1s.  Strongly recommend 'wearable' (119 "
+            "windows) or 'manufacturing' (1000)."
+        )
+
+    embedded_broker = _ensure_broker(broker_host, broker_port, auto_start_broker)
+    try:
+        return _experiment_E_run(
+            dataset_name, output_dir, args,
+            broker_host=broker_host, broker_port=broker_port,
+            live_dt=live_dt, n_steps=n_steps, seed=seed,
+        )
+    finally:
+        if embedded_broker is not None:
+            embedded_broker.stop()
+
+
+def _experiment_E_run(
+    dataset_name: str,
+    output_dir: str,
+    args,
+    *,
+    broker_host: str,
+    broker_port: int,
+    live_dt: float,
+    n_steps: int,
+    seed: int,
+) -> pd.DataFrame:
+    prepared = prepare_dataset(
+        dataset_name,
+        clamp_mode="static",
+        eps_clip=args.eps_clip,
+        seed=args.seed,
+        max_rows=_dataset_max_rows(dataset_name, args),
+    )
+    if prepared is None or not prepared.per_pubs:
+        logger.warning(f"[exp E] nothing prepared for {dataset_name}; skip")
+        return pd.DataFrame()
+
+    sensor = next(
+        (s for s in prepared.spec["sensors"]
+         if s in prepared.per_pubs
+         and s in prepared.spec["static_clamps"]
+         and len(prepared.per_pubs[s][0]) >= 2),
+        None,
+    )
+    if sensor is None:
+        logger.warning(f"[exp E] no suitable sensor in {dataset_name}; skip")
+        return pd.DataFrame()
+
+    per_pub = prepared.per_pubs[sensor][0]
+    lo, hi = prepared.spec["static_clamps"][sensor]
+    B = float(hi - lo)
+
+    strategies = ["uniform", "p_gated_ba", "n_weighted"]
+    epsilons = [0.5, 1.0, 2.0]
+    w = 8
+    P = 2
+
+    exp_dir = os.path.join(output_dir, "experiments", "E_live_broker")
+    os.makedirs(exp_dir, exist_ok=True)
+
+    rows = []
+    t_exp_start = time.time()
+    for strategy in strategies:
+        for epsilon in epsilons:
+            t_cfg = time.time()
+            logger.info(
+                f"[exp E] {dataset_name}/{sensor} strategy={strategy} "
+                f"eps={epsilon} w={w} P={P} (live broker {broker_host}:{broker_port})"
+            )
+            try:
+                out = _drive_live_config(
+                    per_pub, sensor, prepared.spec,
+                    strategy=strategy, epsilon=epsilon, w=w, P=P,
+                    broker_host=broker_host, broker_port=broker_port,
+                    live_dt=live_dt, n_steps=n_steps, seed=seed,
+                )
+            except Exception as exc:
+                logger.exception(
+                    f"[exp E] config failed (strategy={strategy}, eps={epsilon}): {exc}"
+                )
+                rows.append({
+                    "dataset": dataset_name, "sensor": sensor,
+                    "strategy": strategy, "epsilon": epsilon,
+                    "w": w, "P": P, "status": "error",
+                    "error": str(exc),
+                })
+                continue
+
+            log = out["plugin_log"]
+            released = [r for r in log if not r["deferred"]
+                        and r["released_value"] is not None]
+            # Everything the plugin actually published to the broker
+            # (includes deferred-but-repeated-value emissions, which are
+            # still valid w-event releases and still reach subscribers).
+            plugin_published = [r for r in log if r["released_value"] is not None]
+
+            # Metrics from the plugin log (canonical).
+            live_nmae, live_mae, live_kl, live_attr = _live_metrics(
+                released, out["tau_truth"], B,
+            )
+
+            # Offline reference with same seed.
+            agg = [e["true_clamped_mean"] for e in out["tau_truth"]]
+            cnt = [e["n_active"] for e in out["tau_truth"]]
+            offline = run_dp_on_stream(
+                agg, cnt, epsilon=epsilon, window_size=w,
+                min_publishers=P, payload_bound=B,
+                strategy=strategy, seed=seed,
+            )
+            off_m = offline["metrics"]
+
+            broker_deliveries = len(out["subscriber_received"])
+            # Broker-path integrity: every protected-topic publish the plugin
+            # made should have been delivered to the subscriber.
+            broker_delivery_ok = broker_deliveries == len(plugin_published)
+
+            rows.append({
+                "dataset": dataset_name,
+                "sensor": sensor,
+                "strategy": strategy,
+                "epsilon": epsilon,
+                "w": w,
+                "P": P,
+                "run_id": out["run_id"],
+                "num_taus": len(log),
+                "num_released": len(released),
+                "num_plugin_published": len(plugin_published),
+                "release_rate_live": len(released) / max(1, len(log)),
+                "release_rate_offline": off_m.get("release_rate", float("nan")),
+                "nmae_live": live_nmae,
+                "nmae_offline": off_m.get("normalized_mae", float("nan")),
+                "nmae_abs_delta": abs(live_nmae - off_m.get("normalized_mae", float("nan"))),
+                "mae_live": live_mae,
+                "kl_live": live_kl,
+                "kl_offline": off_m.get("kl_divergence", float("nan")),
+                "attribution_advantage_live": live_attr,
+                "attribution_advantage_offline": off_m.get("attribution_advantage", float("nan")),
+                "broker_deliveries": broker_deliveries,
+                "broker_delivery_ok": broker_delivery_ok,
+                "num_input_published": out["num_published"],
+                "wall_clock_seconds": round(time.time() - t_cfg, 2),
+                "status": "ok",
+            })
+            logger.info(
+                f"[exp E]   released={len(released)}/{len(log)} "
+                f"broker_delivered={broker_deliveries} "
+                f"nmae_live={live_nmae:.4f} nmae_offline={off_m.get('normalized_mae', 0):.4f} "
+                f"(elapsed {time.time() - t_cfg:.1f}s)"
+            )
+
+    df = pd.DataFrame(rows)
+    df.to_csv(os.path.join(exp_dir, "experiment_E_live_broker.csv"), index=False)
+    logger.info(
+        f"  Experiment E wrote {len(df)} rows -> {exp_dir} "
+        f"(total wall-clock {time.time() - t_exp_start:.1f}s)"
+    )
+
+    _plot_experiment_E(df, os.path.join(exp_dir, "experiment_E_live_broker.png"),
+                       dataset_name, sensor, live_dt, broker_host, broker_port)
+    return df
+
+
+def _live_metrics(released_records, tau_truth, payload_bound):
+    """Compute NMAE / MAE / KL / attribution advantage from the plugin's release log."""
+    if not released_records:
+        return float("nan"), float("nan"), float("nan"), float("nan")
+    # Match by tau index (plugin's current_tau counts from 1; tau_truth from 0).
+    truth_by_tau = {e["tau"]: e for e in tau_truth}
+    abs_err = []
+    attr = []
+    fresh_true, fresh_noisy = [], []
+    for r in released_records:
+        t = truth_by_tau.get(r["tau"] - 1)
+        if t is None:
+            continue
+        err = abs(r["released_value"] - t["true_clamped_mean"])
+        abs_err.append(err)
+        if r["n_tau"] > 0:
+            attr.append(1.0 / r["n_tau"])
+        fresh_true.append(t["true_clamped_mean"])
+        fresh_noisy.append(r["released_value"])
+    if not abs_err:
+        return float("nan"), float("nan"), float("nan"), float("nan")
+    mae = float(np.mean(abs_err))
+    nmae = mae / max(payload_bound, 1e-9)
+    # KL using the same binning rules as dp_engine (import-on-demand).
+    try:
+        from dp_engine import compute_kl_divergence
+        kl = float(compute_kl_divergence(np.array(fresh_true),
+                                         np.array(fresh_noisy)))
+    except Exception:
+        kl = float("nan")
+    attr_adv = float(np.mean(attr)) if attr else float("nan")
+    return nmae, mae, kl, attr_adv
+
+
+def _plot_experiment_E(df, path, dataset_name, sensor, live_dt, broker_host, broker_port):
+    """Bar + scatter plot comparing live-broker metrics to offline reference."""
+    if df.empty:
+        return
+    ok = df[df["status"] == "ok"].copy()
+    if ok.empty:
+        return
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4.2))
+
+    # (a) NMAE live vs offline per config
+    labels = [f"{r.strategy}\neps={r.epsilon}" for r in ok.itertuples()]
+    x = np.arange(len(labels))
+    bw = 0.38
+    axes[0].bar(x - bw / 2, ok["nmae_live"], bw, label="live broker", color="C0")
+    axes[0].bar(x + bw / 2, ok["nmae_offline"], bw, label="offline (same seed)", color="C1")
+    axes[0].set(xticks=x, ylabel="NMAE",
+                title="(a) Utility: live broker vs offline engine")
+    axes[0].set_xticklabels(labels, fontsize=8, rotation=0)
+    axes[0].grid(True, alpha=0.3, axis="y")
+    axes[0].legend(fontsize=8)
+
+    # (b) KL live vs offline
+    axes[1].bar(x - bw / 2, ok["kl_live"], bw, label="live broker", color="C0")
+    axes[1].bar(x + bw / 2, ok["kl_offline"], bw, label="offline (same seed)", color="C1")
+    axes[1].set(xticks=x, ylabel="KL divergence",
+                title="(b) Distributional utility")
+    axes[1].set_xticklabels(labels, fontsize=8, rotation=0)
+    axes[1].grid(True, alpha=0.3, axis="y")
+    axes[1].legend(fontsize=8)
+
+    # (c) Broker delivery integrity
+    axes[2].bar(x - bw / 2, ok["num_released"], bw, label="plugin released", color="C2")
+    axes[2].bar(x + bw / 2, ok["broker_deliveries"], bw, label="subscriber received", color="C3")
+    axes[2].set(xticks=x, ylabel="count",
+                title="(c) MQTT path integrity")
+    axes[2].set_xticklabels(labels, fontsize=8, rotation=0)
+    axes[2].grid(True, alpha=0.3, axis="y")
+    axes[2].legend(fontsize=8)
+
+    fig.suptitle(
+        f"Experiment E: live MQTT broker [{broker_host}:{broker_port}] "
+        f"dataset={dataset_name} sensor={sensor} dt={live_dt}s",
+        fontsize=11,
+    )
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+
+
 def _plot_single_axis_experiment(df, x_col, x_label, path, title, logx=False):
     """Shared plot for Experiments B/C: one panel per dataset, curves per combo."""
     if df.empty:
@@ -2592,13 +3618,41 @@ def main():
                         help="Only run the Section 5.7 hyperparameter tuning")
     parser.add_argument(
         "--experiment",
-        choices=["full", "sweep", "tune", "A", "B", "C", "D", "ABC", "ABCD", "none"],
+        choices=["full", "sweep", "tune", "A", "B", "C", "D", "E",
+                 "ABC", "ABCD", "none"],
         default="full",
         help="'full' runs sweep + intro + tuning + experiments A/B/C/D.  "
              "'sweep' is the main grid only.  'tune' is just Algorithm 2 / "
              "brute-force tuning.  A/B/C/D pick one single-axis experiment "
-             "(D is the end-to-end plugin path).  'ABC' or 'ABCD' runs the "
-             "single-axis experiments only.",
+             "(D is the end-to-end plugin path).  'E' runs the live-broker "
+             "sanity subset (requires a real MQTT broker, default "
+             "localhost:1883; recommend --dataset wearable).  'ABC' or 'ABCD' "
+             "runs the single-axis experiments only.",
+    )
+    parser.add_argument(
+        "--broker-host", default="localhost",
+        help="MQTT broker host for Experiment E (live-broker sanity subset)",
+    )
+    parser.add_argument(
+        "--broker-port", type=int, default=1883,
+        help="MQTT broker port for Experiment E",
+    )
+    parser.add_argument(
+        "--live-dt", type=float, default=0.1,
+        help="Wall-clock seconds per logical timestamp for Experiment E "
+             "(short values compress runtime; default 0.1s)",
+    )
+    parser.add_argument(
+        "--live-n-steps", type=int, default=120,
+        help="Cap on logical timestamps per config for Experiment E",
+    )
+    parser.add_argument(
+        "--no-auto-broker", dest="auto_broker", action="store_false",
+        default=True,
+        help="Do not auto-start an embedded amqtt broker for Experiment E "
+             "when none is listening; fail instead.  Default behaviour is to "
+             "reuse any existing broker at --broker-host/--broker-port, "
+             "otherwise spin one up for the run.",
     )
     parser.add_argument(
         "--workers", type=int, default=0,
@@ -2659,6 +3713,7 @@ def main():
                     epsilon=1.0, w=8,
                     strategies=strategies,
                     alpha=args.alpha, I_max=args.I_max,
+                    workers=args.workers,
                 )
                 for key in ("greedy", "brute_force", "gap_summary"):
                     tune[key]["dataset"] = name
@@ -2673,6 +3728,26 @@ def main():
 
     run_main_pipeline = args.experiment in ("full", "sweep")
     run_single_axis = args.experiment in ("full", "ABC", "ABCD", "A", "B", "C", "D")
+    run_live_E = args.experiment == "E"
+
+    if run_live_E:
+        ds_for_E = args.dataset if args.dataset != "all" else "wearable"
+        if ds_for_E == "energy":
+            logger.warning(
+                "[exp E] --dataset energy is strongly discouraged "
+                "(~36k windows/sensor). Recommend 'wearable' or 'manufacturing'."
+            )
+        experiment_E_live_broker(
+            ds_for_E, args.output_dir, args,
+            broker_host=args.broker_host,
+            broker_port=args.broker_port,
+            live_dt=args.live_dt,
+            n_steps=args.live_n_steps,
+            seed=args.seed or 123,
+            auto_start_broker=args.auto_broker,
+        )
+        logger.info("Experiment E complete.")
+        return
 
     if run_main_pipeline:
         for clamp_mode in clamp_modes:

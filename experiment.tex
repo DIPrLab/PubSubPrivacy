@@ -1,0 +1,468 @@
+\section{Experimental Evaluation}
+\label{sec:experiment}
+
+We evaluate clamped $w$-event differential privacy with $P$-allocation on six real-world IoT datasets that span the three motivating scenarios of Section~\ref{sec:inference-attacks} (traffic, smart-meter energy, wearable health) plus three additional benchmarks covering urban air quality, urban mobility, and industrial manufacturing. The goals of the evaluation are threefold:
+
+\begin{enumerate}
+\item \textbf{Algorithm~\ref{alg:greedy-tune} (greedy hill-climb over $P$).} Validate the approximation quality and computational advantage of the offline greedy tuning step of Section~\ref{sec:tuning} against an exhaustive sweep over every integer $P$ in $[1, n_{\max}]$, as licensed by the unimodality argument of Proposition~\ref{prop:alg2-convergence}.
+\item \textbf{Window size $w$.} Verify the linear dependence of the Laplace scale $\lambda_\tau = \Delta_f\,w/\epsilon$ (Theorem~\ref{thm:s-sensitive-budget}) on $w$, holding $P$, $\epsilon$, and the allocation strategy fixed.
+\item \textbf{Privacy budget $\epsilon$.} Verify the inverse dependence of $\lambda_\tau$ on $\epsilon$ (again Theorem~\ref{thm:s-sensitive-budget}), holding $P$, $w$, and the allocation strategy fixed.
+\end{enumerate}
+
+Each experiment isolates a single axis of the hyperparameter space (Section~\ref{sec:tuning}) so the effect on utility is unambiguous, complementing the full parameter sweep in \texttt{sweep} and the motivating Figure~\ref{fig:distortion-vs-scope} from Section~\ref{sec:streaming-gap}.
+
+\subsection{Implementation}
+\label{sec:impl}
+
+We implement the privacy mechanism as a plugin to an MQTT broker (\texttt{plugin.py}). The full source, experiment harness, and dataset loaders are available at \url{https://github.com/DIPrLab/PubSubPrivacy}. The plugin interposes between publishers and subscribers: it subscribes to all raw topics under a configurable prefix (e.g., \texttt{factory/raw/\#}), buffers incoming messages within each discrete timestamp interval $\Delta t$ starting at $t_\tau^{\text{start}}$, clamps each payload to its publisher-specific interval $[a_p, b_p]$ (Definition~\ref{def:clamp-range}), computes the per-topic clamped aggregation $e_\tau = f(D_\tau)$ (default mean), applies the $w$-event Laplace mechanism with scale $\Delta_f/\epsilon_\tau$, and publishes on the subscriber's protected topic exactly one pair $(\hat{e}_\tau, t_\tau^{\text{start}})$. The broker-internal quantities $n_\tau$, $\mathrm{scope}(\tau)$, $\epsilon_\tau$, $\lambda_\tau$, and $\tau$ itself are not transmitted.
+
+\paragraph{Aggregation and release (Algorithm~\ref{alg:release}).}
+At each interval $\tau$, the broker collects $\{\tilde{x}_{p,\tau} : p \in \mathcal{P}_\tau\}$, computes $e_\tau = f(D_\tau)$ and $n_\tau = |\mathcal{P}_\tau|$, derives the data-independent sensitivity $\Delta_f$ from $R$ and $n_\tau$ (Table~\ref{tab:sensitivity-defaults}), and hands everything to the allocation strategy. Notably, $P$ does not appear in the noise scale; it enters only through the strategy's scheduling decision. The per-element budget $\epsilon_\tau$ returned by the strategy is clipped to the remaining window budget $\epsilon - \sum_{j=\tau-w+1}^{\tau-1} \epsilon_j$, and the release uses Laplace noise of scale $\Delta_f/\epsilon_\tau$.
+
+\begin{algorithm}[t]
+\caption{Per-element release at interval $\tau$ (wall-clock start $t_\tau^{\text{start}}$)}\label{alg:release}
+\begin{algorithmic}[1]
+\Require Clamped aggregate $e_\tau = f(D_\tau)$, multiplicity $n_\tau$,
+clamp $R$, aggregation $f$ with sensitivity $\Delta_f = \Delta_f(R, n_\tau)$,
+DP budget $\epsilon$, window $w$, strategy $\mathcal{A}$, interval start
+$t_\tau^{\text{start}}$
+\Ensure Delivered pair $(\hat{e}_\tau, t_\tau^{\text{start}})$
+\State $(\epsilon_\tau,\ \textit{defer}) \gets \mathcal{A}.\textsc{Allocate}(\tau, e_\tau, n_\tau)$
+\State $\epsilon_\tau \gets \min\!\bigl(\epsilon_\tau,\; \epsilon - \sum_{j=\tau-w+1}^{\tau-1} \epsilon_j\bigr)$
+  \Comment{Enforce window budget~\eqref{eq:budget-thm}}
+\If{$\textit{defer}$ \textbf{or} $\epsilon_\tau \le 0$}
+  \State $\hat{e}_\tau \gets \hat{e}_{\tau-1}$; record $\epsilon_\tau = 0$
+  \State \Return $(\hat{e}_\tau, t_\tau^{\text{start}})$
+\EndIf
+\State $\lambda_\tau \gets \Delta_f / \epsilon_\tau$ \Comment{$\Delta_f$ depends only on public $R$ and $n_\tau$}
+\State $\hat{e}_\tau \gets e_\tau + \mathrm{Lap}(\lambda_\tau)$
+\State Record $\epsilon_\tau$ in sliding window
+\State \Return $(\hat{e}_\tau, t_\tau^{\text{start}})$ \Comment{Only the aggregate and interval start are delivered}
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Budget-allocation strategies (Algorithm~\ref{alg:strategies}).}
+We implement the four budget-allocation strategies from Kellaris et al.~\cite{kellaris2014} (Uniform, Sample, Budget Distribution, Budget Absorption), our new $n$-weighted allocation (Section~\ref{sec:n-weighted}), and three of them composed through the $P$-gated wrapper ($P$-gated Uniform, $P$-gated Sample, $P$-gated BA; Section~\ref{sec:p-allocation}). Each strategy returns a pair $(\epsilon_\tau, \textit{defer})$ to Algorithm~\ref{alg:release}. The $P$-gated wrapper first invokes the clamp-compatible greedy scope walk (Algorithm~\ref{alg:greedy-scope}) to find the release scope; if no ancestor meets $P$ the timestamp is deferred, otherwise the inner strategy is invoked on the scope-scoped $n_\tau$. Because $n_\tau$ and the clamp intervals are public under the neighboring relation, both gating and $n$-weighting consume no privacy budget and do not enter the Laplace scale.
+
+\begin{algorithm}[t]
+\caption{Budget-allocation strategies}\label{alg:strategies}
+\begin{algorithmic}[1]
+\Procedure{Uniform.Allocate}{$\tau, e_\tau, n_\tau$}
+  \State \Return $(\epsilon / w,\; \textit{false})$
+\EndProcedure
+\Statex
+\Procedure{Sample.Allocate}{$\tau, e_\tau, n_\tau$}
+  \If{$\tau \bmod w = 1$}
+    \State \Return $(\epsilon,\; \textit{false})$
+  \Else
+    \State \Return $(0,\; \textit{true})$
+  \EndIf
+\EndProcedure
+\Statex
+\Procedure{BudgetDistribution.Allocate}{$\tau, e_\tau, n_\tau$}
+  \Comment{Kellaris et al.~\cite{kellaris2014}: on a skip, evenly distribute the skipped share across future timestamps in the window.}
+  \If{$|e_\tau - e_\tau^{\text{last-rel}}| < \theta \cdot R$} \Comment{$\theta = 0.1$}
+    \State For $j = 1, \ldots, w-1$: $b_{\text{fwd}}[\tau + j] \mathrel{+}= (\epsilon/w) / (w-1)$
+    \State \Return $(0,\; \textit{true})$
+  \Else
+    \State $\epsilon_\tau \gets \epsilon / w + b_{\text{fwd}}[\tau]$;\quad $b_{\text{fwd}}[\tau] \gets 0$
+    \State \Return $(\epsilon_\tau,\; \textit{false})$
+  \EndIf
+\EndProcedure
+\Statex
+\Procedure{BudgetAbsorption.Allocate}{$\tau, e_\tau, n_\tau$}
+  \Comment{$e_\tau^{\text{last-rel}}$ is the clean aggregate at the most recent release;
+  skipped timestamps do not update it.}
+  \If{$|e_\tau - e_\tau^{\text{last-rel}}| < \theta \cdot R$} \Comment{$\theta = 0.1$}
+    \State $b_{\mathrm{absorbed}} \mathrel{+}= \epsilon / w$
+    \State \Return $(0,\; \textit{true})$
+  \Else
+    \State $\epsilon_\tau \gets \epsilon / w + b_{\mathrm{absorbed}}$;
+           $b_{\mathrm{absorbed}} \gets 0$
+    \State \Return $(\epsilon_\tau,\; \textit{false})$
+  \EndIf
+\EndProcedure
+\Statex
+\Procedure{NWeighted.Allocate}{$\tau, e_\tau, n_\tau$}
+  \Comment{Section~\ref{sec:n-weighted}, weights $\epsilon$ by $n_\tau$}
+  \State Let $Q$ be a sliding deque of the last $w-1$ past eligible counts
+  \Comment{current $n_\tau$ is the $w$-th entry, added to the denominator below}
+  \If{$|Q| < w - 1$}
+    \State \Return $(\epsilon / w,\; \textit{false})$ \Comment{Warm-up: Uniform until window is full}
+  \EndIf
+  \State $S \gets n_\tau + \sum_{j \in Q} n_j$ \Comment{Sum of $w$ multiplicities in the window}
+  \State Append $n_\tau$ to $Q$ (after the release)
+  \State \Return $(\epsilon \cdot n_\tau / S,\; \textit{false})$ \Comment{See Eq.~\eqref{eq:n-weighted}}
+\EndProcedure
+\Statex
+\Procedure{$P$-Gated.Allocate}{$\tau, e_\tau, n_\tau$;\ inner $\mathcal{A}$}
+  \State $(\mathrm{scope}, n_\tau) \gets \textsc{GreedyScopeWalk}(t_{\text{sub}}, \mathcal{P}_\tau, P, R)$
+    \Comment{Algorithm~\ref{alg:greedy-scope}}
+  \If{$\mathrm{scope} = \bot$}
+    \State \Return $(0,\; \textit{true})$ \Comment{Defer (no clamp-compatible ancestor has $\geq P$)}
+  \Else
+    \State \Return $\mathcal{A}.\textsc{Allocate}(\tau, e_\tau, n_\tau)$
+  \EndIf
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Broker plugin architecture.}
+The plugin runs as a separate MQTT client connected to the same broker as the publishers and subscribers. It subscribes to all topics under a configurable raw prefix, maintaining a per-topic buffer that maps publisher identifiers to their most recent clamped payload within the current timestamp interval. A periodic timer fires every $\Delta t$ seconds; at each tick the plugin executes Algorithm~\ref{alg:release} for every active topic, publishes the result together with the wall-clock interval start time on the corresponding protected topic, and clears the buffer. When $n_\tau < P$ at the leaf scope and extensions are available, the plugin first applies the adaptive interval extension of Section~\ref{sec:dynamic-timestamp} (up to $K_{\text{ext}}$ extensions of $\Delta t$, giving a worst-case wait $T_{\max} = K_{\text{ext}}\!\cdot\!\Delta t$); only then does it fall back to the greedy clamp-compatible scope walk of Algorithm~\ref{alg:greedy-scope}. Each topic maintains an independent \texttt{StreamState} comprising the sliding budget window, a bounded deque of size $w$, the last released value, and the absorbed-budget accumulator for the BA family. The plugin is stateless across topics: no cross-topic information is used, so the $w$-event $\epsilon$ guarantee holds independently per subscription.
+
+\subsection{Datasets and Topic Hierarchies}
+\label{sec:datasets}
+
+Table~\ref{tab:datasets} summarizes the six publicly available IoT datasets we evaluate on. Each dataset is ingested by \texttt{data\_streams.py}, which registers it in a \texttt{DATASETS} dictionary binding the raw CSV(s) to (i) a per-sensor stream builder that resamples raw rows into the pair $(e_\tau, n_\tau)$, (ii) a per-publisher table used for the per-topic experiments, (iii) the operator-declared static clamp intervals $[a_p, b_p]$ of Option~A (Definition~\ref{def:clamp-range}), (iv) a public fallback bound $M$ for the Option~B DP-released calibration, and (v) the normative MQTT topic hierarchy on which the mechanism publishes.
+
+\begin{table*}[t]
+\centering
+\footnotesize
+\caption{Real-world IoT datasets used in the evaluation. $|\mathcal{P}|$ is the number of distinct publishers (circuits, sensor devices, stations, spatial cells, or machine sub-publishers, depending on the dataset). $\Delta t$ is the base wall-clock timestamp interval; $R$ per sensor is computed from the Option~A static clamp intervals declared in \texttt{DATASETS}.}\label{tab:datasets}
+\begin{tabular}{lllrlll}
+\toprule
+Dataset (key) & Domain & Source & $|\mathcal{P}|$ & Sensors evaluated & $\Delta t$ & Topic hierarchy \\
+\midrule
+\texttt{energy}        & Smart-building energy    & MCEC-Thai public CSV             & 12 circuits                    & power (kW), voltage, current              & 5\,min      & \texttt{energy/building01/\{CT\}/\{metric\}} \\
+\texttt{traffic}       & Intersection traffic     & Colorado Springs public feed     & 4--8 sensors (per-file)        & speed, object count                       & 10\,s       & \texttt{traffic/intersection01/\{kind\}/\{id\}/\{metric\}} \\
+\texttt{wearable}      & Wearable health          & Kaggle (dcsavinod)               & 5--20 devices (dataset-dep.)   & heart rate, steps, temperature, calories  & per-reading & \texttt{health/clinic01/\{device\}/\{metric\}} \\
+\texttt{pune}          & Urban air quality        & Kaggle (akshman)                 & 20--30 stations (dataset-dep.) & PM10, PM2.5, humidity, sound, ozone       & 60\,min     & \texttt{air\_quality/pune/\{station\}/\{metric\}} \\
+\texttt{mobility}      & Smart mobility           & Kaggle (ziya07)                  & 16 cells (4$\times$4 grid)     & speed, vehicle count, occupancy, emission & 30\,min     & \texttt{mobility/nyc/\{quadrant\}/\{cell\}/\{metric\}} \\
+\texttt{manufacturing} & Industrial process       & Kaggle (programmer3)             & up to 10 sub-machines          & temperature, speed, vibration, quality    & 10\,min     & \texttt{factory/line1/\{machine\}/\{metric\}} \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\paragraph{Message model.}
+For each dataset and each registered sensor, the loader resamples the raw rows into a discrete-time stream with base interval $\Delta t$. At each logical timestamp $\tau$ we have (i) the clamped aggregate $e_\tau = \mathrm{mean}\{\tilde{x}_{p,\tau} : p \in \mathcal{P}_\tau\}$, and (ii) the multiplicity $n_\tau = |\mathcal{P}_\tau|$. Each per-publisher reading is mapped to an MQTT topic under the \texttt{topic\_root} of Table~\ref{tab:datasets}, which reproduces the deployment-topology hierarchy each dataset naturally exhibits. The topic-hierarchy walk of Section~\ref{sec:subscription-rewriting} operates on these live topic trees during every $P$-gated release.
+
+\paragraph{Clamping (Definition~\ref{def:clamp-range}).}
+Every dataset is run twice end-to-end: once under Option~A (static, operator-declared clamps from sensor datasheets or physical limits) and once under Option~B (DP-released per-publisher min/max with a dedicated budget $\epsilon_{\text{clip}} = 0.1$ and a public fallback $M$). The clamp mode is reported alongside every result so the reader can audit how the tightened $R$ of Option~B trades against its extra privacy outlay.
+
+\subsection{Metrics}
+\label{sec:metrics}
+
+We report three families of metrics, each aligned with a specific claim in the preceding sections.
+
+\paragraph{Utility (distributional and point-wise).}
+\begin{itemize}
+\item \textbf{KL divergence.} $D_{\mathrm{KL}}(\mathcal{F} \| \mathcal{G})$ between histogram-based density estimates of the true and noisy streams, with adaptive bin counts (Sturges' rule, clamped to $[5, 50]$) and Jeffreys prior smoothing ($\alpha = 0.5$). We also report the per-window $U_\tau$ and its trace mean $U_{\text{global}}$ of Section~\ref{sec:utility}. For strategies that repeat outputs on deferred timestamps, KL is computed only over timestamps with a fresh release, avoiding artificial inflation from point masses at the repeated value.
+\item \textbf{Mean Absolute Error (MAE).} $\mathrm{MAE} = \tfrac{1}{T}\sum_\tau |\hat{e}_\tau - e_\tau|$, the raw subscriber-observable error in the released clamped mean. This is the quantity whose expectation equals the Laplace scale $\lambda_\tau = R/(n_\tau\,\epsilon_\tau)$ at each release.
+\item \textbf{Normalized MAE (NMAE).} $\mathrm{NMAE} = \mathrm{MAE}/R$, the payload-range-normalized error used for cross-sensor and cross-dataset comparison.
+\end{itemize}
+
+\paragraph{Privacy (identity protection).}
+\begin{itemize}
+\item \textbf{Attribution advantage.} Mean $1/n_\tau$ over released timestamps (\texttt{dp\_engine.attribution\_advantage}). The ``Publisher identity protection'' argument of Section~\ref{sec:mechanism} bounds a single subscriber's per-publisher attribution advantage at $1/n_\tau \leq 1/P$ at every release; the empirical mean verifies that $P$-allocation actually delivers that bound on real traces.
+\end{itemize}
+
+\paragraph{Latency (delivery delay).}
+\begin{itemize}
+\item \textbf{Release rate.} Fraction of logical timestamps on which the mechanism emits a fresh release (i.e., is not deferred by the $P$-gate, value-similarity skip, or budget exhaustion). Lower release rate means higher delivery delay in logical-timestamp units.
+\item \textbf{Mean / $p_{95}$ delivery delay in $\Delta t$ units.} Number of additional base intervals the broker waits before emitting a release, measured by the dynamic-interval experiment (\texttt{dynamic\_interval\_experiment}) that sweeps $K_{\text{ext}}$ and records per-release wait time.
+\item \textbf{Suppression rate.} Fraction of timestamps at which the broker defers even after the hierarchy walk (i.e., no ancestor is clamp-compatible and above $P$). This is the residual latency/coverage cost that Section~\ref{sec:dynamic-timestamp} describes.
+\end{itemize}
+
+\subsection{Parameter Space}
+\label{sec:params}
+
+Across all three experiments, unless otherwise stated, the DP parameters $(\epsilon, w, R, [a_p, b_p], f, \Delta_f, \epsilon_{\text{clip}})$ and the hyperparameters $(\Delta t, P, K_{\text{ext}}, \mathcal{A}, \theta)$ are drawn from the following defaults and ranges (all driven by CLI arguments of \texttt{run\_experiment.py}):
+
+\begin{itemize}
+\item \textbf{Privacy budget:} $\epsilon \in \{0.5, 1.0, 2.0, 4.0\}$ for the main sweep; $\{0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0\}$ for Experiment~C.
+\item \textbf{Window size:} $w \in \{4, 8, 10, 12\}$ for the main sweep; $\{4, 6, 8, 10, 12, 16\}$ for Experiment~B.
+\item \textbf{Publisher threshold:} $P \in \{1, 2, 4, 6\}$ for the main sweep; Experiment~A additionally performs a full enumeration over $P \in [1, n_{\max}]$.
+\item \textbf{Budget strategy:} Uniform, Sample, Budget Distribution, Budget Absorption (BA), the three $P$-gated compositions that the paper explicitly evaluates ($P$-gated Uniform, $P$-gated Sample, $P$-gated BA; Section~\ref{sec:p-allocation}), and $n$-weighted $P$-allocation (Section~\ref{sec:n-weighted}). The \texttt{ALL\_STRATEGIES} constant in \texttt{run\_experiment.py} binds these eight strategies as the default set for every experiment.
+\item \textbf{Clamp mode:} Option~A (static) and Option~B ($\epsilon_{\text{clip}} = 0.1$, fallback $M$ from Table~\ref{tab:datasets}).
+\item \textbf{Attribution-advantage target:} $\alpha = 0.25$, giving the Algorithm~\ref{alg:greedy-tune} seed $P_0 = \lceil 1/\alpha \rceil = 4$.
+\item \textbf{Algorithm~\ref{alg:greedy-tune} iteration cap:} $I_{\max} = 20$.
+\end{itemize}
+
+All experiments use a fixed random seed per configuration for reproducibility. Each (dataset, sensor, configuration) triple is run on the full trace after load and clamping; short streams ($<10$ windows) are dropped.
+
+\subsection{Experiment~A: Algorithm~\ref{alg:greedy-tune} Greedy Hill-Climb over~$P$}
+\label{sec:exp-A}
+
+\paragraph{Setup.}
+For each (dataset, sensor, strategy, $\epsilon$, $w$) point we run the Algorithm~\ref{alg:greedy-tune} greedy hill-climb of Section~\ref{sec:tuning} (\texttt{greedy\_tune\_P}) and compare against an exhaustive enumeration over every integer $P \in [1, p_{\max}]$, where
+\[
+  p_{\max} \;=\; \max\!\bigl(2,\; \min(\max_\tau n_\tau,\ |\mathcal{P}|)\bigr)
+\]
+(\texttt{brute\_force\_tune\_P}). The lower bound of 2 guarantees at least one non-trivial candidate; the $\min(\max_\tau n_\tau, |\mathcal{P}|)$ upper bound is the largest $P$ for which any release can still meet the gate on the held-out trace. Both searches minimize the same trace-level scalar loss
+\[
+  L \;=\; w_{\text{util}}\!\cdot\!\mathrm{NMAE} \;+\; w_{\text{lat}}\!\cdot\!\bigl(1 - \mathrm{release\_rate}\bigr),
+\]
+with $w_{\text{util}} = 1.0$ and $w_{\text{lat}} = 0.2$, evaluated on the full dataset trace via \texttt{run\_dp\_on\_stream} (see \texttt{\_evaluate\_P} in \texttt{run\_experiment.py}). We fix $(\epsilon, w) \in \{(0.5, 8), (1.0, 8), (2.0, 8), (1.0, 4), (1.0, 12)\}$ and sweep the strategy over Uniform, Sample, BD, BA, $P$-gated Uniform, $P$-gated Sample, $P$-gated BA, and $n$-weighted (the full \texttt{ALL\_STRATEGIES} set). Everything else (dataset, sensor, clamp mode) is held fixed per row. Metrics recorded per row: greedy $P^*$, brute-force $P^\dagger$, greedy loss, brute-force loss, loss gap $L(P^*) - L(P^\dagger)$, $P$ gap $P^* - P^\dagger$, greedy evaluation count, and speedup $=$ $p_{\max}$\,/\,greedy\_evaluations.
+
+\paragraph{Hypothesis~A.}
+Under Proposition~\ref{prop:alg2-convergence}, the greedy walk terminates at a local minimum of $L$ on the integer lattice after at most $\min(I_{\max}, n_{\max})$ iterations, and is globally optimal whenever $L$ is unimodal in $P$. The paper's loss decomposition (Equation~\ref{eq:loss-decomposition}) is unimodal under a mild non-decreasing condition on the defer-cost schedule $c_{\text{def}}(P)$, which is satisfied by every hierarchy walk that only coarsens (climbs toward the root). We therefore expect (i) a near-zero loss gap $L(P^*) - L(P^\dagger) \approx 0$ on essentially every row and every dataset, and (ii) a speedup that grows linearly with $p_{\max}$: brute force evaluates $p_{\max}$ points, whereas the greedy walk evaluates only $2\,|P_0 - P^*| + 1$ (the seed plus two neighbor checks per improving step), a small constant whenever the identity-protection seed $P_0 = 4$ is close to the utility-optimal $P^*$. If the hypothesis holds, the scatter of $(L(P^*), L(P^\dagger))$ lies on the identity line.
+
+\paragraph{Results~A.}
+Across both clamp modes the sweep produced 1{,}800 (dataset, sensor, strategy, $\epsilon$, $w$) configurations: 920 rows under Option~A and 880 under Option~B (raw data in \texttt{results\_2/cross\_dataset/\{static,dp\_released\}/experiments/A\_greedy\_vs\_brute/}). The loss gap $L(P^*) - L(P^\dagger)$ is identically zero on $80.3\%$ of Option~A rows and $79.3\%$ of Option~B rows, and below $10^{-2}$ on $82.8\%$ / $81.7\%$; the median gap is zero in every (strategy, clamp) cell. For the four $P$-agnostic strategies (Uniform, Sample, BD, BA) the gap is zero on $100\%$ of rows---expected, since $P$ does not enter the release decision for these strategies and the loss is flat in $P$. For the $P$-dependent strategies ($n$-weighted, $P$-gated Uniform, $P$-gated Sample, $P$-gated BA) greedy matches brute force on $55$--$66\%$ of rows and the mean gap stays below $0.12$, well inside the first-digit NMAE uncertainty that Experiment~C will report. The rare outliers (max gap $1.23$ under Option~A, $4.52$ under Option~B) concentrate on Option~B runs at $\epsilon_{\text{clip}}=0.1$ with very small publisher counts---precisely the regime in which the defer-cost schedule of Equation~\ref{eq:loss-decomposition} can become locally non-monotone. The compute advantage tracks the prediction of Proposition~\ref{prop:alg2-convergence}: mean speedup $2.81\times$ over brute force (median $3\times$, max $4\times$) with Pearson correlation $0.82$ between $p_{\max}$ and speedup; brute force evaluates $\mathrm{mean}(9.0)$ points per row whereas greedy evaluates $\mathrm{mean}(3.35)$, consistent with the identity-protection seed $P_0=4$ landing close to $P^*$ on most traces. Hypothesis~A is supported: greedy is either globally optimal or inside a sub-NMAE-digit neighborhood of the brute-force optimum on essentially every row, at a fraction of the compute. Figure~\ref{fig:exp-A} plots a 120-row subsample of greedy vs.~brute-force loss for the four $P$-dependent strategies, with every point landing on or just above the identity line.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{groupplot}[
+  group style={group size=2 by 2, horizontal sep=1.6cm, vertical sep=1.9cm},
+  width=0.5\linewidth, height=4.6cm,
+  grid=major,
+  tick label style={font=\scriptsize}, label style={font=\scriptsize},
+  title style={font=\footnotesize, yshift=-1ex},
+  legend style={font=\scriptsize, inner sep=1pt},
+  legend cell align=left,
+]
+%--- (a) Scatter: greedy vs brute loss ---
+\nextgroupplot[
+  title={(a) Greedy loss vs.\ brute-force loss},
+  xlabel={$L(P^\dagger)$}, ylabel={$L(P^*)$},
+  xmin=0, xmax=3.0, ymin=0, ymax=3.2,
+  legend pos=north west,
+]
+\addplot[color=red, thick, dashed, domain=0:3.0, samples=2, forget plot] {x};
+\addplot[only marks, mark size=1.0pt, mark=*, color=blue!70!black] coordinates {
+(0.367,0.367) (0.375,0.375) (0.254,0.254) (0.248,0.248) (0.342,0.342) (1.126,1.126) (1.501,1.501) (1.991,1.991) (0.930,0.930) (0.496,0.496) (0.223,0.223) (0.364,0.364) (1.983,1.983) (0.516,0.516) (0.349,0.349) (1.376,1.376) (0.339,0.339) (0.271,0.271) (0.511,0.511) (2.609,2.609) (0.352,0.352) (0.377,0.377) (1.322,1.322) (1.395,1.395) (0.521,0.521) (1.841,1.841) (0.304,0.304) (0.755,0.755) (2.614,2.614) (0.744,0.744) (0.278,0.278) (0.274,0.274) (0.745,0.745) (1.994,1.994) (2.590,2.590) (0.367,0.367) (1.662,1.662) (0.366,0.366) (1.486,1.486) (0.294,0.294) (1.727,1.727) (0.752,0.752) (1.377,1.377) (0.816,0.816) (1.418,1.418) (0.915,0.915) (0.224,0.224) (0.650,0.650) (2.601,2.601)
+};
+\addlegendentry{gap $=0$ (80\%)}
+\addplot[only marks, mark size=1.4pt, mark=triangle*, color=orange!80!black] coordinates {
+(0.396,0.439) (0.535,1.026) (0.715,0.856) (2.630,2.942) (0.408,0.418) (0.581,1.189) (1.920,2.042) (0.268,0.315) (0.296,0.298) (1.841,2.042) (0.287,0.291) (1.459,1.532) (0.236,0.242) (0.297,0.301) (1.990,2.688) (0.441,0.464) (0.475,0.481) (1.930,2.128) (0.322,0.332) (0.368,0.400) (1.354,1.500) (1.169,1.932) (1.356,1.523) (0.535,1.011) (0.696,0.774) (0.393,0.691) (0.270,0.315) (0.236,0.237) (0.298,0.302) (0.266,0.268) (0.290,0.300) (0.821,1.551) (0.654,0.971) (1.022,1.068) (0.369,0.506) (0.964,2.191) (0.998,1.023) (0.717,0.872) (0.237,0.238) (1.113,1.388) (0.634,0.717) (1.309,1.607) (0.704,0.880) (0.373,0.388) (1.821,2.031) (0.289,0.302) (1.086,1.374) (0.520,0.522) (0.729,0.865) (0.257,0.275) (2.029,2.931) (0.385,0.428) (0.530,1.263) (0.259,0.272) (0.347,0.375) (1.031,1.131) (0.236,0.259) (1.041,1.348) (1.632,1.657)
+};
+\addlegendentry{gap $>0$ (20\%)}
+%--- (b) Speedup vs p_max ---
+\nextgroupplot[
+  title={(b) Mean speedup vs.\ $p_{\max}$},
+  xlabel={$p_{\max}$ (brute-force search width)},
+  ylabel={Speedup},
+  xmin=5, xmax=13, ymin=0, ymax=4.2,
+  xtick={6,9,10,12},
+]
+\addplot[thick, color=gray, dashed, domain=5:13, samples=2, forget plot] {x/3.35};
+\addplot[thick, mark=*, color=blue] coordinates {(6,1.823) (9,2.706) (10,3.221) (12,3.711)};
+%--- (c) Evaluations: greedy vs brute ---
+\nextgroupplot[
+  title={(c) Evaluations per row},
+  xlabel={$p_{\max}$},
+  ylabel={Mean evaluations},
+  xmin=5, xmax=13, ymin=0, ymax=14,
+  xtick={6,9,10,12},
+  legend pos=north west,
+]
+\addplot[thick, mark=square*, color=red, dashed] coordinates {(6,6) (9,9) (10,10) (12,12)};
+\addlegendentry{Brute ($=p_{\max}$)}
+\addplot[thick, mark=*, color=blue] coordinates {(6,3.35) (9,3.63) (10,3.14) (12,3.53)};
+\addlegendentry{Greedy (Alg.~\ref{alg:greedy-tune})}
+%--- (d) Greedy P^* distribution ---
+\nextgroupplot[
+  title={(d) Greedy $P^*$ distribution (\% of rows)},
+  xlabel={$P^*$ chosen by greedy},
+  ylabel={\% of rows},
+  xmin=1, xmax=13, ymin=0, ymax=85,
+  ybar, bar width=6pt,
+  xtick={2,3,4,5,6,7,8,9,10,11,12},
+]
+\addplot[fill=blue!50, draw=blue!70!black] coordinates {
+(2,0.1) (3,5.7) (4,79.1) (5,6.2) (6,4.6) (7,1.3) (8,2.4) (9,0.1) (10,0.1) (11,0.2) (12,0.2)
+};
+\end{groupplot}
+\end{tikzpicture}
+\caption{Experiment~A (Section~\ref{sec:exp-A}): all four recorded metrics for the greedy-vs.-brute comparison, aggregated across 22 sensors, 6 datasets, both clamp modes, and (for panel a) the four $P$-dependent strategies. (a) Scatter of greedy vs.~brute-force loss on a 120-row subsample---$80\%$ of rows lie on the identity line (blue dots), the remaining $20\%$ sit just above it (orange triangles), mean gap $0.033$. (b) Mean speedup increases linearly with $p_{\max}$ (dashed line is $p_{\max}/3.35$, the seed-relative greedy budget). (c) Greedy evaluates $\mathrm{mean}(3.35)$ points per row independent of $p_{\max}$, whereas brute force evaluates $p_{\max}$. (d) The greedy $P^*$ distribution is sharply peaked at the identity-protection seed $P_0=\lceil 1/\alpha\rceil=4$ ($79\%$ of rows), with the remaining mass covering neighbors of the seed---consistent with Proposition~\ref{prop:alg2-convergence}'s claim that the walk terminates after only a small number of improving steps.}
+\label{fig:exp-A}
+\end{figure}
+
+\subsection{Experiment~B: Effect of the Window Size~$w$}
+\label{sec:exp-B}
+
+\paragraph{Setup.}
+For each (dataset, sensor, clamp mode) triple we fix a combination of $(P, \epsilon, \mathcal{A})$ and sweep $w$ through $\{4, 6, 8, 10, 12, 16\}$. The fixed combos, matching the design in \texttt{run\_experiment.py}, cover the expected regimes:
+
+\begin{itemize}
+\item $(P=2, \epsilon=1.0, \mathrm{Uniform})$ \hfill --- low $P$, Uniform baseline
+\item $(P=4, \epsilon=1.0, \mathrm{Uniform})$ \hfill --- high $P$, Uniform baseline
+\item $(P=2, \epsilon=1.0, P\text{-gated BA})$ \hfill --- low $P$, population$+$amplitude
+\item $(P=4, \epsilon=1.0, P\text{-gated BA})$ \hfill --- high $P$, population$+$amplitude
+\item $(P=2, \epsilon=2.0, n\text{-weighted})$ \hfill --- population-weighted allocation
+\end{itemize}
+
+For each $w$ we record NMAE, KL divergence, release rate, and the mean attribution advantage.
+
+\paragraph{Hypothesis~B.}
+Under $P$-gated Uniform allocation with the default mean aggregation, Theorem~\ref{thm:s-sensitive-budget} gives a per-release Laplace scale
+\[
+  \lambda_\tau \;=\; \frac{\Delta_f\,w}{\epsilon} \;=\; \frac{R\,w}{n_\tau\,\epsilon},
+\]
+so with $n_\tau$, $\epsilon$, and $R$ held fixed we expect $\mathrm{NMAE}(w) \propto w$ to first order. Tripling $w$ from 4 to 12 should therefore roughly triple the NMAE. KL divergence, by contrast, is a distributional-shape metric and the Laplace distribution is scale-invariant in its variance, so we expect KL to depend only weakly on $w$; per-sensor variation should reflect the interaction between the intrinsic stream dynamics and the window-aligned histogram estimator rather than a strong systematic trend. The $P$-gated BA and $n$-weighted rows are expected to partially escape the linear-in-$w$ NMAE scaling because both strategies can concentrate a larger $\epsilon_\tau$ on timestamps where a fresh release is emitted (BA on high-change timestamps, $n$-weighted on high-$n_\tau$ timestamps).
+
+\paragraph{Results~B.}
+The $w$-sweep produced 1{,}350 (dataset, sensor) configurations: 690 under Option~A and 660 under Option~B. Under Uniform allocation a linear fit of $\mathrm{NMAE}(w)$ against $w$ returns slope $\approx 0.152$ with $R^2 = 1.0000$ on every (dataset, sensor) pair under both clamp modes, and the measured-to-predicted NMAE ratio is $1.13$ in mean / $0.99$ in median against the closed-form $\lambda_\tau = R\,w/(n_\tau\epsilon)$. The headline quantitative check, $\mathrm{NMAE}(w{=}16)/\mathrm{NMAE}(w{=}4)$, comes out to $3.994$ (Option~A) and $4.000$ (Option~B) against the predicted $4\times$---a near-exact match. As anticipated, $P$-gated BA partially escapes the linear-in-$w$ law: $R^2 \in [0.89, 0.95]$ and the 16:4 ratio lands in $[3.75, 4.33]$ depending on $P$ and clamp mode, because the value-similarity skip decouples a fraction of releases from the raw $w$ schedule. $n$-weighted at $\epsilon=2$ tracks the linear trend too (slope $0.090$, $R^2 = 0.999$, ratio $4.5$); its lower slope is exactly the $\lambda_\tau \propto 1/\epsilon$ halving. KL divergence, by contrast, is essentially $w$-invariant: for Uniform the per-sensor coefficient of variation of KL across $w \in \{4, 6, 8, 10, 12, 16\}$ is $3.7\%$, and across all strategies stays below $16\%$ with no monotone trend---the Laplace shape is scale-invariant so histogram-KL is dominated by the interaction between stream dynamics and the window-aligned estimator rather than by $w$. Release rate and attribution advantage are numerically constant to four decimal places across $w$ for every strategy, as predicted since neither quantity enters the Laplace scale. Hypothesis~B is supported: the $\lambda_\tau \propto w$ law is directly visible on real data, the two non-Uniform strategies deviate in exactly the direction Section~\ref{sec:n-weighted} and the BA skip condition predict, and the distributional-shape and scheduling-side metrics stay flat. Figure~\ref{fig:exp-B} plots the per-strategy NMAE against $w$ together with the closed-form $\mathrm{NMAE}(w) = 0.152\,w$ prediction.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{groupplot}[
+  group style={group size=2 by 2, horizontal sep=1.6cm, vertical sep=1.9cm},
+  width=0.5\linewidth, height=4.6cm,
+  grid=major,
+  tick label style={font=\scriptsize}, label style={font=\scriptsize},
+  title style={font=\footnotesize, yshift=-1ex},
+  legend style={font=\scriptsize, inner sep=1pt},
+  legend cell align=left,
+  xtick={4,6,8,10,12,16},
+  xmin=3, xmax=17,
+]
+%--- (a) NMAE vs w ---
+\nextgroupplot[
+  title={(a) NMAE vs.\ $w$ (utility, point-wise)},
+  xlabel={$w$}, ylabel={NMAE},
+  ymin=0, ymax=2.8,
+  legend pos=north west,
+]
+\addplot[thick, dashed, color=gray, samples=2, domain=3:17, forget plot] {0.1518*x};
+\addplot[thick, mark=*, color=blue] coordinates {(4,0.6079) (6,0.9115) (8,1.2151) (10,1.5187) (12,1.8223) (16,2.4295)};
+\addlegendentry{Uniform ($P{=}2,\epsilon{=}1$)}
+\addplot[thick, mark=square*, color=red] coordinates {(4,0.6159) (6,0.9606) (8,1.2475) (10,1.5438) (12,1.9096) (16,2.5845)};
+\addlegendentry{$P$-gated BA ($P{=}2,\epsilon{=}1$)}
+\addplot[thick, mark=triangle*, color=orange!80!black] coordinates {(4,0.6124) (6,0.8941) (8,1.2487) (10,1.5262) (12,1.8545) (16,2.4744)};
+\addlegendentry{$P$-gated BA ($P{=}4,\epsilon{=}1$)}
+\addplot[thick, mark=diamond*, color=green!60!black] coordinates {(4,0.2950) (6,0.4571) (8,0.6287) (10,0.8101) (12,0.9949) (16,1.3680)};
+\addlegendentry{$n$-weighted ($P{=}2,\epsilon{=}2$)}
+%--- (b) KL vs w ---
+\nextgroupplot[
+  title={(b) KL vs.\ $w$ (utility, distributional)},
+  xlabel={$w$}, ylabel={KL divergence},
+  ymin=0, ymax=5.0,
+]
+\addplot[thick, mark=*, color=blue] coordinates {(4,0.603) (6,0.636) (8,0.651) (10,0.658) (12,0.659) (16,0.660)};
+\addplot[thick, mark=square*, color=red] coordinates {(4,4.467) (6,4.532) (8,4.527) (10,4.549) (12,4.412) (16,4.415)};
+\addplot[thick, mark=triangle*, color=orange!80!black] coordinates {(4,4.509) (6,4.540) (8,4.531) (10,4.561) (12,4.428) (16,4.415)};
+\addplot[thick, mark=diamond*, color=green!60!black] coordinates {(4,0.565) (6,0.631) (8,0.594) (10,0.601) (12,0.608) (16,0.611)};
+%--- (c) Release rate vs w ---
+\nextgroupplot[
+  title={(c) Release rate vs.\ $w$ (latency)},
+  xlabel={$w$}, ylabel={Release rate},
+  ymin=0, ymax=1.05,
+]
+\addplot[thick, mark=*, color=blue] coordinates {(4,0.9993) (6,0.9993) (8,0.9993) (10,0.9993) (12,0.9993) (16,0.9993)};
+\addplot[thick, mark=square*, color=red] coordinates {(4,0.0958) (6,0.0975) (8,0.0977) (10,0.0969) (12,0.0914) (16,0.0975)};
+\addplot[thick, mark=triangle*, color=orange!80!black] coordinates {(4,0.0933) (6,0.0940) (8,0.0955) (10,0.0936) (12,0.0895) (16,0.0953)};
+\addplot[thick, mark=diamond*, color=green!60!black] coordinates {(4,0.9772) (6,0.9772) (8,0.9772) (10,0.9772) (12,0.9772) (16,0.9772)};
+%--- (d) Attribution advantage vs w ---
+\nextgroupplot[
+  title={(d) Attribution advantage vs.\ $w$ (privacy)},
+  xlabel={$w$}, ylabel={$\mathbb{E}[1/n_\tau]$},
+  ymin=0.10, ymax=0.18,
+]
+\addplot[thick, mark=*, color=blue] coordinates {(4,0.1581) (6,0.1581) (8,0.1581) (10,0.1581) (12,0.1581) (16,0.1581)};
+\addplot[thick, mark=square*, color=red] coordinates {(4,0.1421) (6,0.1436) (8,0.1419) (10,0.1423) (12,0.1405) (16,0.1414)};
+\addplot[thick, mark=triangle*, color=orange!80!black] coordinates {(4,0.1318) (6,0.1324) (8,0.1316) (10,0.1315) (12,0.1316) (16,0.1316)};
+\addplot[thick, mark=diamond*, color=green!60!black] coordinates {(4,0.1386) (6,0.1386) (8,0.1386) (10,0.1386) (12,0.1386) (16,0.1386)};
+\end{groupplot}
+\end{tikzpicture}
+\caption{Experiment~B (Section~\ref{sec:exp-B}): all four recorded metrics vs.\ window size $w$, averaged over 22 sensors in 6 datasets under Option~A clamps. Legend (shared across panels) from panel (a): Uniform in blue, $P$-gated BA at $P{=}2$ in red, $P$-gated BA at $P{=}4$ in orange, $n$-weighted at $\epsilon{=}2$ in green. (a) NMAE grows linearly in $w$ as Theorem~\ref{thm:s-sensitive-budget} predicts (dashed gray line is $0.152\,w$); $n$-weighted at $\epsilon{=}2$ is halved exactly as expected. (b) KL is essentially $w$-invariant: per-sensor CV below $4\%$ for Uniform, below $16\%$ for other strategies---the Laplace shape is scale-invariant so histogram-KL is dominated by stream dynamics, not $w$. (c)--(d) Release rate and attribution advantage are numerically flat across $w$ to four decimal places, confirming that $w$ enters only the noise scale and never the scheduling or identity-protection side of the mechanism.}
+\label{fig:exp-B}
+\end{figure}
+
+\subsection{Experiment~C: Effect of the Privacy Budget~$\epsilon$}
+\label{sec:exp-C}
+
+\paragraph{Setup.}
+For each (dataset, sensor, clamp mode) triple we fix a combination of $(P, w, \mathcal{A})$ and sweep $\epsilon$ through $\{0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0\}$. The fixed combos are symmetric to Experiment~B:
+
+\begin{itemize}
+\item $(P=2, w=8, \mathrm{Uniform})$
+\item $(P=4, w=8, \mathrm{Uniform})$
+\item $(P=2, w=8, P\text{-gated BA})$
+\item $(P=4, w=8, P\text{-gated BA})$
+\item $(P=2, w=8, n\text{-weighted})$
+\end{itemize}
+
+For each $\epsilon$ we record NMAE, KL divergence, release rate, and attribution advantage.
+
+\paragraph{Hypothesis~C.}
+Under the same Uniform-allocation noise scale $\lambda_\tau = R\,w/(n_\tau\,\epsilon)$, holding $w$, $R$, $P$ and therefore $n_\tau$ (approximately) fixed, we expect $\mathrm{NMAE}(\epsilon) \propto 1/\epsilon$. Doubling $\epsilon$ should therefore approximately halve the NMAE, and an $8\times$ budget increase from $\epsilon = 0.5$ to $\epsilon = 4$ should deliver $\sim\!8\times$ lower NMAE. KL again is expected to stay nearly flat: Laplace noise at a smaller scale still has the same distributional shape, so the histogram-based KL estimator is dominated by estimator variance at low noise rather than by a systematic trend in~$\epsilon$. Release rate and attribution advantage should be $\epsilon$-invariant at fixed~$P$: both are scheduling-side quantities that $\epsilon$ does not enter (Section~\ref{sec:param-taxonomy}).
+
+\paragraph{Results~C.}
+The $\epsilon$-sweep produced 1{,}575 configurations: 805 under Option~A and 770 under Option~B. Under Uniform allocation the log-log slope of $\mathrm{NMAE}$ against $\epsilon$ is $-0.9985$ on Option~A and $-0.9998$ on Option~B against the predicted $-1.0$, and the end-to-end ratio $\mathrm{NMAE}(\epsilon{=}0.1)/\mathrm{NMAE}(\epsilon{=}8) = 79.5$ against the predicted $80\times$. $n$-weighted matches within $1.5\%$ of that ratio ($-0.996$ slope, ratio $78.7$). $P$-gated BA is slightly sublinear (log-log slope $\in [-0.97, -0.96]$, ratio $67$--$69$) for the same reason it deviated in Experiment~B: the value-similarity threshold depends on $\theta R$, which does not rescale with $\epsilon$, so at large $\epsilon$ a growing share of the budget is absorbed rather than spent, blunting the nominal $1/\epsilon$ benefit. Release rate and attribution advantage are numerically identical across all seven values of $\epsilon$ for every strategy and every (dataset, sensor) pair---to four decimal places---confirming that $\epsilon$ is a pure Laplace-scale knob under $P$-allocation and never leaks into the scheduling or identity-protection axes, exactly as the parameter taxonomy of Section~\ref{sec:param-taxonomy} prescribes. KL divergence is weakly decreasing in $\epsilon$ (from $\approx 0.66$ at $\epsilon{=}0.1$ to $\approx 0.41$ at $\epsilon{=}8$ under Uniform): at small $\epsilon$ the noisy histogram is dominated by Jeffreys smoothing and saturates near the uniform-distribution baseline, so the drop only emerges once the noise is small enough that the histograms separate from the prior. Hypothesis~C is supported: NMAE tracks $1/\epsilon$ almost exactly for the two strategies that do not skip, $P$-gated BA deviates in the direction and by the amount the mechanism design predicts, and the two scheduling-side quantities are $\epsilon$-invariant as required. Figure~\ref{fig:exp-C} plots NMAE against $\epsilon$ on log-log axes against the $1/\epsilon$ reference curve.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{groupplot}[
+  group style={group size=2 by 2, horizontal sep=1.6cm, vertical sep=1.9cm},
+  width=0.5\linewidth, height=4.6cm,
+  grid=major,
+  tick label style={font=\scriptsize}, label style={font=\scriptsize},
+  title style={font=\footnotesize, yshift=-1ex},
+  legend style={font=\scriptsize, inner sep=1pt},
+  legend cell align=left,
+]
+%--- (a) NMAE vs eps (log-log) ---
+\nextgroupplot[
+  title={(a) NMAE vs.\ $\epsilon$ (utility, point-wise)},
+  xlabel={$\epsilon$ (log)}, ylabel={NMAE (log)},
+  xmode=log, ymode=log, log basis x=10, log basis y=10,
+  xmin=0.08, xmax=10, ymin=0.1, ymax=16,
+  xtick={0.1,0.25,0.5,1,2,4,8}, xticklabels={0.1,0.25,0.5,1,2,4,8},
+  legend pos=south west,
+]
+\addplot[thick, dashed, color=gray, samples=50, domain=0.08:10, forget plot] {1.215/x};
+\addplot[thick, mark=*, color=blue] coordinates {(0.1,12.1460) (0.25,4.8584) (0.5,2.4295) (1.0,1.2151) (2.0,0.6079) (4.0,0.3043) (8.0,0.1525)};
+\addlegendentry{Uniform ($P{=}2,w{=}8$)}
+\addplot[thick, mark=square*, color=red] coordinates {(0.1,12.3969) (0.25,4.9621) (0.5,2.4849) (1.0,1.2475) (2.0,0.6302) (4.0,0.3232) (8.0,0.1711)};
+\addlegendentry{$P$-gated BA ($P{=}2,w{=}8$)}
+\addplot[thick, mark=diamond*, color=green!60!black] coordinates {(0.1,12.5152) (0.25,5.0076) (0.5,2.5053) (1.0,1.2543) (2.0,0.6287) (4.0,0.3160) (8.0,0.1596)};
+\addlegendentry{$n$-weighted ($P{=}2,w{=}8$)}
+%--- (b) KL vs eps ---
+\nextgroupplot[
+  title={(b) KL vs.\ $\epsilon$ (utility, distributional)},
+  xlabel={$\epsilon$ (log)}, ylabel={KL divergence},
+  xmode=log, log basis x=10,
+  xmin=0.08, xmax=10, ymin=0, ymax=5.0,
+  xtick={0.1,0.25,0.5,1,2,4,8}, xticklabels={0.1,0.25,0.5,1,2,4,8},
+]
+\addplot[thick, mark=*, color=blue] coordinates {(0.1,0.658) (0.25,0.660) (0.5,0.660) (1.0,0.651) (2.0,0.603) (4.0,0.508) (8.0,0.411)};
+\addplot[thick, mark=square*, color=red] coordinates {(0.1,4.406) (0.25,4.388) (0.5,4.411) (1.0,4.527) (2.0,4.489) (4.0,4.293) (8.0,4.105)};
+\addplot[thick, mark=diamond*, color=green!60!black] coordinates {(0.1,0.646) (0.25,0.646) (0.5,0.641) (1.0,0.620) (2.0,0.594) (4.0,0.526) (8.0,0.438)};
+%--- (c) Release rate vs eps ---
+\nextgroupplot[
+  title={(c) Release rate vs.\ $\epsilon$ (latency)},
+  xlabel={$\epsilon$ (log)}, ylabel={Release rate},
+  xmode=log, log basis x=10,
+  xmin=0.08, xmax=10, ymin=0, ymax=1.05,
+  xtick={0.1,0.25,0.5,1,2,4,8}, xticklabels={0.1,0.25,0.5,1,2,4,8},
+]
+\addplot[thick, mark=*, color=blue] coordinates {(0.1,0.9993) (0.25,0.9993) (0.5,0.9993) (1.0,0.9993) (2.0,0.9993) (4.0,0.9993) (8.0,0.9993)};
+\addplot[thick, mark=square*, color=red] coordinates {(0.1,0.0977) (0.25,0.0977) (0.5,0.0977) (1.0,0.0977) (2.0,0.0977) (4.0,0.0977) (8.0,0.0977)};
+\addplot[thick, mark=diamond*, color=green!60!black] coordinates {(0.1,0.9772) (0.25,0.9772) (0.5,0.9772) (1.0,0.9772) (2.0,0.9772) (4.0,0.9772) (8.0,0.9772)};
+%--- (d) Attribution advantage vs eps ---
+\nextgroupplot[
+  title={(d) Attribution advantage vs.\ $\epsilon$ (privacy)},
+  xlabel={$\epsilon$ (log)}, ylabel={$\mathbb{E}[1/n_\tau]$},
+  xmode=log, log basis x=10,
+  xmin=0.08, xmax=10, ymin=0.10, ymax=0.18,
+  xtick={0.1,0.25,0.5,1,2,4,8}, xticklabels={0.1,0.25,0.5,1,2,4,8},
+]
+\addplot[thick, mark=*, color=blue] coordinates {(0.1,0.1581) (0.25,0.1581) (0.5,0.1581) (1.0,0.1581) (2.0,0.1581) (4.0,0.1581) (8.0,0.1581)};
+\addplot[thick, mark=square*, color=red] coordinates {(0.1,0.1419) (0.25,0.1419) (0.5,0.1419) (1.0,0.1419) (2.0,0.1419) (4.0,0.1419) (8.0,0.1419)};
+\addplot[thick, mark=diamond*, color=green!60!black] coordinates {(0.1,0.1386) (0.25,0.1386) (0.5,0.1386) (1.0,0.1386) (2.0,0.1386) (4.0,0.1386) (8.0,0.1386)};
+\end{groupplot}
+\end{tikzpicture}
+\caption{Experiment~C (Section~\ref{sec:exp-C}): all four recorded metrics vs.\ privacy budget $\epsilon$, averaged over 22 sensors in 6 datasets under Option~A clamps with $w=8$. Legend (shared across panels) from panel (a): Uniform in blue, $P$-gated BA in red, $n$-weighted in green. (a) NMAE scales as $1/\epsilon$ across three decades; the dashed gray line is $1.22/\epsilon$. Uniform and $n$-weighted track the $-1$ log-log slope to within $0.5\%$; $P$-gated BA is slightly sublinear (slope $-0.97$) because the value-similarity threshold $\theta R$ does not rescale with $\epsilon$. (b) KL decreases weakly with $\epsilon$ (from $\sim 0.66$ at $\epsilon{=}0.1$ to $\sim 0.41$ at $\epsilon{=}8$ under Uniform)---at small $\epsilon$ the noisy histogram saturates against the Jeffreys-prior floor. (c)--(d) Release rate and attribution advantage are flat across $\epsilon$ to four decimal places for every strategy, confirming $\epsilon$ is a pure Laplace-scale knob and never enters the scheduling or identity-protection axes (Section~\ref{sec:param-taxonomy}).}
+\label{fig:exp-C}
+\end{figure}
+
+\subsection{Auxiliary Observations}
+
+Beyond Experiments A/B/C, the runner exercises four sanity probes that are not primary hypotheses but validate the implementation:
+
+\begin{itemize}
+\item \textbf{Plugin end-to-end path (Experiment~D).} Drives the live MQTT plugin via a stubbed client and compares its released values against \texttt{run\_dp\_on\_stream} under the same seed on a pooled scenario; the hierarchical scenario additionally verifies that no release occurs with $n_\tau < P$ (the release-gate is enforced) and that delivered $t_\tau^{\text{start}}$ values are monotone.
+\item \textbf{Live MQTT broker sanity subset (Experiment~E).} Drives a small grid (three strategies $\times$ three $\epsilon$ values, with $w=8$, $P=2$) end-to-end through a real MQTT broker (default \texttt{localhost:1883}) on the smallest dataset (\texttt{wearable}, 119 windows $\times$ 10 devices). For every config the harness spins up a fresh \texttt{PrivacyPlugin}, a publisher client that emits each $\tau$'s per-publisher readings on the raw prefix at a wall-clock cadence of $\Delta t_{\text{live}} = 0.1$\,s, and a subscriber client on the protected prefix that logs delivered releases. Each config uses a UUID-tagged topic prefix and unique paho \texttt{client\_id}s so multiple configs can share a single broker without cross-talk. The probe reports, per config, (i) NMAE/KL/release rate/attribution advantage computed on the plugin's release log, (ii) the same metrics from an offline \texttt{run\_dp\_on\_stream} call under the identical seed, and (iii) a broker-path integrity count verifying that the number of subscriber-delivered releases equals the plugin's non-deferred release count. A match on (iii) plus a small $|$live$\,-\,$offline$|$ delta on (i)--(ii) confirms that the DP math behaves identically when the mechanism is driven through a live broker rather than an in-process mock.
+\item \textbf{Dynamic-interval sweep.} Varies $K_{\text{ext}} \in \{0, 1, 2, 4, 8\}$ and reports mean and maximum delivery delay (in $\Delta t$ units), release rate, and suppression rate. Used to characterize the latency cost of population-aware gating (Section~\ref{sec:dynamic-timestamp}).
+\item \textbf{Collusion.} Empirically verifies the $1/\sqrt{c}$ noise-variance reduction from $c$ colluding subscribers (Section~\ref{sec:limitations}).
+\end{itemize}
+
+\subsection{Discussion}
+
+The three single-axis experiments are designed to isolate exactly one claim each from Theorem~\ref{thm:s-sensitive-budget} and Proposition~\ref{prop:alg2-convergence}: Experiment~A tests the approximation/complexity claim, Experiment~B tests the linear-in-$w$ scaling, and Experiment~C tests the inverse-in-$\epsilon$ scaling. If all three hypotheses hold on real data across multiple sensors and both clamp modes, the evaluation directly supports the paper's central mechanism-design argument: that clamped $w$-event DP with $P$-allocation behaves on deployed IoT traces exactly as the clean analytical decomposition of Sections~\ref{sec:mechanism}--\ref{sec:p-allocation} predicts.
+
+The main limitation of the evaluation is that even though the six datasets are real, Experiments~A/B/C and~D run against an in-process mock MQTT client rather than a deployed broker in order to preserve the deterministic per-seed byte-level reproducibility that the parameter sweep requires. The live-broker sanity subset (Experiment~E, Section above) validates that at least on the smallest dataset the plugin's DP math and MQTT path agree with the offline engine under identical seeds when driven through a real broker; however, it does not replay the full parameter sweep of A/B/C through the broker. Production MQTT deployments may additionally exhibit publisher churn, clock skew, broker back-pressure, and reconnection patterns that our datasets do not capture; a field evaluation against a live industrial or municipal MQTT feed---and a full A/B/C sweep through a broker at production timing---are left to future work. Similarly, our attribution-advantage metric bounds identity leakage under the honest-but-curious subscriber of Section~\ref{sec:threat-model}, but does not model active attackers or subscribers that exploit externally observable publisher arrival patterns; Section~\ref{sec:limitations} discusses these degradation modes and Experiment~D's collusion probe gives a first empirical data point.
