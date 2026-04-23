@@ -47,6 +47,7 @@ import json
 import logging
 import os
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import matplotlib
 matplotlib.use("Agg")
@@ -163,8 +164,127 @@ def run_dp_on_stream(
 
 
 # ═════════════════════════════════════════════════════════════════════════
+#  Parallel execution helpers
+# ═════════════════════════════════════════════════════════════════════════
+#
+# Each hot experiment (sweep, A, B, C) is a loop of independent calls into
+# ``run_dp_on_stream`` or the greedy/brute tuners.  We ship those tasks to
+# a ``ProcessPoolExecutor`` so a full run finishes in roughly 1 / n_workers
+# of the serial time.  Workers are plain Python processes (spawn on Windows)
+# and the task functions below are module-level so they pickle cleanly.
+#
+# Large read-only payloads (``streams``) are passed through ``initializer``
+# and stashed in a worker-process global so each task args tuple only has to
+# carry small identifiers (sensor name, combo values).
+
+_WORKER_STREAMS: dict | None = None
+
+
+def _init_streams_worker(streams):
+    """Pool initializer: cache ``streams`` in a worker-local global."""
+    global _WORKER_STREAMS
+    _WORKER_STREAMS = streams
+
+
+def _default_workers(requested: int | None) -> int:
+    """Clamp the requested worker count to [1, os.cpu_count()]."""
+    if requested is None or requested <= 0:
+        cpu = os.cpu_count() or 1
+        return max(1, cpu - 1)
+    return int(requested)
+
+
+def _run_parallel_tasks(
+    tasks: list,
+    fn,
+    *,
+    workers: int,
+    initializer=None,
+    initargs: tuple = (),
+    progress_label: str | None = None,
+    progress_every: int = 100,
+) -> list:
+    """Run ``fn(task)`` for each item in ``tasks`` with optional parallelism.
+
+    Results are returned in the same order as ``tasks``.  When ``workers`` is
+    1 the loop runs serially in-process (still calling ``initializer`` so
+    task functions that rely on worker globals keep working).  Otherwise a
+    ``ProcessPoolExecutor`` is created, tasks are submitted with
+    ``as_completed`` for progress logging, and results are re-sorted to the
+    original index before returning.
+    """
+    total = len(tasks)
+    if total == 0:
+        return []
+
+    if workers <= 1:
+        if initializer is not None:
+            initializer(*initargs)
+        results = []
+        for idx, task in enumerate(tasks):
+            results.append(fn(task))
+            if progress_label and (idx + 1) % progress_every == 0:
+                logger.info(f"{progress_label} {idx + 1}/{total}")
+        return results
+
+    results: list = [None] * total
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=initializer,
+        initargs=initargs,
+    ) as pool:
+        future_to_idx = {
+            pool.submit(fn, task): idx for idx, task in enumerate(tasks)
+        }
+        done = 0
+        for fut in as_completed(future_to_idx):
+            idx = future_to_idx[fut]
+            results[idx] = fut.result()
+            done += 1
+            if progress_label and done % progress_every == 0:
+                logger.info(f"{progress_label} {done}/{total}")
+    return results
+
+
+# ═════════════════════════════════════════════════════════════════════════
 #  Parameter sweep
 # ═════════════════════════════════════════════════════════════════════════
+
+def _sweep_task(task):
+    """One sweep combo: runs the DP engine and builds the result row."""
+    i, dataset_name, sensor, P, eps, w, strat = task
+    aggregates, pub_counts, B = _WORKER_STREAMS[sensor]
+    result = run_dp_on_stream(
+        aggregates, pub_counts,
+        epsilon=eps, window_size=w, min_publishers=P,
+        payload_bound=B, strategy=strat, seed=i,
+    )
+    m = result["metrics"]
+    avg_n = float(np.mean([n for n in pub_counts if n > 0])) if any(pub_counts) else 0.0
+    return {
+        "dataset": dataset_name,
+        "sensor": sensor,
+        "P": P,
+        "epsilon": eps,
+        "w": w,
+        "strategy": strat,
+        "mae": m["mae"],
+        "rmse": m["rmse"],
+        "relative_error": m["relative_error"],
+        "normalized_mae": m["normalized_mae"],
+        "kl_divergence": m["kl_divergence"],
+        "kl_global_utility": m["kl_global_utility"],
+        "release_rate": m["release_rate"],
+        "deferrals": m["deferrals"],
+        "attribution_advantage": m["attribution_advantage"],
+        # Theoretical Uniform Laplace scale on the released mean:
+        #   lambda = R * w / (n_tau * eps);  use avg n_tau for reporting.
+        "noise_scale_theoretical": B * w / (max(avg_n, 1.0) * eps),
+        "payload_bound": B,
+        "num_timestamps": len(aggregates),
+        "avg_publishers": float(np.mean(pub_counts)),
+    }
+
 
 def sweep(
     dataset_name: str,
@@ -173,48 +293,23 @@ def sweep(
     epsilon_values: list[float],
     w_values: list[int],
     strategies: list[str],
+    workers: int = 1,
 ) -> pd.DataFrame:
-    rows = []
     combos = list(itertools.product(
         streams.keys(), s_values, epsilon_values, w_values, strategies,
     ))
-
-    for i, (sensor, P, eps, w, strat) in enumerate(combos):
-        aggregates, pub_counts, B = streams[sensor]
-        result = run_dp_on_stream(
-            aggregates, pub_counts,
-            epsilon=eps, window_size=w, min_publishers=P,
-            payload_bound=B, strategy=strat, seed=i,
-        )
-        m = result["metrics"]
-        avg_n = float(np.mean([n for n in pub_counts if n > 0])) if any(pub_counts) else 0.0
-        rows.append({
-            "dataset": dataset_name,
-            "sensor": sensor,
-            "P": P,
-            "epsilon": eps,
-            "w": w,
-            "strategy": strat,
-            "mae": m["mae"],
-            "rmse": m["rmse"],
-            "relative_error": m["relative_error"],
-            "normalized_mae": m["normalized_mae"],
-            "kl_divergence": m["kl_divergence"],
-            "kl_global_utility": m["kl_global_utility"],
-            "release_rate": m["release_rate"],
-            "deferrals": m["deferrals"],
-            "attribution_advantage": m["attribution_advantage"],
-            # Theoretical Uniform Laplace scale on the released mean:
-            #   lambda = R * w / (n_tau * eps);  use avg n_tau for reporting.
-            "noise_scale_theoretical": B * w / (max(avg_n, 1.0) * eps),
-            "payload_bound": B,
-            "num_timestamps": len(aggregates),
-            "avg_publishers": float(np.mean(pub_counts)),
-        })
-        if (i + 1) % 100 == 0:
-            logger.info(f"  [{dataset_name}] {i + 1}/{len(combos)}")
-
-    logger.info(f"  [{dataset_name}] sweep complete: {len(combos)} configs")
+    tasks = [
+        (i, dataset_name, sensor, P, eps, w, strat)
+        for i, (sensor, P, eps, w, strat) in enumerate(combos)
+    ]
+    rows = _run_parallel_tasks(
+        tasks, _sweep_task,
+        workers=workers,
+        initializer=_init_streams_worker,
+        initargs=(streams,),
+        progress_label=f"  [{dataset_name}]",
+    )
+    logger.info(f"  [{dataset_name}] sweep complete: {len(tasks)} configs")
     return pd.DataFrame(rows)
 
 
@@ -1553,6 +1648,7 @@ def run_dataset(
     s_values, eps_values, w_values, strategies, output_dir, args,
     clamp_mode: str = "static",
     quick: bool = False, skip_extras: bool = False,
+    workers: int = 1,
 ) -> dict:
     """Run the full experiment on one (dataset, clamp_mode) pair.
 
@@ -1624,7 +1720,8 @@ def run_dataset(
                 index=False,
             )
 
-    df = sweep(name, streams, s_values, eps_values, w_values, strategies)
+    df = sweep(name, streams, s_values, eps_values, w_values, strategies,
+               workers=workers)
     df["clamp_mode"] = clamp_mode
     df["eps_clip"] = args.eps_clip if clamp_mode == "dp_released" else 0.0
     df.to_csv(os.path.join(dirs["sweep"], "sweep_results.csv"), index=False)
@@ -1777,8 +1874,12 @@ EXPERIMENT_FIXED_COMBOS_C = [
 EXPERIMENT_C_EPS_VALUES = [0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
 
 
-def _iter_clamped_per_sensor(datasets, clamp_mode, eps_clip, seed, args):
-    """Yield (ds_name, sensor, pp, R, (agg, cnt)) for every sensor of each dataset."""
+def _iter_clamped_by_dataset(datasets, clamp_mode, eps_clip, seed, args):
+    """Yield (ds_name, [(sensor, pp, R, (agg, cnt)), ...]) grouped per dataset.
+
+    One list per dataset so callers can launch a fresh worker pool per
+    dataset.  Keeps memory bounded: only one dataset is held at a time.
+    """
     for ds_name in datasets:
         prepared = prepare_dataset(
             ds_name,
@@ -1789,9 +1890,88 @@ def _iter_clamped_per_sensor(datasets, clamp_mode, eps_clip, seed, args):
         )
         if prepared is None or not prepared.raw_per_pubs:
             continue
+        entries = []
         for sensor, (agg, cnt, R) in prepared.streams.items():
             pp = prepared.per_pubs[sensor][0]
-            yield ds_name, sensor, pp, R, (agg, cnt)
+            entries.append((sensor, pp, R, (agg, cnt)))
+        if entries:
+            yield ds_name, entries
+
+
+def _experiment_A_task(task):
+    """One (sensor, combo, strategy) Experiment-A point: greedy + brute."""
+    (ds_name, sensor, pp, R, combo, strat, alpha, I_max, p_max,
+     clamp_mode) = task
+    eps = combo["epsilon"]
+    w = combo["w"]
+    g = greedy_tune_P(pp, R, eps, w, strat, p_max,
+                      alpha=alpha, I_max=I_max)
+    b_df = brute_force_tune_P(pp, R, eps, w, strat, p_max)
+    b_best = (b_df.assign(_neg=-b_df["P"])
+              .sort_values(["tuning_loss", "_neg"]).iloc[0])
+    g_best = g["best"]
+    return {
+        "dataset": ds_name, "sensor": sensor, "strategy": strat,
+        "clamp_mode": clamp_mode,
+        "epsilon": eps, "w": w, "p_max": p_max,
+        "payload_bound": R,
+        "alpha": alpha,
+        "I_max": I_max,
+        "greedy_P": int(g_best["P"]),
+        "greedy_loss": float(g_best["tuning_loss"]),
+        "greedy_nmae": g_best["normalized_mae"],
+        "greedy_kl": g_best["kl_divergence"],
+        "greedy_release_rate": g_best["release_rate"],
+        "greedy_attribution_advantage": g_best["attribution_advantage"],
+        "greedy_evaluations": g["evaluations"],
+        "greedy_seed_P": g["seed_P"],
+        "brute_P": int(b_best["P"]),
+        "brute_loss": float(b_best["tuning_loss"]),
+        "brute_nmae": b_best["normalized_mae"],
+        "brute_kl": b_best["kl_divergence"],
+        "brute_release_rate": b_best["release_rate"],
+        "brute_attribution_advantage": b_best["attribution_advantage"],
+        "brute_evaluations": int(p_max),
+        "gap_loss": float(g_best["tuning_loss"] - b_best["tuning_loss"]),
+        "gap_P": int(g_best["P"] - b_best["P"]),
+        "speedup": float(p_max / max(g["evaluations"], 1)),
+    }
+
+
+def _experiment_single_axis_task(task):
+    """Shared worker for Experiment B (vary w) and C (vary eps)."""
+    (ds_name, sensor, agg, cnt, R, strategy, P, eps, w, clamp_mode) = task
+    res = run_dp_on_stream(
+        agg, cnt, epsilon=eps, window_size=w,
+        min_publishers=P, payload_bound=R,
+        strategy=strategy, seed=77,
+    )
+    m = res["metrics"]
+    elig_n = [n for n in cnt if n > 0]
+    avg_n = float(np.mean(elig_n)) if elig_n else 0.0
+    # Paper Thm 5.1 + Uniform allocation: lambda = R * w / (n * eps);
+    # expected NMAE = lambda / R = w / (n * eps).
+    pred_lambda = R * w / (avg_n * eps) if avg_n > 0 else float("nan")
+    pred_nmae = w / (avg_n * eps) if avg_n > 0 else float("nan")
+    return {
+        "dataset": ds_name, "sensor": sensor,
+        "clamp_mode": clamp_mode,
+        "strategy": strategy, "P": P,
+        "epsilon": eps, "w": w,
+        "payload_bound": R,
+        "normalized_mae": m["normalized_mae"],
+        "predicted_nmae_uniform": pred_nmae,
+        "predicted_laplace_scale": pred_lambda,
+        "kl_divergence": m["kl_divergence"],
+        "release_rate": m["release_rate"],
+        "attribution_advantage": m["attribution_advantage"],
+        "avg_n_tau_eligible": avg_n,
+        "avg_n_tau": float(np.mean(cnt)) if cnt else 0.0,
+        "mae": m["mae"],
+        "deferrals": m["deferrals"],
+        "num_timestamps": len(agg),
+        "seed": 77,
+    }
 
 
 def experiment_A_greedy_vs_brute(
@@ -1805,46 +1985,26 @@ def experiment_A_greedy_vs_brute(
     """
     fixed_combos = fixed_combos or EXPERIMENT_FIXED_COMBOS_A
     strategies = strategies or ALL_STRATEGIES
+    workers = _default_workers(getattr(args, "workers", None))
     rows = []
-    for ds_name, sensor, pp, R, _ in _iter_clamped_per_sensor(
+    for ds_name, entries in _iter_clamped_by_dataset(
             datasets, clamp_mode, args.eps_clip, args.seed, args):
-        _, cnt = _rebuild_stream_with_dt(pp, 1)
-        p_max = max(2, min(max(cnt), len(pp)))
-        for combo in fixed_combos:
-            eps = combo["epsilon"]; w = combo["w"]
-            for strat in strategies:
-                g = greedy_tune_P(pp, R, eps, w, strat, p_max,
-                                  alpha=args.alpha, I_max=args.I_max)
-                b_df = brute_force_tune_P(pp, R, eps, w, strat, p_max)
-                b_best = (b_df.assign(_neg=-b_df["P"])
-                          .sort_values(["tuning_loss", "_neg"]).iloc[0])
-                g_best = g["best"]
-                rows.append({
-                    "dataset": ds_name, "sensor": sensor, "strategy": strat,
-                    "clamp_mode": clamp_mode,
-                    "epsilon": eps, "w": w, "p_max": p_max,
-                    "payload_bound": R,
-                    "alpha": args.alpha,
-                    "I_max": args.I_max,
-                    "greedy_P": int(g_best["P"]),
-                    "greedy_loss": float(g_best["tuning_loss"]),
-                    "greedy_nmae": g_best["normalized_mae"],
-                    "greedy_kl": g_best["kl_divergence"],
-                    "greedy_release_rate": g_best["release_rate"],
-                    "greedy_attribution_advantage": g_best["attribution_advantage"],
-                    "greedy_evaluations": g["evaluations"],
-                    "greedy_seed_P": g["seed_P"],
-                    "brute_P": int(b_best["P"]),
-                    "brute_loss": float(b_best["tuning_loss"]),
-                    "brute_nmae": b_best["normalized_mae"],
-                    "brute_kl": b_best["kl_divergence"],
-                    "brute_release_rate": b_best["release_rate"],
-                    "brute_attribution_advantage": b_best["attribution_advantage"],
-                    "brute_evaluations": int(p_max),
-                    "gap_loss": float(g_best["tuning_loss"] - b_best["tuning_loss"]),
-                    "gap_P": int(g_best["P"] - b_best["P"]),
-                    "speedup": float(p_max / max(g["evaluations"], 1)),
-                })
+        tasks = []
+        for sensor, pp, R, _ in entries:
+            _, cnt = _rebuild_stream_with_dt(pp, 1)
+            p_max = max(2, min(max(cnt), len(pp)))
+            for combo in fixed_combos:
+                for strat in strategies:
+                    tasks.append((
+                        ds_name, sensor, pp, R, combo, strat,
+                        args.alpha, args.I_max, p_max, clamp_mode,
+                    ))
+        batch = _run_parallel_tasks(
+            tasks, _experiment_A_task, workers=workers,
+            progress_label=f"  [exp A {ds_name}/{clamp_mode}]",
+            progress_every=20,
+        )
+        rows.extend(batch)
 
     df = pd.DataFrame(rows)
     exp_dir = os.path.join(output_dir, "experiments", "A_greedy_vs_brute")
@@ -1889,44 +2049,25 @@ def experiment_B_vary_w(
     """Experiment B: fix (P, eps, strategy), sweep w."""
     fixed_combos = fixed_combos or EXPERIMENT_FIXED_COMBOS_B
     w_values = w_values or EXPERIMENT_B_W_VALUES
+    workers = _default_workers(getattr(args, "workers", None))
     rows = []
-    for ds_name, sensor, _, R, (agg, cnt) in _iter_clamped_per_sensor(
+    for ds_name, entries in _iter_clamped_by_dataset(
             datasets, clamp_mode, args.eps_clip, args.seed, args):
-        for combo in fixed_combos:
-            for w in w_values:
-                res = run_dp_on_stream(
-                    agg, cnt, epsilon=combo["epsilon"], window_size=w,
-                    min_publishers=combo["P"], payload_bound=R,
-                    strategy=combo["strategy"], seed=77,
-                )
-                m = res["metrics"]
-                # Restrict avg_n_tau to eligible timestamps (n_tau > 0), matching
-                # the paper's theoretical Laplace-scale derivation.
-                elig_n = [n for n in cnt if n > 0]
-                avg_n = float(np.mean(elig_n)) if elig_n else 0.0
-                # Paper Thm 5.1 + Uniform allocation: lambda = R * w / (n * eps);
-                # expected NMAE = E|Lap(lambda)| / R = lambda / R = w / (n * eps).
-                pred_lambda = R * w / (avg_n * combo["epsilon"]) if avg_n > 0 else float("nan")
-                pred_nmae = w / (avg_n * combo["epsilon"]) if avg_n > 0 else float("nan")
-                rows.append({
-                    "dataset": ds_name, "sensor": sensor,
-                    "clamp_mode": clamp_mode,
-                    "strategy": combo["strategy"], "P": combo["P"],
-                    "epsilon": combo["epsilon"], "w": w,
-                    "payload_bound": R,
-                    "normalized_mae": m["normalized_mae"],
-                    "predicted_nmae_uniform": pred_nmae,
-                    "predicted_laplace_scale": pred_lambda,
-                    "kl_divergence": m["kl_divergence"],
-                    "release_rate": m["release_rate"],
-                    "attribution_advantage": m["attribution_advantage"],
-                    "avg_n_tau_eligible": avg_n,
-                    "avg_n_tau": float(np.mean(cnt)) if cnt else 0.0,
-                    "mae": m["mae"],
-                    "deferrals": m["deferrals"],
-                    "num_timestamps": len(agg),
-                    "seed": 77,
-                })
+        tasks = []
+        for sensor, _, R, (agg, cnt) in entries:
+            for combo in fixed_combos:
+                for w in w_values:
+                    tasks.append((
+                        ds_name, sensor, agg, cnt, R,
+                        combo["strategy"], combo["P"], combo["epsilon"], w,
+                        clamp_mode,
+                    ))
+        batch = _run_parallel_tasks(
+            tasks, _experiment_single_axis_task, workers=workers,
+            progress_label=f"  [exp B {ds_name}/{clamp_mode}]",
+            progress_every=50,
+        )
+        rows.extend(batch)
     df = pd.DataFrame(rows)
     exp_dir = os.path.join(output_dir, "experiments", "B_vary_w")
     os.makedirs(exp_dir, exist_ok=True)
@@ -1948,43 +2089,25 @@ def experiment_C_vary_epsilon(
     """Experiment C: fix (P, w, strategy), sweep eps."""
     fixed_combos = fixed_combos or EXPERIMENT_FIXED_COMBOS_C
     eps_values = eps_values or EXPERIMENT_C_EPS_VALUES
+    workers = _default_workers(getattr(args, "workers", None))
     rows = []
-    for ds_name, sensor, _, R, (agg, cnt) in _iter_clamped_per_sensor(
+    for ds_name, entries in _iter_clamped_by_dataset(
             datasets, clamp_mode, args.eps_clip, args.seed, args):
-        for combo in fixed_combos:
-            for eps in eps_values:
-                res = run_dp_on_stream(
-                    agg, cnt, epsilon=eps, window_size=combo["w"],
-                    min_publishers=combo["P"], payload_bound=R,
-                    strategy=combo["strategy"], seed=77,
-                )
-                m = res["metrics"]
-                elig_n = [n for n in cnt if n > 0]
-                avg_n = float(np.mean(elig_n)) if elig_n else 0.0
-                # Paper Thm 5.1 + Uniform allocation: lambda = R * w / (n * eps);
-                # expected NMAE = lambda / R = w / (n * eps). Halving lambda
-                # when eps doubles is the paper's inverse-in-eps hypothesis.
-                pred_lambda = (R * combo["w"] / (avg_n * eps)) if avg_n > 0 else float("nan")
-                pred_nmae = (combo["w"] / (avg_n * eps)) if avg_n > 0 else float("nan")
-                rows.append({
-                    "dataset": ds_name, "sensor": sensor,
-                    "clamp_mode": clamp_mode,
-                    "strategy": combo["strategy"], "P": combo["P"],
-                    "w": combo["w"], "epsilon": eps,
-                    "payload_bound": R,
-                    "normalized_mae": m["normalized_mae"],
-                    "predicted_nmae_uniform": pred_nmae,
-                    "predicted_laplace_scale": pred_lambda,
-                    "kl_divergence": m["kl_divergence"],
-                    "release_rate": m["release_rate"],
-                    "attribution_advantage": m["attribution_advantage"],
-                    "avg_n_tau_eligible": avg_n,
-                    "avg_n_tau": float(np.mean(cnt)) if cnt else 0.0,
-                    "mae": m["mae"],
-                    "deferrals": m["deferrals"],
-                    "num_timestamps": len(agg),
-                    "seed": 77,
-                })
+        tasks = []
+        for sensor, _, R, (agg, cnt) in entries:
+            for combo in fixed_combos:
+                for eps in eps_values:
+                    tasks.append((
+                        ds_name, sensor, agg, cnt, R,
+                        combo["strategy"], combo["P"], eps, combo["w"],
+                        clamp_mode,
+                    ))
+        batch = _run_parallel_tasks(
+            tasks, _experiment_single_axis_task, workers=workers,
+            progress_label=f"  [exp C {ds_name}/{clamp_mode}]",
+            progress_every=50,
+        )
+        rows.extend(batch)
     df = pd.DataFrame(rows)
     exp_dir = os.path.join(output_dir, "experiments", "C_vary_epsilon")
     os.makedirs(exp_dir, exist_ok=True)
@@ -2477,7 +2600,15 @@ def main():
              "(D is the end-to-end plugin path).  'ABC' or 'ABCD' runs the "
              "single-axis experiments only.",
     )
+    parser.add_argument(
+        "--workers", type=int, default=0,
+        help="Parallel worker processes for the sweep and experiments "
+             "A/B/C.  0 (default) uses os.cpu_count() - 1.  Set to 1 to "
+             "run serially.",
+    )
     args = parser.parse_args()
+    args.workers = _default_workers(args.workers)
+    logger.info(f"Using {args.workers} worker process(es) for parallel tasks")
 
     if args.quick:
         s_values = [1, 2, 4]
@@ -2552,6 +2683,7 @@ def main():
                         args.output_dir, args,
                         clamp_mode=clamp_mode,
                         quick=args.quick, skip_extras=args.skip_extras,
+                        workers=args.workers,
                     )
                 except FileNotFoundError as e:
                     logger.warning(f"Skipping {name}: {e}")
