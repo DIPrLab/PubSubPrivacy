@@ -495,3 +495,5 @@ python run_experiment.py --experiment full --quick --clamp-mode both \
                         --max-traffic-rows 30000 --max-rows 5000 \
                         --output-dir results_test
 ```
+
+```python run_experiment.py --experiment E --dataset wearable --output-dir results_e```
