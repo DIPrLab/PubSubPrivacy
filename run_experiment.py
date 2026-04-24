@@ -331,8 +331,16 @@ def _dp_named_task(task):
 # ═════════════════════════════════════════════════════════════════════════
 
 def _sweep_task(task):
-    """One sweep combo: runs the DP engine and builds the result row."""
-    i, dataset_name, sensor, P, eps, w, strat = task
+    """One sweep combo: runs the DP engine and builds the result row.
+
+    When ``log_messages`` is set on the task tuple, the worker also returns
+    per-release message records (true aggregate, noisy value, n_tau,
+    eps_tau, lambda_tau, deferred, ...) for that configuration.  The main
+    process consolidates these into a single ``sweep_messages.csv`` per
+    dataset -- one row per logical timestamp per config.
+    """
+    (i, dataset_name, sensor, P, eps, w, strat,
+     clamp_mode, log_messages) = task
     aggregates, pub_counts, B = _WORKER_STREAMS[sensor]
     result = run_dp_on_stream(
         aggregates, pub_counts,
@@ -341,13 +349,15 @@ def _sweep_task(task):
     )
     m = result["metrics"]
     avg_n = float(np.mean([n for n in pub_counts if n > 0])) if any(pub_counts) else 0.0
-    return {
+    out = {
         "dataset": dataset_name,
+        "clamp_mode": clamp_mode,
         "sensor": sensor,
         "P": P,
         "epsilon": eps,
         "w": w,
         "strategy": strat,
+        "seed": i,
         "mae": m["mae"],
         "rmse": m["rmse"],
         "relative_error": m["relative_error"],
@@ -364,6 +374,15 @@ def _sweep_task(task):
         "num_timestamps": len(aggregates),
         "avg_publishers": float(np.mean(pub_counts)),
     }
+    if log_messages:
+        from message_logger import build_message_rows
+        out["_messages"] = build_message_rows(
+            result,
+            dataset=dataset_name, clamp_mode=clamp_mode, sensor=sensor,
+            strategy=strat, P=P, epsilon=eps, w=w,
+            payload_bound=B, seed=i, experiment="sweep",
+        )
+    return out
 
 
 def sweep(
@@ -374,12 +393,15 @@ def sweep(
     w_values: list[int],
     strategies: list[str],
     workers: int = 1,
+    clamp_mode: str = "static",
+    log_messages: bool = True,
+    messages_csv_path: str | None = None,
 ) -> pd.DataFrame:
     combos = list(itertools.product(
         streams.keys(), s_values, epsilon_values, w_values, strategies,
     ))
     tasks = [
-        (i, dataset_name, sensor, P, eps, w, strat)
+        (i, dataset_name, sensor, P, eps, w, strat, clamp_mode, log_messages)
         for i, (sensor, P, eps, w, strat) in enumerate(combos)
     ]
     rows = _run_parallel_tasks(
@@ -389,8 +411,23 @@ def sweep(
         initargs=(streams,),
         progress_label=f"  [{dataset_name}]",
     )
+
+    # Split out the per-release messages before building the summary frame.
+    all_messages: list[dict] = []
+    summary_rows: list[dict] = []
+    for r in rows:
+        if isinstance(r, dict) and "_messages" in r:
+            all_messages.extend(r.pop("_messages"))
+        summary_rows.append(r)
+
+    if log_messages and messages_csv_path and all_messages:
+        from message_logger import write_messages_csv
+        n = write_messages_csv(all_messages, messages_csv_path, append=False)
+        logger.info(f"  [{dataset_name}] sweep messages -> {messages_csv_path} "
+                    f"({n} rows)")
+
     logger.info(f"  [{dataset_name}] sweep complete: {len(tasks)} configs")
-    return pd.DataFrame(rows)
+    return pd.DataFrame(summary_rows)
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1016,43 +1053,110 @@ def _tune_eval_task(task):
 
 def _greedy_walk_task(task):
     """One strategy's Algorithm-2 greedy walk, end-to-end in the worker."""
-    strategy, p_max, alpha, I_max, loss_tie_tol, seed = task
+    (strategy, p_max, alpha, I_max, loss_tie_tol, seed,
+     n_restarts, restart_rng_seed) = task
     agg, cnt, B, eps, w, uw, lw = _WORKER_TUNE_CTX
     return _greedy_walk_on_stream(
         agg, cnt, B, eps, w, strategy, p_max,
         alpha=alpha, I_max=I_max,
         utility_weight=uw, latency_weight=lw,
         loss_tie_tol=loss_tie_tol, seed=seed,
+        n_restarts=n_restarts, restart_rng_seed=restart_rng_seed,
     )
 
 
-def _greedy_walk_on_stream(
+def _intelligent_restart_seeds(
+    cnt: list[int], alpha: float, p_max: int,
+    n_restarts: int, rng_seed: int,
+) -> list[int]:
+    """Pick P values for Algorithm 2 multi-start.
+
+    The first seed is always P_0 = ceil(1/alpha), the paper's
+    identity-protection seed (Section 6.7).  The remaining n_restarts-1 seeds
+    are sampled *intelligently* rather than uniformly: we draw from the
+    empirical distribution of n_tau so the hill-climb is seeded at plausible
+    publisher-count levels the stream actually exhibits.  Concretely, we take
+    quantiles of the non-zero n_tau distribution (p25, median, p75, ...) so
+    the restarts cover the pool-density regimes that matter for the loss.
+
+    All returned values are clamped to [1, p_max] and de-duplicated while
+    preserving order.
+    """
+    P_0 = max(1, int(np.ceil(1.0 / max(alpha, 1e-9))))
+    P_0 = max(1, min(P_0, max(1, p_max)))
+    seeds: list[int] = [P_0]
+    if n_restarts <= 1:
+        return seeds
+
+    nonzero = [int(c) for c in cnt if c is not None and c > 0]
+    k_extra = max(0, n_restarts - 1)
+    extras: list[int] = []
+    rng = np.random.default_rng(rng_seed)
+
+    if nonzero:
+        # Symmetric quantile grid avoiding 0 and 1 (equivalent to equally spaced
+        # probabilities strictly inside the distribution's support).
+        qs = np.linspace(1.0 / (k_extra + 1), k_extra / (k_extra + 1), k_extra)
+        quantile_candidates = [int(np.clip(round(q), 1, p_max))
+                               for q in np.quantile(nonzero, qs)]
+        extras.extend(quantile_candidates)
+
+    # Fill any remaining slots with rng-sampled draws from the observed n_tau
+    # so the restart surface is not degenerate when the stream's n_tau support
+    # is thin (common for traffic/manufacturing sub-pubs).
+    while len(extras) < k_extra:
+        if nonzero:
+            extras.append(int(np.clip(rng.choice(nonzero), 1, p_max)))
+        else:
+            extras.append(int(rng.integers(1, max(2, p_max) + 1)))
+
+    for s in extras:
+        s = int(np.clip(s, 1, max(1, p_max)))
+        if s not in seeds:
+            seeds.append(s)
+    return seeds
+
+
+def _greedy_hillclimb_from(
     agg, cnt, payload_bound, epsilon, w, strategy, p_max,
-    alpha=0.25, I_max=20, utility_weight=1.0, latency_weight=0.2,
-    loss_tie_tol: float = 1e-9, seed: int = 77,
-) -> dict:
-    """Stream-level Algorithm 2 walk (per-eval stream rebuild removed)."""
-    P_seed = max(1, int(np.ceil(1.0 / max(alpha, 1e-9))))
-    P = min(P_seed, max(1, p_max))
+    P_start: int, utility_weight, latency_weight,
+    I_max: int, loss_tie_tol: float, seed: int,
+    restart_idx: int, action_prefix: str = "",
+) -> tuple[list[dict], dict, int]:
+    """One hill-climb trajectory from ``P_start``.  Returns (trajectory rows,
+    best evaluated row, evaluation count for this run).
+    """
+    evaluations = 0
     trajectory: list[dict] = []
+    P = max(1, min(P_start, p_max))
     best = _evaluate_stream(agg, cnt, payload_bound, epsilon, w, P, strategy,
                             utility_weight, latency_weight, seed)
-    trajectory.append({**best, "iter": 0, "action": "seed"})
+    evaluations += 1
+    trajectory.append({
+        **best, "iter": 0,
+        "action": f"{action_prefix}seed",
+        "restart_idx": restart_idx,
+    })
     seen = {P: best["tuning_loss"]}
-
     for i in range(1, I_max + 1):
         neighbors = []
         for P_nbr in (P - 1, P + 1):
             if P_nbr < 1 or P_nbr > p_max:
                 continue
             if P_nbr in seen:
-                neighbors.append({"P": P_nbr, "tuning_loss": seen[P_nbr], "_cached": True})
+                neighbors.append({"P": P_nbr, "tuning_loss": seen[P_nbr],
+                                  "_cached": True})
                 continue
             r = _evaluate_stream(agg, cnt, payload_bound, epsilon, w, P_nbr, strategy,
                                  utility_weight, latency_weight, seed)
+            evaluations += 1
             seen[P_nbr] = r["tuning_loss"]
             neighbors.append({**r, "_cached": False})
-            trajectory.append({**r, "iter": i, "action": f"probe_P={P_nbr}"})
+            trajectory.append({
+                **r, "iter": i,
+                "action": f"{action_prefix}probe_P={P_nbr}",
+                "restart_idx": restart_idx,
+            })
         if not neighbors:
             break
         # Tie-break: on equal loss prefer the higher P (better identity protection).
@@ -1065,14 +1169,75 @@ def _greedy_walk_on_stream(
             else:
                 best = _evaluate_stream(agg, cnt, payload_bound, epsilon, w, P, strategy,
                                         utility_weight, latency_weight, seed)
-            trajectory.append({**best, "iter": i, "action": f"step_to_P={P}"})
+                evaluations += 1
+            trajectory.append({
+                **best, "iter": i,
+                "action": f"{action_prefix}step_to_P={P}",
+                "restart_idx": restart_idx,
+            })
         else:
-            trajectory.append({**best, "iter": i, "action": "stop_local_optimum"})
+            trajectory.append({
+                **best, "iter": i,
+                "action": f"{action_prefix}stop_local_optimum",
+                "restart_idx": restart_idx,
+            })
             break
+    return trajectory, best, evaluations
+
+
+def _greedy_walk_on_stream(
+    agg, cnt, payload_bound, epsilon, w, strategy, p_max,
+    alpha=0.25, I_max=20, utility_weight=1.0, latency_weight=0.2,
+    loss_tie_tol: float = 1e-9, seed: int = 77,
+    n_restarts: int = 3, restart_rng_seed: int = 12345,
+) -> dict:
+    """Stream-level Algorithm 2 walk with intelligent multi-start.
+
+    The first restart seeds at P_0 = ceil(1/alpha) (paper Section 6.7).
+    Additional restarts are sampled from quantiles of the observed n_tau
+    distribution, so the hill-climb explores the pool-density regimes the
+    stream actually exhibits instead of always starting at the same point.
+    Each restart runs an independent greedy walk; we return the best local
+    optimum across restarts.
+    """
+    P_0 = max(1, int(np.ceil(1.0 / max(alpha, 1e-9))))
+    P_seeds = _intelligent_restart_seeds(
+        cnt, alpha=alpha, p_max=max(1, p_max),
+        n_restarts=max(1, n_restarts), rng_seed=restart_rng_seed,
+    )
+
+    all_traj: list[dict] = []
+    best_overall: dict | None = None
+    total_evals = 0
+    for r_idx, P_start in enumerate(P_seeds):
+        prefix = "" if r_idx == 0 else f"r{r_idx}_"
+        traj, best_here, evals = _greedy_hillclimb_from(
+            agg, cnt, payload_bound, epsilon, w, strategy, p_max,
+            P_start=P_start, utility_weight=utility_weight,
+            latency_weight=latency_weight, I_max=I_max,
+            loss_tie_tol=loss_tie_tol, seed=seed,
+            restart_idx=r_idx, action_prefix=prefix,
+        )
+        all_traj.extend(traj)
+        total_evals += evals
+        if best_overall is None or (
+            best_here["tuning_loss"]
+            < best_overall["tuning_loss"] - loss_tie_tol
+        ) or (
+            abs(best_here["tuning_loss"] - best_overall["tuning_loss"])
+            <= loss_tie_tol
+            and best_here["P"] > best_overall["P"]
+        ):
+            best_overall = best_here
+
     return {
-        "strategy": strategy, "best": best, "seed_P": P_seed,
-        "trajectory": pd.DataFrame(trajectory),
-        "evaluations": sum(1 for t in trajectory if t["action"].startswith(("seed", "probe"))),
+        "strategy": strategy,
+        "best": best_overall,
+        "seed_P": P_0,
+        "restart_seeds_P": P_seeds,
+        "trajectory": pd.DataFrame(all_traj),
+        "evaluations": total_evals,
+        "n_restarts": len(P_seeds),
     }
 
 
@@ -1080,8 +1245,11 @@ def greedy_tune_P(
     per_pub, payload_bound, epsilon, w, strategy, p_max,
     alpha=0.25, I_max=20, utility_weight=1.0, latency_weight=0.2,
     loss_tie_tol: float = 1e-9,
+    n_restarts: int = 3, restart_rng_seed: int = 12345,
 ) -> dict:
-    """Algorithm 2 from the paper: greedy hill-climb over P.
+    """Algorithm 2 from the paper: greedy hill-climb over P with intelligent
+    multi-start (seeded at P_0 = ceil(1/alpha) plus additional restarts drawn
+    from quantiles of the observed n_tau distribution).
 
     Compatibility shim: rebuilds the stream from ``per_pub`` and delegates
     to ``_greedy_walk_on_stream``.  Callers with a cached stream should use
@@ -1093,6 +1261,7 @@ def greedy_tune_P(
         alpha=alpha, I_max=I_max,
         utility_weight=utility_weight, latency_weight=latency_weight,
         loss_tie_tol=loss_tie_tol,
+        n_restarts=n_restarts, restart_rng_seed=restart_rng_seed,
     )
 
 
@@ -1129,6 +1298,8 @@ def tune_hyperparameters(
     latency_weight: float = 0.2,
     p_max: int | None = None,
     workers: int = 1,
+    n_restarts: int = 3,
+    restart_rng_seed: int = 12345,
 ) -> dict:
     """
     Stage 1 of Section 5.7: tune P per strategy using the paper's Algorithm 2
@@ -1177,9 +1348,12 @@ def tune_hyperparameters(
     brute_df = pd.DataFrame(brute_rows_flat)
 
     # Greedy: one task per strategy (walks are serial within, but across
-    # strategies they're independent).
-    greedy_tasks = [(strat, p_max, alpha, I_max, 1e-9, 77)
-                    for strat in strategies]
+    # strategies they're independent).  Each task carries its n_restarts and
+    # restart-rng seed so workers can reproduce the intelligent multi-start
+    # seed schedule.
+    greedy_tasks = [(strat, p_max, alpha, I_max, 1e-9, 77,
+                     n_restarts, restart_rng_seed + i)
+                    for i, strat in enumerate(strategies)]
     logger.info(f"  [{dataset_name}/{sensor_name}] greedy: dispatching "
                 f"{len(greedy_tasks)} walks across "
                 f"{min(workers, len(greedy_tasks))} worker(s)")
@@ -1225,6 +1399,7 @@ def tune_hyperparameters(
         b_best = b_sub.iloc[0]
         gap_loss = float(g_best["tuning_loss"] - b_best["tuning_loss"])
         gap_P = int(g_best["P"] - b_best["P"])
+        restart_seeds = g_res.get("restart_seeds_P", [g_res.get("seed_P", 1)])
         summary_rows.append({
             "strategy": strat,
             "greedy_P": int(g_best["P"]),
@@ -1234,6 +1409,8 @@ def tune_hyperparameters(
             "greedy_release_rate": g_best["release_rate"],
             "greedy_evaluations": g_evals,
             "greedy_seed_P": g_res["seed_P"],
+            "greedy_n_restarts": int(g_res.get("n_restarts", 1)),
+            "greedy_restart_seeds_P": ";".join(str(p) for p in restart_seeds),
             "brute_P": int(b_best["P"]),
             "brute_loss": float(b_best["tuning_loss"]),
             "brute_nmae": b_best["normalized_mae"],
@@ -2092,13 +2269,23 @@ def run_dataset(
                 index=False,
             )
 
-    df = sweep(name, streams, s_values, eps_values, w_values, strategies,
-               workers=workers)
+    log_messages = getattr(args, "log_messages", True)
+    messages_dir = os.path.join(dirs["root"], "messages")
+    os.makedirs(messages_dir, exist_ok=True)
+    sweep_messages_csv = os.path.join(messages_dir, "sweep_messages.csv")
+    df = sweep(
+        name, streams, s_values, eps_values, w_values, strategies,
+        workers=workers,
+        clamp_mode=clamp_mode,
+        log_messages=log_messages,
+        messages_csv_path=sweep_messages_csv if log_messages else None,
+    )
     df["clamp_mode"] = clamp_mode
     df["eps_clip"] = args.eps_clip if clamp_mode == "dp_released" else 0.0
     df.to_csv(os.path.join(dirs["sweep"], "sweep_results.csv"), index=False)
     print_summary(df, f"{spec['label']} [clamp_mode={clamp_mode}]")
-    plot_results(df, name, dirs["sweep"], streams, workers=workers)
+    if getattr(args, "generate_plots", False):
+        plot_results(df, name, dirs["sweep"], streams, workers=workers)
 
     results: dict = {"sweep": df}
     logger.info(f"  [{name}/{clamp_mode}] --- phase: intro figures ---")
@@ -2284,11 +2471,13 @@ def _iter_clamped_by_dataset(datasets, clamp_mode, eps_clip, seed, args):
 def _experiment_A_task(task):
     """One (sensor, combo, strategy) Experiment-A point: greedy + brute."""
     (ds_name, sensor, pp, R, combo, strat, alpha, I_max, p_max,
-     clamp_mode) = task
+     clamp_mode, n_restarts, restart_rng_seed) = task
     eps = combo["epsilon"]
     w = combo["w"]
     g = greedy_tune_P(pp, R, eps, w, strat, p_max,
-                      alpha=alpha, I_max=I_max)
+                      alpha=alpha, I_max=I_max,
+                      n_restarts=n_restarts,
+                      restart_rng_seed=restart_rng_seed)
     b_df = brute_force_tune_P(pp, R, eps, w, strat, p_max)
     b_best = (b_df.assign(_neg=-b_df["P"])
               .sort_values(["tuning_loss", "_neg"]).iloc[0])
@@ -2308,6 +2497,10 @@ def _experiment_A_task(task):
         "greedy_attribution_advantage": g_best["attribution_advantage"],
         "greedy_evaluations": g["evaluations"],
         "greedy_seed_P": g["seed_P"],
+        "greedy_n_restarts": int(g.get("n_restarts", 1)),
+        "greedy_restart_seeds_P": ";".join(
+            str(p) for p in g.get("restart_seeds_P", [g.get("seed_P", 1)])
+        ),
         "brute_P": int(b_best["P"]),
         "brute_loss": float(b_best["tuning_loss"]),
         "brute_nmae": b_best["normalized_mae"],
@@ -2323,7 +2516,8 @@ def _experiment_A_task(task):
 
 def _experiment_single_axis_task(task):
     """Shared worker for Experiment B (vary w) and C (vary eps)."""
-    (ds_name, sensor, agg, cnt, R, strategy, P, eps, w, clamp_mode) = task
+    (ds_name, sensor, agg, cnt, R, strategy, P, eps, w,
+     clamp_mode, log_messages, experiment_tag) = task
     res = run_dp_on_stream(
         agg, cnt, epsilon=eps, window_size=w,
         min_publishers=P, payload_bound=R,
@@ -2336,7 +2530,7 @@ def _experiment_single_axis_task(task):
     # expected NMAE = lambda / R = w / (n * eps).
     pred_lambda = R * w / (avg_n * eps) if avg_n > 0 else float("nan")
     pred_nmae = w / (avg_n * eps) if avg_n > 0 else float("nan")
-    return {
+    out = {
         "dataset": ds_name, "sensor": sensor,
         "clamp_mode": clamp_mode,
         "strategy": strategy, "P": P,
@@ -2355,6 +2549,15 @@ def _experiment_single_axis_task(task):
         "num_timestamps": len(agg),
         "seed": 77,
     }
+    if log_messages:
+        from message_logger import build_message_rows
+        out["_messages"] = build_message_rows(
+            res,
+            dataset=ds_name, clamp_mode=clamp_mode, sensor=sensor,
+            strategy=strategy, P=P, epsilon=eps, w=w,
+            payload_bound=R, seed=77, experiment=experiment_tag,
+        )
+    return out
 
 
 def experiment_A_greedy_vs_brute(
@@ -2381,6 +2584,9 @@ def experiment_A_greedy_vs_brute(
                     tasks.append((
                         ds_name, sensor, pp, R, combo, strat,
                         args.alpha, args.I_max, p_max, clamp_mode,
+                        int(getattr(args, "n_restarts", 3)),
+                        int(getattr(args, "restart_rng_seed", 12345))
+                        + hash(strat) % 1000,
                     ))
         batch = _run_parallel_tasks(
             tasks, _experiment_A_task, workers=workers,
@@ -2425,6 +2631,17 @@ def experiment_A_greedy_vs_brute(
     return df
 
 
+def _split_messages_from_rows(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Pop ``_messages`` off every returned task row; return (summary, msgs)."""
+    messages: list[dict] = []
+    summaries: list[dict] = []
+    for r in rows:
+        if isinstance(r, dict) and "_messages" in r:
+            messages.extend(r.pop("_messages"))
+        summaries.append(r)
+    return summaries, messages
+
+
 def experiment_B_vary_w(
     datasets, clamp_mode, output_dir, args,
     fixed_combos=None, w_values=None,
@@ -2433,6 +2650,7 @@ def experiment_B_vary_w(
     fixed_combos = fixed_combos or EXPERIMENT_FIXED_COMBOS_B
     w_values = w_values or EXPERIMENT_B_W_VALUES
     workers = _default_workers(getattr(args, "workers", None))
+    log_messages = getattr(args, "log_messages", True)
     rows = []
     for ds_name, entries in _iter_clamped_by_dataset(
             datasets, clamp_mode, args.eps_clip, args.seed, args):
@@ -2443,7 +2661,7 @@ def experiment_B_vary_w(
                     tasks.append((
                         ds_name, sensor, agg, cnt, R,
                         combo["strategy"], combo["P"], combo["epsilon"], w,
-                        clamp_mode,
+                        clamp_mode, log_messages, "B_vary_w",
                     ))
         batch = _run_parallel_tasks(
             tasks, _experiment_single_axis_task, workers=workers,
@@ -2451,10 +2669,18 @@ def experiment_B_vary_w(
             progress_every=50,
         )
         rows.extend(batch)
-    df = pd.DataFrame(rows)
+    summaries, messages = _split_messages_from_rows(rows)
+    df = pd.DataFrame(summaries)
     exp_dir = os.path.join(output_dir, "experiments", "B_vary_w")
     os.makedirs(exp_dir, exist_ok=True)
     df.to_csv(os.path.join(exp_dir, "experiment_B_vary_w.csv"), index=False)
+    if log_messages and messages:
+        from message_logger import write_messages_csv
+        n = write_messages_csv(
+            messages,
+            os.path.join(exp_dir, "experiment_B_messages.csv"),
+        )
+        logger.info(f"  Experiment B wrote {n} per-release messages")
     logger.info(f"  Experiment B wrote {len(df)} rows -> {exp_dir}")
 
     _plot_single_axis_experiment(
@@ -2473,6 +2699,7 @@ def experiment_C_vary_epsilon(
     fixed_combos = fixed_combos or EXPERIMENT_FIXED_COMBOS_C
     eps_values = eps_values or EXPERIMENT_C_EPS_VALUES
     workers = _default_workers(getattr(args, "workers", None))
+    log_messages = getattr(args, "log_messages", True)
     rows = []
     for ds_name, entries in _iter_clamped_by_dataset(
             datasets, clamp_mode, args.eps_clip, args.seed, args):
@@ -2483,7 +2710,7 @@ def experiment_C_vary_epsilon(
                     tasks.append((
                         ds_name, sensor, agg, cnt, R,
                         combo["strategy"], combo["P"], eps, combo["w"],
-                        clamp_mode,
+                        clamp_mode, log_messages, "C_vary_epsilon",
                     ))
         batch = _run_parallel_tasks(
             tasks, _experiment_single_axis_task, workers=workers,
@@ -2491,10 +2718,18 @@ def experiment_C_vary_epsilon(
             progress_every=50,
         )
         rows.extend(batch)
-    df = pd.DataFrame(rows)
+    summaries, messages = _split_messages_from_rows(rows)
+    df = pd.DataFrame(summaries)
     exp_dir = os.path.join(output_dir, "experiments", "C_vary_epsilon")
     os.makedirs(exp_dir, exist_ok=True)
     df.to_csv(os.path.join(exp_dir, "experiment_C_vary_epsilon.csv"), index=False)
+    if log_messages and messages:
+        from message_logger import write_messages_csv
+        n = write_messages_csv(
+            messages,
+            os.path.join(exp_dir, "experiment_C_messages.csv"),
+        )
+        logger.info(f"  Experiment C wrote {n} per-release messages")
     logger.info(f"  Experiment C wrote {len(df)} rows -> {exp_dir}")
 
     _plot_single_axis_experiment(
@@ -3115,12 +3350,38 @@ def _drive_live_config(
     n_steps: int,
     seed: int,
     drain_ticks: int = 3,
+    scenario: str = "pooled",
+    n_subscribers: int = 1,
 ) -> dict:
-    """Run one (strategy, epsilon, w, P) config end-to-end through a live broker.
+    """Run one (strategy, epsilon, w, P, scenario) config end-to-end
+    through a live broker.
 
-    Every component (plugin, publisher, subscriber) gets unique paho client_ids
-    and a unique topic-prefix UUID so parallel configs can share the broker.
-    Returns the plugin's release log, subscriber-received releases, and timing.
+    Scenarios:
+
+      * ``pooled``    — every publisher emits on the SAME leaf topic so the
+                        plugin aggregates all n_tau active publishers into a
+                        single release per tau.  Matches the offline
+                        ``run_dp_on_stream`` reference exactly (single stream
+                        over the mean of all active publishers).  Exercises
+                        the many-publishers path under a shared-leaf
+                        subscription.
+      * ``hierarchy`` — each publisher emits on its own leaf under the
+                        dataset's normative MQTT tree (so each leaf's
+                        n_tau = 1).  P >= 2 therefore forces Algorithm 1's
+                        clamp-compatible walk-up on every release, and the
+                        plugin's ``walk_up`` flag should be True for every
+                        released record.
+
+    Every component (plugin, publishers, subscribers) gets unique paho
+    client_ids and a unique topic-prefix UUID so parallel configs can share
+    the broker safely.  ``n_subscribers`` concurrent ``_LiveSubscriber``
+    clients attach to the protected prefix to verify the broker correctly
+    fans each release out to every subscribing client — each subscriber's
+    received-count is reported alongside the plugin's published-count, so
+    the caller can verify subscriber-fan-out integrity.
+
+    Returns the plugin's release log, every subscriber's received releases
+    (aggregated), per-subscriber counts, tau-truth log, and timing metadata.
     """
     import uuid as _uuid
 
@@ -3129,17 +3390,24 @@ def _drive_live_config(
     protected_prefix = f"pubsubpriv/{run_id}/protected"
 
     lo, hi = dataset_spec["static_clamps"][sensor]
-    # Pooled scenario: every publisher emits on the SAME leaf topic, so the
-    # plugin aggregates all n_tau active publishers into a single release per
-    # tau.  This matches the offline `run_dp_on_stream` reference exactly
-    # (single stream over the mean of all active publishers).  The per-leaf
-    # hierarchical scenario with walk-ups is already covered by Experiment D;
-    # Experiment E's purpose is to verify the DP math behaves identically
-    # when the mechanism is driven through a live broker.
-    pooled_leaf = f"{sensor}"
+    if scenario == "pooled":
+        pooled_leaf = f"{sensor}"
 
-    def _leaf_of(_pub_id: str) -> str:
-        return pooled_leaf
+        def _leaf_of(_pub_id: str) -> str:
+            return pooled_leaf
+        plugin_P = int(P)
+    elif scenario == "hierarchy":
+        # Each publisher gets its own leaf under the dataset's normative
+        # topic tree.  With P > 1 the plugin's release gate will fire
+        # on every leaf (n_tau=1 < P) and Algorithm 1's clamp-compatible
+        # walk-up must climb to an ancestor before any release can emit.
+        topic_of = dataset_spec["publisher_topic"]
+
+        def _leaf_of(pub_id: str) -> str:
+            return topic_of(pub_id, sensor)
+        plugin_P = max(2, int(P))  # force walk-up (every leaf has n=1)
+    else:
+        raise ValueError(f"unknown scenario: {scenario}")
 
     plugin = PrivacyPlugin(
         broker_host=broker_host,
@@ -3148,15 +3416,19 @@ def _drive_live_config(
         protected_prefix=protected_prefix,
         epsilon=epsilon,
         window_size=w,
-        min_publishers=P,
+        min_publishers=plugin_P,
         strategy=strategy,
         timestamp_interval=live_dt,
         k_ext=0,
         sensor_bounds={sensor: (lo, hi)},
         client_id=f"plugin-{run_id}",
     )
-    subscriber = _LiveSubscriber(broker_host, broker_port, protected_prefix,
-                                 client_id=f"sub-{run_id}")
+    n_subscribers = max(1, int(n_subscribers))
+    subscribers = [
+        _LiveSubscriber(broker_host, broker_port, protected_prefix,
+                        client_id=f"sub-{run_id}-{i}")
+        for i in range(n_subscribers)
+    ]
     publisher = _LivePublisher(broker_host, broker_port, raw_prefix,
                                client_id=f"pub-{run_id}")
 
@@ -3167,13 +3439,14 @@ def _drive_live_config(
     t0_wall = None
 
     try:
-        subscriber.start()
+        for sub in subscribers:
+            sub.start()
         plugin.start()
         publisher.start()
 
         # Give the broker a moment to finish subscription ack-and-route before
         # the first publish.  This avoids a race where tau=0 messages arrive
-        # before the plugin's subscription is live.
+        # before any subscription is live.
         time.sleep(max(0.2, live_dt))
 
         t0_wall = time.time()
@@ -3206,11 +3479,30 @@ def _drive_live_config(
             plugin.stop()
         finally:
             publisher.stop()
-            subscriber.stop()
+            for sub in subscribers:
+                try:
+                    sub.stop()
+                except Exception:
+                    pass
+
+    # Aggregate across every subscriber so downstream metrics still see one
+    # canonical delivery list; also record per-subscriber counts so the
+    # caller can verify broker fan-out was correct (every subscriber should
+    # receive every release).
+    subscriber_received: list[dict] = []
+    per_subscriber_counts: list[int] = []
+    for sub in subscribers:
+        recv = list(sub.received)
+        subscriber_received.extend(recv)
+        per_subscriber_counts.append(len(recv))
 
     return {
         "plugin_log": list(plugin.release_log),
-        "subscriber_received": list(subscriber.received),
+        "subscriber_received": subscriber_received,
+        "per_subscriber_counts": per_subscriber_counts,
+        "num_subscribers": n_subscribers,
+        "scenario": scenario,
+        "plugin_P": plugin_P,
         "tau_truth": tau_truth,
         "run_id": run_id,
         "raw_prefix": raw_prefix,
@@ -3303,98 +3595,228 @@ def _experiment_E_run(
     w = 8
     P = 2
 
-    exp_dir = os.path.join(output_dir, "experiments", "E_live_broker")
+    # Scenarios exercised end-to-end:
+    #   pooled    — many publishers on one shared leaf (no walk-up; matches
+    #               offline reference exactly).
+    #   hierarchy — each publisher on its own leaf under the normative
+    #               topic tree, P>=2 forces Algorithm 1 walk-up on every
+    #               release.
+    # The pooled scenario is always valid; the hierarchy scenario is skipped
+    # only when the dataset lacks a ``publisher_topic`` factory.
+    scenarios: list[str] = getattr(
+        args, "live_scenarios", None,
+    ) or ["pooled", "hierarchy"]
+    if "hierarchy" in scenarios and "publisher_topic" not in prepared.spec:
+        logger.info(
+            f"[exp E] {dataset_name}: dataset lacks 'publisher_topic' spec; "
+            "skipping hierarchy scenario"
+        )
+        scenarios = [s for s in scenarios if s != "hierarchy"]
+
+    n_subscribers: int = max(1, int(getattr(args, "live_n_subscribers", 3)))
+
+    # Dataset-specific output path so running E across multiple datasets
+    # (e.g. --experiment E --dataset all) does not clobber earlier results.
+    exp_dir = os.path.join(output_dir, "experiments", "E_live_broker",
+                           dataset_name)
     os.makedirs(exp_dir, exist_ok=True)
 
     rows = []
+    all_messages: list[dict] = []
+    log_messages = getattr(args, "log_messages", True)
     t_exp_start = time.time()
     for strategy in strategies:
         for epsilon in epsilons:
-            t_cfg = time.time()
-            logger.info(
-                f"[exp E] {dataset_name}/{sensor} strategy={strategy} "
-                f"eps={epsilon} w={w} P={P} (live broker {broker_host}:{broker_port})"
-            )
-            try:
-                out = _drive_live_config(
-                    per_pub, sensor, prepared.spec,
-                    strategy=strategy, epsilon=epsilon, w=w, P=P,
-                    broker_host=broker_host, broker_port=broker_port,
-                    live_dt=live_dt, n_steps=n_steps, seed=seed,
+            for scenario in scenarios:
+                t_cfg = time.time()
+                logger.info(
+                    f"[exp E] {dataset_name}/{sensor} strategy={strategy} "
+                    f"eps={epsilon} w={w} P={P} scenario={scenario} "
+                    f"subscribers={n_subscribers} "
+                    f"(live broker {broker_host}:{broker_port})"
                 )
-            except Exception as exc:
-                logger.exception(
-                    f"[exp E] config failed (strategy={strategy}, eps={epsilon}): {exc}"
+                try:
+                    out = _drive_live_config(
+                        per_pub, sensor, prepared.spec,
+                        strategy=strategy, epsilon=epsilon, w=w, P=P,
+                        broker_host=broker_host, broker_port=broker_port,
+                        live_dt=live_dt, n_steps=n_steps, seed=seed,
+                        scenario=scenario,
+                        n_subscribers=n_subscribers,
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        f"[exp E] config failed (strategy={strategy}, "
+                        f"eps={epsilon}, scenario={scenario}): {exc}"
+                    )
+                    rows.append({
+                        "dataset": dataset_name, "sensor": sensor,
+                        "strategy": strategy, "epsilon": epsilon,
+                        "w": w, "P": P, "scenario": scenario,
+                        "num_subscribers": n_subscribers,
+                        "status": "error", "error": str(exc),
+                    })
+                    continue
+
+                log = out["plugin_log"]
+                released = [r for r in log if not r["deferred"]
+                            and r["released_value"] is not None]
+                plugin_published = [r for r in log
+                                    if r["released_value"] is not None]
+
+                # Canonical metrics from the plugin log.
+                live_nmae, live_mae, live_kl, live_attr = _live_metrics(
+                    released, out["tau_truth"], B,
                 )
+
+                # Offline reference with the same seed; used for comparison
+                # metrics and to populate epsilon_tau / lambda_tau in the
+                # per-release message log (plugin doesn't expose budget
+                # metadata directly).
+                agg = [e["true_clamped_mean"] for e in out["tau_truth"]]
+                cnt = [e["n_active"] for e in out["tau_truth"]]
+                offline = run_dp_on_stream(
+                    agg, cnt, epsilon=epsilon, window_size=w,
+                    min_publishers=P, payload_bound=B,
+                    strategy=strategy, seed=seed,
+                )
+                off_m = offline["metrics"]
+
+                walkup_count = sum(1 for r in log if r.get("walk_up"))
+                walkup_rate = walkup_count / max(1, len(log))
+                # P-gate violation: a released (non-deferred) record with
+                # n_tau < plugin_P indicates the gate is broken.
+                p_gate_violations = sum(
+                    1 for r in released
+                    if int(r["n_tau"]) < int(out.get("plugin_P", P))
+                )
+
+                # Per-release message log.  Canonical rows from the live
+                # plugin path, augmented with broker-delivery and walk-up
+                # audit columns.
+                if log_messages:
+                    subscriber_by_t = {
+                        float(m.get("t_start", -1)): m
+                        for m in out["subscriber_received"]
+                    }
+                    off_budgets = offline.get("budgets_spent") or []
+                    for rec in log:
+                        tau_idx = int(rec["tau"])  # 1-indexed
+                        n_tau = int(rec["n_tau"])
+                        true_v = rec["true_aggregate"]
+                        noisy_v = rec["released_value"]
+                        eps_tau = (float(off_budgets[tau_idx - 1])
+                                   if 0 <= tau_idx - 1 < len(off_budgets)
+                                   else 0.0)
+                        deferred = bool(rec["deferred"]) or eps_tau <= 0
+                        if (true_v is not None and noisy_v is not None
+                                and not deferred):
+                            noise = float(noisy_v) - float(true_v)
+                        else:
+                            noise = 0.0
+                        lam = (float(B) / (n_tau * eps_tau)
+                               if eps_tau > 0 and n_tau > 0
+                               else float("inf"))
+                        delta_f = (float(B) / n_tau
+                                   if n_tau > 0 else float("inf"))
+                        t_start = float(rec.get("t_start", 0.0))
+                        all_messages.append({
+                            "dataset": dataset_name,
+                            "clamp_mode": "static",  # E runs under Option A
+                            "sensor": sensor,
+                            "strategy": strategy,
+                            "P": int(P),
+                            "epsilon": float(epsilon),
+                            "w": int(w),
+                            "payload_bound": float(B),
+                            "seed": int(seed),
+                            "experiment": f"E_live_broker/{scenario}",
+                            "config_id": (
+                                f"{dataset_name}|E|{scenario}|{sensor}"
+                                f"|{strategy}|P={P}|eps={epsilon}|w={w}"
+                                f"|run={out['run_id']}"
+                            ),
+                            "tau": tau_idx,
+                            "t_start_logical": t_start,
+                            "true_aggregate": (float(true_v)
+                                               if true_v is not None else None),
+                            "noisy_value": (float(noisy_v)
+                                            if noisy_v is not None else None),
+                            "n_tau": n_tau,
+                            "epsilon_tau": eps_tau,
+                            "lambda_tau": lam,
+                            "noise_sample": noise,
+                            "deferred": deferred,
+                            "delta_f": delta_f,
+                            # Live-broker-specific audit columns:
+                            "scenario": scenario,
+                            "plugin_P": int(out.get("plugin_P", P)),
+                            "num_subscribers": n_subscribers,
+                            "leaf_topic": rec.get("leaf_topic"),
+                            "release_scope": rec.get("release_scope"),
+                            "walk_up": bool(rec.get("walk_up", False)),
+                            "broker_delivered": t_start in subscriber_by_t,
+                            "run_id": out["run_id"],
+                        })
+
+                # Broker-path integrity: every protected-topic publish the
+                # plugin made should have been delivered to every subscriber.
+                per_sub = out.get("per_subscriber_counts", [])
+                broker_deliveries = len(out["subscriber_received"])
+                expected_deliveries = len(plugin_published) * n_subscribers
+                broker_delivery_ok = (
+                    broker_deliveries == expected_deliveries
+                    and all(c == len(plugin_published) for c in per_sub)
+                )
+
                 rows.append({
-                    "dataset": dataset_name, "sensor": sensor,
-                    "strategy": strategy, "epsilon": epsilon,
-                    "w": w, "P": P, "status": "error",
-                    "error": str(exc),
+                    "dataset": dataset_name,
+                    "sensor": sensor,
+                    "strategy": strategy,
+                    "epsilon": epsilon,
+                    "w": w,
+                    "P": P,
+                    "scenario": scenario,
+                    "plugin_P": int(out.get("plugin_P", P)),
+                    "num_subscribers": n_subscribers,
+                    "per_subscriber_counts": ";".join(str(c) for c in per_sub),
+                    "run_id": out["run_id"],
+                    "num_taus": len(log),
+                    "num_released": len(released),
+                    "num_plugin_published": len(plugin_published),
+                    "num_walkups": walkup_count,
+                    "walkup_rate": walkup_rate,
+                    "p_gate_violations": p_gate_violations,
+                    "release_rate_live": len(released) / max(1, len(log)),
+                    "release_rate_offline": off_m.get("release_rate",
+                                                      float("nan")),
+                    "nmae_live": live_nmae,
+                    "nmae_offline": off_m.get("normalized_mae", float("nan")),
+                    "nmae_abs_delta": abs(
+                        live_nmae - off_m.get("normalized_mae", float("nan"))),
+                    "mae_live": live_mae,
+                    "kl_live": live_kl,
+                    "kl_offline": off_m.get("kl_divergence", float("nan")),
+                    "attribution_advantage_live": live_attr,
+                    "attribution_advantage_offline":
+                        off_m.get("attribution_advantage", float("nan")),
+                    "broker_deliveries": broker_deliveries,
+                    "expected_deliveries": expected_deliveries,
+                    "broker_delivery_ok": broker_delivery_ok,
+                    "num_input_published": out["num_published"],
+                    "wall_clock_seconds": round(time.time() - t_cfg, 2),
+                    "status": "ok",
                 })
-                continue
-
-            log = out["plugin_log"]
-            released = [r for r in log if not r["deferred"]
-                        and r["released_value"] is not None]
-            # Everything the plugin actually published to the broker
-            # (includes deferred-but-repeated-value emissions, which are
-            # still valid w-event releases and still reach subscribers).
-            plugin_published = [r for r in log if r["released_value"] is not None]
-
-            # Metrics from the plugin log (canonical).
-            live_nmae, live_mae, live_kl, live_attr = _live_metrics(
-                released, out["tau_truth"], B,
-            )
-
-            # Offline reference with same seed.
-            agg = [e["true_clamped_mean"] for e in out["tau_truth"]]
-            cnt = [e["n_active"] for e in out["tau_truth"]]
-            offline = run_dp_on_stream(
-                agg, cnt, epsilon=epsilon, window_size=w,
-                min_publishers=P, payload_bound=B,
-                strategy=strategy, seed=seed,
-            )
-            off_m = offline["metrics"]
-
-            broker_deliveries = len(out["subscriber_received"])
-            # Broker-path integrity: every protected-topic publish the plugin
-            # made should have been delivered to the subscriber.
-            broker_delivery_ok = broker_deliveries == len(plugin_published)
-
-            rows.append({
-                "dataset": dataset_name,
-                "sensor": sensor,
-                "strategy": strategy,
-                "epsilon": epsilon,
-                "w": w,
-                "P": P,
-                "run_id": out["run_id"],
-                "num_taus": len(log),
-                "num_released": len(released),
-                "num_plugin_published": len(plugin_published),
-                "release_rate_live": len(released) / max(1, len(log)),
-                "release_rate_offline": off_m.get("release_rate", float("nan")),
-                "nmae_live": live_nmae,
-                "nmae_offline": off_m.get("normalized_mae", float("nan")),
-                "nmae_abs_delta": abs(live_nmae - off_m.get("normalized_mae", float("nan"))),
-                "mae_live": live_mae,
-                "kl_live": live_kl,
-                "kl_offline": off_m.get("kl_divergence", float("nan")),
-                "attribution_advantage_live": live_attr,
-                "attribution_advantage_offline": off_m.get("attribution_advantage", float("nan")),
-                "broker_deliveries": broker_deliveries,
-                "broker_delivery_ok": broker_delivery_ok,
-                "num_input_published": out["num_published"],
-                "wall_clock_seconds": round(time.time() - t_cfg, 2),
-                "status": "ok",
-            })
-            logger.info(
-                f"[exp E]   released={len(released)}/{len(log)} "
-                f"broker_delivered={broker_deliveries} "
-                f"nmae_live={live_nmae:.4f} nmae_offline={off_m.get('normalized_mae', 0):.4f} "
-                f"(elapsed {time.time() - t_cfg:.1f}s)"
-            )
+                logger.info(
+                    f"[exp E]   scenario={scenario} "
+                    f"released={len(released)}/{len(log)} "
+                    f"walkups={walkup_count} "
+                    f"p_violations={p_gate_violations} "
+                    f"broker_delivered={broker_deliveries}/{expected_deliveries} "
+                    f"nmae_live={live_nmae:.4f} "
+                    f"nmae_offline={off_m.get('normalized_mae', 0):.4f} "
+                    f"(elapsed {time.time() - t_cfg:.1f}s)"
+                )
 
     df = pd.DataFrame(rows)
     df.to_csv(os.path.join(exp_dir, "experiment_E_live_broker.csv"), index=False)
@@ -3403,8 +3825,23 @@ def _experiment_E_run(
         f"(total wall-clock {time.time() - t_exp_start:.1f}s)"
     )
 
-    _plot_experiment_E(df, os.path.join(exp_dir, "experiment_E_live_broker.png"),
-                       dataset_name, sensor, live_dt, broker_host, broker_port)
+    if log_messages and all_messages:
+        from message_logger import write_messages_csv
+        n = write_messages_csv(
+            all_messages,
+            os.path.join(exp_dir, "experiment_E_messages.csv"),
+        )
+        logger.info(f"  Experiment E wrote {n} per-release messages "
+                    f"(live plugin path; broker_delivered flag included)")
+
+    # Plot generation is delegated to generate_plots.py by default; inline
+    # rendering only runs when the user passes --generate-plots (monkey-patch
+    # of plt.savefig in main() no-ops this call otherwise).
+    if getattr(args, "generate_plots", False):
+        _plot_experiment_E(df,
+                           os.path.join(exp_dir, "experiment_E_live_broker.png"),
+                           dataset_name, sensor, live_dt,
+                           broker_host, broker_port)
     return df
 
 
@@ -3600,6 +4037,34 @@ def main():
                         help="Attribution-advantage target; Algorithm 2 seeds P_0 = ceil(1/alpha)")
     parser.add_argument("--I-max", type=int, default=20,
                         help="Algorithm 2 iteration cap for the greedy hill-climb over P")
+    parser.add_argument("--n-restarts", type=int, default=3,
+                        help="Algorithm 2 intelligent multi-start: the first "
+                             "seed is P_0 = ceil(1/alpha); the remaining "
+                             "n_restarts-1 seeds are drawn from quantiles of "
+                             "the observed n_tau distribution.  1 disables "
+                             "random restart and reverts to paper's "
+                             "deterministic seed only.")
+    parser.add_argument("--restart-rng-seed", type=int, default=12345,
+                        help="Random seed used to pick the non-P_0 restart "
+                             "seeds in Algorithm 2 (controls reproducibility "
+                             "of the quantile fallback draw).")
+    parser.add_argument("--log-messages", dest="log_messages",
+                        action="store_true", default=True,
+                        help="Write per-release message CSV (true aggregate, "
+                             "noisy value, n_tau, eps_tau, lambda_tau, "
+                             "deferred flag, ...) for every DP run.  Default: on.")
+    parser.add_argument("--no-log-messages", dest="log_messages",
+                        action="store_false",
+                        help="Disable per-release message logging.")
+    parser.add_argument("--generate-plots", dest="generate_plots",
+                        action="store_true", default=False,
+                        help="Generate PNG plots inline during the run.  "
+                             "Default: off -- use generate_plots.py post-hoc.")
+    parser.add_argument("--no-generate-plots", dest="generate_plots",
+                        action="store_false",
+                        help="Skip inline plot generation (the canonical "
+                             "workflow: run experiments, then generate plots "
+                             "separately from the CSVs via generate_plots.py).")
     parser.add_argument("--seed", type=int, default=0,
                         help="Seed for Option B calibration noise")
     parser.add_argument("--quick", action="store_true", help="Reduced sweep for testing")
@@ -3655,6 +4120,33 @@ def main():
              "otherwise spin one up for the run.",
     )
     parser.add_argument(
+        "--include-energy-in-E", action="store_true", default=False,
+        help="When running Experiment E with --dataset all, also include "
+             "the 'energy' dataset.  Default: skip energy (~36k windows/"
+             "sensor -> hours of broker traffic per config).",
+    )
+    parser.add_argument(
+        "--live-scenarios", default="pooled,hierarchy",
+        help="Comma-separated subset of {pooled,hierarchy} to run under "
+             "Experiment E.  'pooled' exercises the many-publisher shared-"
+             "leaf path; 'hierarchy' puts each publisher on its own leaf "
+             "under the dataset's normative MQTT tree so P>=2 forces "
+             "Algorithm 1 walk-ups on every release.",
+    )
+    parser.add_argument(
+        "--live-n-subscribers", type=int, default=3,
+        help="Number of concurrent subscriber clients attached to the "
+             "protected prefix per Experiment E config.  The broker should "
+             "fan each release out to every subscriber; a mismatch between "
+             "broker_deliveries and expected_deliveries flags a fan-out bug.",
+    )
+    parser.add_argument(
+        "--run-live-E-after-full", action="store_true", default=False,
+        help="When --experiment full is used, additionally run Experiment E "
+             "after the main pipeline completes (live MQTT broker on every "
+             "non-energy dataset by default; respects --include-energy-in-E).",
+    )
+    parser.add_argument(
         "--workers", type=int, default=0,
         help="Parallel worker processes for the sweep and experiments "
              "A/B/C.  0 (default) uses os.cpu_count() - 1.  Set to 1 to "
@@ -3663,6 +4155,17 @@ def main():
     args = parser.parse_args()
     args.workers = _default_workers(args.workers)
     logger.info(f"Using {args.workers} worker process(es) for parallel tasks")
+
+    # When plot generation is disabled, short-circuit savefig so the
+    # experiment functions keep writing their CSVs but produce no PNGs.
+    # generate_plots.py reads those CSVs post-hoc and renders every figure.
+    if not args.generate_plots:
+        def _savefig_noop(*_a, **_kw):  # pragma: no cover - trivial
+            return None
+        plt.savefig = _savefig_noop
+        logger.info("Inline plot generation DISABLED. Run `python "
+                    "generate_plots.py --output-dir <results_dir>` "
+                    "after the experiment completes to render every figure.")
 
     if args.quick:
         s_values = [1, 2, 4]
@@ -3731,22 +4234,38 @@ def main():
     run_live_E = args.experiment == "E"
 
     if run_live_E:
-        ds_for_E = args.dataset if args.dataset != "all" else "wearable"
-        if ds_for_E == "energy":
-            logger.warning(
-                "[exp E] --dataset energy is strongly discouraged "
-                "(~36k windows/sensor). Recommend 'wearable' or 'manufacturing'."
+        # --dataset <name>   -> run E on that one dataset.
+        # --dataset all      -> run E on every dataset EXCEPT energy
+        #                       (energy has ~36k windows/sensor -> hours per
+        #                       config on a live broker).  Set
+        #                       --include-energy-in-E to force it.
+        if args.dataset == "all":
+            datasets_for_E = [ds for ds in DATASETS.keys()
+                              if ds != "energy" or args.include_energy_in_E]
+            if not args.include_energy_in_E:
+                logger.info("[exp E] --dataset all: skipping 'energy' "
+                            "(pass --include-energy-in-E to force)")
+        else:
+            datasets_for_E = [args.dataset]
+            if args.dataset == "energy":
+                logger.warning(
+                    "[exp E] --dataset energy is strongly discouraged "
+                    "(~36k windows/sensor). Recommend 'wearable' or "
+                    "'manufacturing'."
+                )
+        for ds_for_E in datasets_for_E:
+            logger.info(f"===== Experiment E: dataset={ds_for_E} =====")
+            experiment_E_live_broker(
+                ds_for_E, args.output_dir, args,
+                broker_host=args.broker_host,
+                broker_port=args.broker_port,
+                live_dt=args.live_dt,
+                n_steps=args.live_n_steps,
+                seed=args.seed or 123,
+                auto_start_broker=args.auto_broker,
             )
-        experiment_E_live_broker(
-            ds_for_E, args.output_dir, args,
-            broker_host=args.broker_host,
-            broker_port=args.broker_port,
-            live_dt=args.live_dt,
-            n_steps=args.live_n_steps,
-            seed=args.seed or 123,
-            auto_start_broker=args.auto_broker,
-        )
-        logger.info("Experiment E complete.")
+        logger.info(
+            f"Experiment E complete ({len(datasets_for_E)} dataset(s)).")
         return
 
     if run_main_pipeline:
@@ -3787,6 +4306,38 @@ def main():
         run_single_axis_experiments(
             targets, clamp_modes, args.output_dir, args, strategies, which=which,
         )
+
+    # Experiment E auto-runs after --experiment full when --run-live-E-after-full
+    # is set.  Each dataset gets its own live-broker sub-run (pooled + hierarchy
+    # scenarios, --live-n-subscribers concurrent subscribers); results land
+    # under <output_dir>/experiments/E_live_broker/<dataset>/.
+    if (args.experiment == "full"
+            and getattr(args, "run_live_E_after_full", False)):
+        e_targets = [ds for ds in (
+            targets if args.dataset != "all" else list(DATASETS.keys())
+        ) if ds != "energy" or args.include_energy_in_E]
+        if "energy" in (targets if args.dataset != "all"
+                        else list(DATASETS.keys())) \
+                and not args.include_energy_in_E:
+            logger.info("[exp E/auto] skipping 'energy' dataset (pass "
+                        "--include-energy-in-E to force)")
+        for ds_for_E in e_targets:
+            logger.info(f"===== Experiment E (post-full): dataset={ds_for_E} =====")
+            try:
+                experiment_E_live_broker(
+                    ds_for_E, args.output_dir, args,
+                    broker_host=args.broker_host,
+                    broker_port=args.broker_port,
+                    live_dt=args.live_dt,
+                    n_steps=args.live_n_steps,
+                    seed=args.seed or 123,
+                    auto_start_broker=args.auto_broker,
+                )
+            except Exception as exc:
+                logger.exception(
+                    f"[exp E/auto] failed on {ds_for_E}: {exc} "
+                    "(continuing with next dataset)"
+                )
 
     logger.info("All experiments complete.")
 

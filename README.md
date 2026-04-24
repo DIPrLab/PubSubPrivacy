@@ -22,12 +22,22 @@ et al. (2014) to the pub/sub setting with:
   * **Dynamic timestamp-interval extension** up to `T_max = K_ext · Δt`
     (Section 5.6).
   * **Two-stage hyperparameter tuning** (Section 5.7): Algorithm 2 greedy
-    hill-climb over the publisher threshold `P`, seeded at `P_0 = ⌈1/α⌉`,
-    with Δt adapting online via the extension mechanism and the inner
-    strategy `(A, θ)` selected by subscription requirements. Paired with a
-    naive full-brute-force enumeration of every `P ∈ [1, max n_τ]` per
-    strategy so the **empirical gap** between greedy and optimal is
-    measurable directly.
+    hill-climb over the publisher threshold `P`, now with **intelligent
+    random-restart multi-start**. The first restart always seeds at the
+    paper's `P_0 = ⌈1/α⌉` identity-protection seed; the remaining seeds are
+    drawn from quantiles of the observed `n_τ` distribution so the hill-climb
+    explores the pool-density regimes the stream actually exhibits instead of
+    always starting at the same point. Paired with a naive full-brute-force
+    enumeration of every `P ∈ [1, max n_τ]` per strategy so the **empirical
+    gap** between greedy and optimal is measurable directly.
+  * **Comprehensive per-release message logging** — every DP run writes the
+    `(true_aggregate, noisy_value, n_τ, ε_τ, λ_τ, deferred, ...)` pair for
+    every logical timestamp to `messages/*.csv`, so the full input/output
+    trail (original message and its noisy delivery) is auditable offline.
+  * **Decoupled plotting** — `run_experiment.py` writes CSVs only (no inline
+    PNGs by default); `generate_plots.py` reads those CSVs post-hoc and
+    renders every figure. Use `--generate-plots` on `run_experiment.py` to
+    restore the inline behavior.
 
 The experimental pipeline runs end-to-end on **six real-world public
 datasets** — no synthetic data anywhere.
@@ -64,7 +74,9 @@ Publishers (IoT sensors)
 | `dp_engine.py` | Core DP engine. Laplace mechanism, sliding-window budget, all eight budget strategies exercised by the paper (Uniform, Sample, BD with the Algorithm 4 forward buffer, BA, P-gated Uniform/Sample/BA, n-weighted), utility metrics (MAE/NMAE, windowed + global KL), attribution advantage. |
 | `plugin.py` | MQTT privacy plugin. Per-publisher clamping (Def. 3.2), Algorithm 1 hierarchy walk with clamp-compatibility, dynamic interval extension (Section 5.6), delivery of only `(ê_τ, t_start_τ)` pairs per Def. 3.4. |
 | `data_streams.py` | Dataset ingestion, stream construction, `DATASETS` registry (six real-world datasets), and the Definition 3.2 clamp options (static / DP-released). |
-| `run_experiment.py` | Single entry-point for the full pipeline: per-dataset parameter sweep, strategy comparison, paper's four intro figures, n-weighted spotlight, collusion experiment, K_ext sweep, Section 5.7 multi-strategy hyperparameter tuning, Experiments A/B/C/D (Section 6.5–6.8), and cross-dataset aggregates. |
+| `run_experiment.py` | Single entry-point for the full pipeline: per-dataset parameter sweep, strategy comparison, paper's four intro figures, n-weighted spotlight, collusion experiment, K_ext sweep, Section 5.7 multi-strategy hyperparameter tuning, Experiments A/B/C/D (Section 6.5–6.8), and cross-dataset aggregates. Writes only CSVs by default. |
+| `message_logger.py` | Per-release message serialization. Flattens every DP run's `(true_aggregate, noisy_value, n_τ, ε_τ, λ_τ, deferred, ...)` into append-friendly CSV rows. Used by every experiment that records per-message data. |
+| `generate_plots.py` | Post-hoc plot generator. Reads every CSV produced by `run_experiment.py` and renders the full PNG catalogue (sweep, intro, tuning, extras, experiments A/B/C/D, cross-dataset). Run it after `run_experiment.py` — or pass `--generate-plots` to the latter to restore the inline workflow. |
 | `config.yaml` | Configuration mirroring the paper's DP / scheduling parameter taxonomy. |
 
 ## Parameter taxonomy (paper §3.1)
@@ -114,17 +126,23 @@ identity protection against latency and scope coarsening.
 pip install -r requirements.txt
 ```
 
-### Run the real-data experiment
+### Run the real-data experiment (two-step workflow)
 
 ```bash
-# FULL paper pipeline on every dataset in both clamp modes (Option A + B).
-# Produces every artifact referenced in the paper: the main sweep,
-# intro figures (Section 1.3), Section 5.7 greedy-vs-brute tuning, the
-# Option A vs B clamp comparison, the n-weighted / collusion / K_ext
-# auxiliary probes, and Experiments A/B/C/D (Section 6.5–6.8).
+# 1.  FULL paper pipeline on every dataset in both clamp modes (Option A + B).
+#     Writes every CSV the paper references: the main sweep, intro figures
+#     (Section 1.3), Section 5.7 greedy-vs-brute tuning with intelligent
+#     multi-start, the Option A vs B clamp comparison, the n-weighted /
+#     collusion / K_ext auxiliary probes, and Experiments A/B/C/D
+#     (Section 6.5–6.8).  Per-release messages (true aggregate + noisy
+#     delivery + all metadata) land under each experiment's messages/ dir.
 python run_experiment.py --experiment full --clamp-mode both \
                         --alpha 0.25 --eps-clip 0.1 \
-                        --output-dir results
+                        --n-restarts 3 \
+                        --output-dir results_3
+
+# 2.  Render every PNG from the CSVs in results_3/.
+python generate_plots.py --output-dir results_3
 
 # Same pipeline, sequential over every single-axis experiment explicitly.
 # `--experiment full` already covers this; use ABCD when you want to skip
@@ -162,7 +180,14 @@ python run_experiment.py --quick --max-energy-timestamps 3000 \
 # Tuning-sensitivity dials (paper Algorithm 2 hyperparameters).
 python run_experiment.py --alpha 0.10          # P_0 = ceil(1/0.10) = 10
 python run_experiment.py --I-max 40            # More hill-climb iterations
+python run_experiment.py --n-restarts 5        # More intelligent restart starts
+python run_experiment.py --n-restarts 1        # Paper's original deterministic seed only
+python run_experiment.py --restart-rng-seed 42 # Reproducibility of quantile draws
 python run_experiment.py --eps-clip 0.05       # Tighter Option B calibration
+
+# Message / plot logging dials.
+python run_experiment.py --no-log-messages     # Skip the messages/*.csv outputs
+python run_experiment.py --generate-plots      # Render PNGs inline (legacy mode)
 
 # Single-axis experiments (hold all hyperparameters fixed except one).
 python run_experiment.py --experiment A        # greedy vs naive P-tuning
@@ -194,35 +219,40 @@ Every run of `run_experiment.py` produces the same standardized tree under
 `--clamp-mode both` emits both side-by-side for comparison.
 
 ```
-results/
+results_3/
   <dataset>/
     <clamp_mode>/
       <dataset>_<clamp_mode>_clamps.csv    # per-publisher [a_p, b_p] actually used
+      <dataset>_topics.csv                 # (publisher_id, sensor) -> MQTT topic
+      <dataset>_subscriber_filters.csv     # wildcard filters realistic subscribers bind to
+      messages/
+        sweep_messages.csv                 # per-release log: true_aggregate,
+                                           # noisy_value, n_tau, eps_tau,
+                                           # lambda_tau, deferred, noise_sample,
+                                           # delta_f, for every (config, tau).
       sweep/
         sweep_results.csv                   # every (strategy, P, eps, w, sensor) row
-        <dataset>_mae_vs_epsilon.png
-        <dataset>_mae_vs_P.png
-        <dataset>_strategy_comparison.png
-        <dataset>_timeseries.png
-        <dataset>_budget_utilization.png
-        <dataset>_kl_vs_epsilon.png
-        <dataset>_kl_heatmap.png
-        <dataset>_kl_windowed.png
-        <dataset>_release_rate_vs_P.png
+        # PNGs land here only when --generate-plots is set on run_experiment.py
+        # or after running: python generate_plots.py --output-dir results_3
       intro/
-        <dataset>_figure_extreme1_global.csv/.png
-        <dataset>_figure_extreme2_per_publisher.csv/.png
-        <dataset>_figure_extremes_vs_ours.csv/.png
-        <dataset>_figure_u_shaped_P_vs_KL.csv/.png
-        <dataset>_figure1_kl_vs_P.csv/.png
+        <dataset>_figure_extreme1_global.csv  (+ .png from generate_plots.py)
+        <dataset>_figure_extreme2_per_publisher.csv  (+ .png)
+        <dataset>_figure_extremes_vs_ours.csv  (+ .png)
+        <dataset>_figure_u_shaped_P_vs_KL.csv  (+ .png)
+        <dataset>_figure1_kl_vs_P.csv  (+ .png)
       tuning/
-        <dataset>_<sensor>_tuning_greedy.csv        # Algorithm 2 trajectory (every probe)
+        <dataset>_<sensor>_tuning_greedy.csv        # Algorithm 2 trajectory
+                                                    # (every probe across every
+                                                    # restart, with restart_idx
+                                                    # column)
         <dataset>_<sensor>_tuning_brute_force.csv   # every P in [1, p_max]
-        <dataset>_<sensor>_tuning_strategy_summary.csv  # greedy vs brute-force
-        <dataset>_<sensor>_tuning.png               # loss-vs-P curve with greedy overlay
+        <dataset>_<sensor>_tuning_strategy_summary.csv  # greedy vs brute-force,
+                                                    # plus greedy_n_restarts +
+                                                    # greedy_restart_seeds_P
+        <dataset>_<sensor>_tuning.png               # loss-vs-P curve (generate_plots)
       extras/
-        <dataset>_n_weighted_spotlight.csv/.png
-        <dataset>_collusion.csv/.png
+        <dataset>_n_weighted_spotlight.csv  (+ .png)
+        <dataset>_collusion.csv  (+ .png)
         <dataset>_<sensor>_k_ext_sweep.csv
         <dataset>_<sensor>_k_ext.png
   cross_dataset/
@@ -237,6 +267,22 @@ results/
       figure1_all_datasets.csv              # per-clamp-mode slice
       figure1_avg_across_datasets.csv       # KL averaged across datasets per P
       figure1_all_datasets.png              # cross-dataset Figure 1 for this clamp mode
+      experiments/
+        A_greedy_vs_brute/
+          experiment_A_greedy_vs_brute.csv   # greedy vs brute for every (ds,strat,eps,w)
+          experiment_A_speedup_and_gap.png
+        B_vary_w/
+          experiment_B_vary_w.csv            # NMAE/KL vs w for 5 fixed combos
+          experiment_B_messages.csv          # per-release messages (NEW)
+          experiment_B_vary_w.png
+        C_vary_epsilon/
+          experiment_C_vary_epsilon.csv      # NMAE/KL vs eps for 5 fixed combos
+          experiment_C_messages.csv          # per-release messages (NEW)
+          experiment_C_vary_epsilon.png
+        D_plugin_path/
+          experiment_D_plugin_releases.csv   # already per-release (plugin log)
+          experiment_D_plugin_summary.csv
+          experiment_D_plugin_path.png
     cross_dataset_<clamp_mode>.png          # NMAE / KL vs eps per clamp mode
 ```
 
@@ -374,6 +420,36 @@ with its own sweep, intro figures, and tuning, so operators can read off the
 empirical accuracy penalty of Option A's loose clamp versus Option B's
 calibration cost.
 
+### Per-release message logging
+
+Every DP run records every logical-timestamp release as one row in an
+append-friendly CSV.  The main sweep drains to
+`results_3/<dataset>/<clamp_mode>/messages/sweep_messages.csv`; Experiments
+B and C drain to `experiment_B_messages.csv` / `experiment_C_messages.csv`
+under `cross_dataset/<clamp_mode>/experiments/{B,C}_*/`; Experiment D
+already writes its own per-release log
+(`experiment_D_plugin_releases.csv`); Experiment E drains to
+`experiments/E_live_broker/<dataset>/experiment_E_messages.csv` with extra
+live-broker audit columns (`leaf_topic`, `release_scope`, `walk_up`,
+`broker_delivered`, `run_id`).  The schema
+(see `message_logger.MESSAGE_LOG_COLUMNS`) is:
+
+| Column | Meaning |
+|--------|---------|
+| `dataset`, `clamp_mode`, `sensor`, `strategy`, `P`, `epsilon`, `w`, `payload_bound`, `seed`, `experiment`, `config_id` | Configuration context |
+| `tau`, `t_start_logical` | Logical timestamp and `(τ−1)·Δt` offline proxy for Def. 3.1's wall-clock start |
+| `true_aggregate` | Clamped-mean `e_τ` BEFORE noise — the *original message* the broker would have released without DP |
+| `noisy_value` | `ê_τ` delivered to the subscriber (or repeat-of-last when deferred) |
+| `n_tau` | Multiplicity `|P_τ|` (broker-internal) |
+| `epsilon_tau` | Per-element budget spent at τ |
+| `lambda_tau` | Laplace scale `Δf / ε_τ = R / (n_τ ε_τ)` |
+| `noise_sample` | `noisy − true` at τ (0.0 when deferred) |
+| `deferred` | `True` when the release gate or skip fired |
+| `delta_f` | Per-element sensitivity `R / n_τ` for the default mean |
+
+These rows are the canonical audit trail for "every output message and its
+original" — pass `--no-log-messages` to disable.
+
 ### Section 5.7 tuning: Algorithm 2 greedy + naive brute-force enumeration
 
 Per the paper's updated Tuning architecture, `tune_hyperparameters` now runs
@@ -381,11 +457,21 @@ two-stage scope-first tuning with `P` as the primary knob (Δt adapts online
 via Section 5.6; `(A, θ)` is selected by subscription requirements rather
 than jointly optimized):
 
-* **Greedy hill-climb (Algorithm 2).** For each strategy, seed
-  `P_0 = ⌈1/α⌉` (default `α = 0.25` → `P_0 = 4`; flag `--alpha`). Probe
-  neighbors `P_0 − 1` and `P_0 + 1`; step to the better if it lowers the
-  scalarized loss `L = NMAE + 0.2 · (1 − release_rate)`; stop at a local
-  optimum or after `--I-max` iterations (default 20).
+* **Greedy hill-climb with intelligent multi-start (Algorithm 2).** For each
+  strategy, run `--n-restarts` independent hill-climbs (default 3) and keep
+  the best local optimum.  The first restart always seeds at the paper's
+  `P_0 = ⌈1/α⌉` identity-protection seed (default `α = 0.25` → `P_0 = 4`;
+  flags `--alpha` / `--n-restarts` / `--restart-rng-seed`).  The remaining
+  `--n-restarts − 1` starts are drawn from quantiles of the observed
+  `n_τ` distribution on the trace, so the walks probe the pool-density
+  regimes the stream actually exhibits instead of always starting at the
+  same point — setting `--n-restarts 1` reverts to the paper's original
+  deterministic seed.  Each restart probes neighbors `P − 1` and `P + 1`,
+  steps to the better if it lowers the scalarized loss
+  `L = NMAE + 0.2 · (1 − release_rate)`, and stops at a local optimum or
+  after `--I-max` iterations (default 20).  The full greedy CSV records the
+  restart index per probe; the summary CSV records `greedy_n_restarts` and
+  `greedy_restart_seeds_P` for auditability.
 * **Naive brute-force enumeration.** For the same strategy, evaluate every
   integer `P ∈ [1, p_max]` where `p_max = max n_τ` observed on the trace.
 
@@ -476,14 +562,44 @@ runtime quantities remain broker-internal.
 
 ## Reproducing the paper end-to-end
 
-The canonical command that runs every artifact the paper references, on
-every dataset, in both clamp modes, sequentially, and saves every CSV /
-PNG under `results/`:
+Each experiment runs **concurrently within** (ProcessPoolExecutor fans out
+the task list over `--workers` cores) but **sequentially across**
+experiments — the sweep finishes before Experiment A starts, A before B,
+and so on, so the DP budget accounting for each experiment is isolated.
+Inside each experiment, independent tasks (sensor × strategy × P × ε × w,
+or per-config greedy walks) run in parallel.
+
+The canonical command — runs every artifact the paper references, on every
+dataset, in both clamp modes, writes every CSV under `results_3/`, and then
+renders every PNG from those CSVs — is:
 
 ```bash
+# 1.  Experiments (CSV-only; plots are a separate pass).
+#     --run-live-E-after-full chains Experiment E after the main pipeline,
+#     iterating over every non-energy dataset (live MQTT broker,
+#     pooled + hierarchy scenarios, 3 concurrent subscribers per config).
 python run_experiment.py --experiment full --clamp-mode both \
                         --alpha 0.25 --eps-clip 0.1 \
-                        --output-dir results
+                        --n-restarts 3 \
+                        --run-live-E-after-full \
+                        --live-scenarios pooled,hierarchy \
+                        --live-n-subscribers 3 \
+                        --output-dir results_3
+
+# 2.  Plots — reads every CSV under results_3/ and renders the full PNG set
+#     (includes Experiment E figures under
+#     experiments/E_live_broker/<dataset>/).
+python generate_plots.py --output-dir results_3
+```
+
+Experiment E is optional — drop `--run-live-E-after-full` to skip it, or
+run it separately afterwards:
+
+```bash
+python run_experiment.py --experiment E --dataset all \
+                        --live-scenarios pooled,hierarchy \
+                        --live-n-subscribers 3 \
+                        --output-dir results_3
 ```
 
 For a faster smoke-test of the pipeline (reduced grids, capped row counts,
@@ -494,6 +610,38 @@ python run_experiment.py --experiment full --quick --clamp-mode both \
                         --max-energy-timestamps 3000 \
                         --max-traffic-rows 30000 --max-rows 5000 \
                         --output-dir results_test
+python generate_plots.py --output-dir results_test
 ```
 
-```python run_experiment.py --experiment E --dataset wearable --output-dir results_e```
+### Experiment E: what it actually tests
+
+Experiment E exercises the broker-side plugin end-to-end against a real
+MQTT broker (default: embedded `amqtt` if nothing is listening on
+`--broker-host:--broker-port`).  Per dataset, per
+`(strategy × epsilon × scenario)` config, it spins up:
+
+* a `PrivacyPlugin` running the full DP pipeline,
+* all dataset publishers emitting their recorded traces on unique
+  per-`run_id` raw topics (the **many-publishers** path — every publisher
+  registered by that dataset's loader is emitted concurrently),
+* `--live-n-subscribers` independent subscriber clients (default 3) all
+  listening on the protected prefix, so the broker must fan every release
+  out to every subscriber.
+
+Scenarios (run both by default):
+
+| Scenario | Topic layout | What it exercises |
+|----------|--------------|-------------------|
+| `pooled` | All publishers emit on ONE shared leaf; the plugin pools them into a single aggregate per τ. | Many-publishers path under a shared-leaf subscription; also byte-for-byte comparison against `run_dp_on_stream` under the same seed. |
+| `hierarchy` | Each publisher emits on its OWN leaf under the dataset's normative MQTT tree (`factory/line1/<machine>/<sensor>`, etc.). The plugin sees `n_τ=1` at every leaf, so Algorithm 1 walks up to a clamp-compatible ancestor on every release. | **P-enforced walk-up** — every released record should have `walk_up=True` and `release_scope != leaf`.  The summary row tracks `walkup_rate` and `p_gate_violations` (must be 0). |
+
+The `experiment_E_live_broker.csv` summary row records for every config:
+`release_rate_live` vs `release_rate_offline`, `nmae_live` vs `nmae_offline`,
+`kl_live` vs `kl_offline`, `broker_deliveries` vs `expected_deliveries`,
+`per_subscriber_counts`, `num_walkups`, `walkup_rate`, and
+`p_gate_violations`.  The `experiment_E_messages.csv` per-release log
+carries the full DP-engine schema plus live-broker audit columns
+(`scenario`, `plugin_P`, `num_subscribers`, `leaf_topic`, `release_scope`,
+`walk_up`, `broker_delivered`, `run_id`).
+
+
