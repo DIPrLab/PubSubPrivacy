@@ -383,16 +383,27 @@ def plot_extras(extras_dir: str, dataset_name: str):
     p = os.path.join(extras_dir, f"{dataset_name}_n_weighted_spotlight.csv")
     df = _safe_read_csv(p)
     if df is not None and not df.empty and "cv_n_tau" in df.columns:
-        fig, ax = plt.subplots(figsize=(7, 4.5))
-        ax.scatter(df["cv_n_tau"], df["kl_advantage_uniform_minus_nweighted"],
-                   s=60, alpha=0.8, c="tab:blue")
-        ax.axhline(0, color="red", ls="--", alpha=0.6)
-        ax.set(xlabel="CV of n_tau",
-               ylabel="KL(uniform) - KL(n-weighted)",
-               title=f"{dataset_name}: n-weighted advantage vs n_tau variance")
-        ax.grid(True, alpha=0.3)
-        _savefig(os.path.join(extras_dir,
-                              f"{dataset_name}_n_weighted_spotlight.png"))
+        adv_col = next(
+            (c for c in ("kl_advantage",
+                         "kl_advantage_uniform_minus_nweighted")
+             if c in df.columns),
+            None,
+        )
+        if adv_col is None and {"kl_uniform", "kl_n_weighted"} <= set(df.columns):
+            df = df.copy()
+            df["kl_advantage"] = df["kl_uniform"] - df["kl_n_weighted"]
+            adv_col = "kl_advantage"
+        if adv_col is not None:
+            fig, ax = plt.subplots(figsize=(7, 4.5))
+            ax.scatter(df["cv_n_tau"], df[adv_col],
+                       s=60, alpha=0.8, c="tab:blue")
+            ax.axhline(0, color="red", ls="--", alpha=0.6)
+            ax.set(xlabel="CV of n_tau",
+                   ylabel="KL(uniform) - KL(n-weighted)",
+                   title=f"{dataset_name}: n-weighted advantage vs n_tau variance")
+            ax.grid(True, alpha=0.3)
+            _savefig(os.path.join(extras_dir,
+                                  f"{dataset_name}_n_weighted_spotlight.png"))
 
     # Collusion.
     p = os.path.join(extras_dir, f"{dataset_name}_collusion.csv")

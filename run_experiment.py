@@ -3603,9 +3603,15 @@ def _experiment_E_run(
     #               release.
     # The pooled scenario is always valid; the hierarchy scenario is skipped
     # only when the dataset lacks a ``publisher_topic`` factory.
-    scenarios: list[str] = getattr(
-        args, "live_scenarios", None,
-    ) or ["pooled", "hierarchy"]
+    raw_scenarios = getattr(args, "live_scenarios", None)
+    if isinstance(raw_scenarios, str):
+        scenarios: list[str] = [
+            s.strip() for s in raw_scenarios.split(",") if s.strip()
+        ]
+    else:
+        scenarios = list(raw_scenarios) if raw_scenarios else []
+    if not scenarios:
+        scenarios = ["pooled", "hierarchy"]
     if "hierarchy" in scenarios and "publisher_topic" not in prepared.spec:
         logger.info(
             f"[exp E] {dataset_name}: dataset lacks 'publisher_topic' spec; "

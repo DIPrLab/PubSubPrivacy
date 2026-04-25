@@ -12,6 +12,14 @@ Implements the paper:
   - Sliding-window budget constraint: sum_{j=tau-w+1}^{tau} eps_j <= eps.
   - Budget-allocation strategies from Kellaris et al. (Section 5.2):
       Uniform, Sample, Budget Distribution (BD), Budget Absorption (BA).
+  - BD and BA follow Kellaris et al. Section 4: each tau runs a private
+    dissimilarity sub-mechanism M_{i,1} (spending eps/(2w), Laplace scale
+    R / (n_tau * eps_{i,1})) whose noisy output drives the skip/publish
+    decision, plus a publication sub-mechanism M_{i,2} that is bounded to a
+    share of eps/2 per window so total(M_{i,1}+M_{i,2}) fits under eps.
+  - BA additionally nullifies the alpha timestamps following a release that
+    absorbed alpha prior skipped budgets (Kellaris et al. Figure 4 lines 5-6)
+    so the sliding-window constraint holds by construction, not by truncation.
   - P-allocation (Section 5.3): a population-aware release gate that requires
     n_tau >= P to spend budget; otherwise the element is deferred (last
     release repeated).  Composes with any inner strategy.
@@ -109,12 +117,20 @@ class StreamState:
     last_released: Optional[float] = None
     last_true_aggregate: Optional[float] = None
     absorbed_budget: float = 0.0
-    # Budget Distribution forward buffer (paper Algorithm 4 lines 11-18).
-    # Index 0 is the share landing at the current tau; when we skip at tau
-    # we add (eps/w)/(w-1) to indices 1..w-1; when we release at tau we
-    # consume index 0. Maintained at length w: popleft() + append(0.0) per
-    # tick keeps the indexing aligned with the logical timestamp.
+    # Budget Distribution forward buffer (Kellaris et al. BD, half-budget
+    # variant).  Index 0 is the share landing at the current tau; when we
+    # skip at tau we add (eps/(2w))/(w-1) to indices 0..w-2 (i.e. to taus
+    # tau+1..tau+w-1); when we release at tau we consume index 0.
+    # Maintained at length w: popleft() + append(0.0) per tick keeps the
+    # indexing aligned with the logical timestamp.
     bd_forward: deque = field(default_factory=deque)
+    # BA nullification state (Kellaris et al. Figure 4 lines 5-6).
+    # ba_nullify_remaining counts how many future taus M_{i,2} must force
+    # to null because the last publication absorbed that many prior skips.
+    # ba_skipped_since_last_pub counts skipped publications waiting to be
+    # absorbed at the next release.
+    ba_nullify_remaining: int = 0
+    ba_skipped_since_last_pub: int = 0
     # Set by _record on every release() call so callers (e.g. plugin.py) can
     # distinguish a fresh Laplace release from a repeat-of-previous deferral
     # without relying on numerical-equality heuristics.
@@ -149,72 +165,139 @@ class StreamState:
     def _budget_remaining(self) -> float:
         return self.config.epsilon - self._budget_spent_in_window()
 
-    # ---- inner value-driven allocators ----------------------------------
+    # ---- private dissimilarity sub-mechanism M_{i,1} --------------------
 
-    def _alloc_uniform(self) -> tuple[float, bool]:
-        return self.config.epsilon / self.config.window_size, False
+    def _private_dissimilarity(
+        self, aggregate: float, n_tau: int
+    ) -> tuple[float, float]:
+        """Kellaris et al. M_{i,1}: noisy dissimilarity vs. the last release.
 
-    def _alloc_sample(self) -> tuple[float, bool]:
-        # Release full budget every w-th eligible timestamp; else skip.
-        if self.current_tau % self.config.window_size == 1:
-            return self.config.epsilon, False
-        return 0.0, True
+        Returns ``(noisy_dis, eps_dissim)``.  The comparison is against
+        ``last_released`` (o_l in the paper) which is already public, so
+        only the sensitivity of the current aggregate enters the analysis:
+        one added/removed row shifts ``|aggregate - last_released|`` by at
+        most R / n_tau, so spending eps/(2w) budget requires Laplace noise
+        of scale (R / n_tau) / (eps/(2w)) = 2 w R / (n_tau * eps).
 
-    def _alloc_budget_distribution(self, aggregate: float) -> tuple[float, bool]:
+        When no prior release exists (cold-start) dissim is unused and we
+        spend zero budget; returning +inf forces the caller's publish branch.
         """
-        BD (Kellaris et al., paper Algorithm 4 lines 11-18).
+        if self.last_released is None or n_tau <= 0:
+            return float("inf"), 0.0
+        w = self.config.window_size
+        eps_dissim = self.config.epsilon / (2 * w)
+        sensitivity = self.config.payload_bound / n_tau
+        scale = sensitivity / eps_dissim
+        raw_dis = abs(aggregate - self.last_released)
+        noisy = raw_dis + float(np.random.laplace(loc=0.0, scale=scale))
+        return noisy, eps_dissim
 
-        The caller ticks ``bd_forward`` exactly once per tau in ``release()``
-        (setting ``_bd_pending_now`` to the share landing at this tau), so
-        this method never shifts the deque itself.
+    # ---- inner value-driven allocators ----------------------------------
+    #
+    # Each allocator returns ``(dissim_eps, pub_eps, skip)``.  Strategies
+    # without a private dissimilarity step (Uniform, Sample, n-weighted)
+    # return ``dissim_eps == 0``.  Total budget spent at tau is the sum
+    # ``dissim_eps + pub_eps``; both participate in the sliding-window cap.
 
-          - Skip (|e_tau - last_rel| < theta*R): forward the base share
-            eps/w equally across fwd[tau+1..tau+w-1]; return (0, skip).
-            The ``pending_now`` share for this tau is lost (paper: fwd is
-            only drained on release).
-          - Release: spend eps/w + pending_now; return that, false.
+    def _alloc_uniform(self) -> tuple[float, float, bool]:
+        return 0.0, self.config.epsilon / self.config.window_size, False
+
+    def _alloc_sample(self) -> tuple[float, float, bool]:
+        # Release full budget every w-th eligible timestamp; else skip.
+        # (tau - 1) % w == 0 handles w == 1 (every tau publishes) and
+        # matches the paper's "i mod w == 1" for w > 1.
+        if (self.current_tau - 1) % self.config.window_size == 0:
+            return 0.0, self.config.epsilon, False
+        return 0.0, 0.0, True
+
+    def _alloc_budget_distribution(
+        self, aggregate: float, n_tau: int
+    ) -> tuple[float, float, bool]:
+        """BD with private dissimilarity (Kellaris et al. Algorithm 4).
+
+        Per-tau layout in the w-event budget of eps:
+          M_{i,1}: eps/(2w)           (noisy dissimilarity)
+          M_{i,2}: eps/(2w) base share + accumulated forward shares from
+                   earlier skips, capped at eps/2 per window.
+
+        Window invariant: dissim totals exactly eps/2 over any w consecutive
+        taus; publication totals at most eps/2 because every skip forwards
+        only (eps/(2w))/(w-1) per future slot and at most w-1 slots land in
+        any window.  Sum = eps.
         """
         w = self.config.window_size
         pending_now = getattr(self, "_bd_pending_now", 0.0)
+        noisy_dis, eps_dissim = self._private_dissimilarity(aggregate, n_tau)
 
-        if self.last_true_aggregate is not None:
-            change = abs(aggregate - self.last_true_aggregate)
+        if self.last_released is not None:
             threshold = self.config.ba_threshold * self.config.payload_bound
-            if change < threshold:
-                # Distribute eps/w equally across fwd[tau+1..tau+w-1].
+            if noisy_dis < threshold:
+                # Forward the base share across the w-1 future slots.
                 if w > 1 and len(self.bd_forward) >= w - 1:
-                    per_slot = (self.config.epsilon / w) / (w - 1)
+                    per_slot = (self.config.epsilon / (2 * w)) / (w - 1)
                     for i in range(w - 1):
                         self.bd_forward[i] += per_slot
-                return 0.0, True
+                return eps_dissim, 0.0, True
 
-        share = self.config.epsilon / w + pending_now
-        # The sliding-window budget check downstream in release() still caps
-        # at remaining budget, so this cannot violate (Eq. 4).
-        share = min(share, self.config.epsilon)
-        return max(share, 0.0), False
+        pub_share = self.config.epsilon / (2 * w) + pending_now
+        pub_share = max(pub_share, 0.0)
+        pub_share = min(pub_share, self.config.epsilon / 2)
+        return eps_dissim, pub_share, False
 
-    def _alloc_budget_absorption(self, aggregate: float) -> tuple[float, bool]:
+    def _alloc_budget_absorption(
+        self, aggregate: float, n_tau: int
+    ) -> tuple[float, float, bool]:
+        """BA with private dissimilarity and nullification (Kellaris et al.
+        Algorithm 5 / Figure 4).
+
+        State:
+          ba_skipped_since_last_pub: count of skipped publications whose
+            base share eps/(2w) is waiting to be absorbed at the next release.
+          ba_nullify_remaining: the next k taus' M_{i,2} must force null
+            because the last release absorbed k prior skips (Figure 4 line 6).
+
+        Per-tau layout:
+          M_{i,1}: eps/(2w) always.
+          M_{i,2}: nullified -> 0
+                   skipped   -> 0 (and ba_skipped += 1)
+                   released  -> eps/(2w) * min(1 + ba_skipped, w)
+                                and ba_nullify_remaining = (that factor) - 1.
+
+        Window invariant: dissim = eps/2; pub across any w consecutive taus
+        is at most eps/2 because each skipped base share is absorbed by at
+        most one later release and followed by exactly that many nullified
+        slots, so the pub mass in the window never exceeds w * eps/(2w).
         """
-        BA (Kellaris et al.): If the aggregate has not changed much, skip and
-        ABSORB the would-be share into a running pot that is added to the next
-        release with a large change.
-        """
-        if self.last_true_aggregate is not None:
-            change = abs(aggregate - self.last_true_aggregate)
+        w = self.config.window_size
+        base = self.config.epsilon / (2 * w)
+        noisy_dis, eps_dissim = self._private_dissimilarity(aggregate, n_tau)
+
+        # Nullification: skip by fiat, regardless of dissimilarity.
+        if self.ba_nullify_remaining > 0:
+            self.ba_nullify_remaining -= 1
+            return eps_dissim, 0.0, True
+
+        if self.last_released is not None:
             threshold = self.config.ba_threshold * self.config.payload_bound
-            if change < threshold:
-                self.absorbed_budget += self.config.epsilon / self.config.window_size
-                # Cap absorbed budget at epsilon - any more cannot actually be
-                # spent under the sliding-window constraint.
-                self.absorbed_budget = min(self.absorbed_budget, self.config.epsilon)
-                return 0.0, True
+            if noisy_dis < threshold:
+                # Data is close to the last release; skip and save the share
+                # for a future absorbing release.  Cap at w-1 so a single
+                # release cannot absorb more than w-1 prior skips (Figure 4).
+                if self.ba_skipped_since_last_pub < w - 1:
+                    self.ba_skipped_since_last_pub += 1
+                return eps_dissim, 0.0, True
 
-        budget = self.config.epsilon / self.config.window_size + self.absorbed_budget
+        # Release: absorb prior skipped shares and nullify the same count
+        # of following taus so the window constraint holds by construction.
+        to_absorb = min(1 + self.ba_skipped_since_last_pub, w)
+        pub_share = base * to_absorb
+        self.ba_nullify_remaining = to_absorb - 1
+        self.ba_skipped_since_last_pub = 0
+        # Kept for backwards compatibility; ignored by the new path.
         self.absorbed_budget = 0.0
-        return budget, False
+        return eps_dissim, pub_share, False
 
-    def _alloc_n_weighted(self, n_tau: int) -> tuple[float, bool]:
+    def _alloc_n_weighted(self, n_tau: int) -> tuple[float, float, bool]:
         """n-weighted P-allocation (paper Section 5.4).
 
           eps_tau = eps * n_tau / sum_{j=tau-w+1}^{tau} n_j.
@@ -229,12 +312,14 @@ class StreamState:
             return self._alloc_uniform()
         total_n = sum(self.n_window) + n_tau
         if total_n <= 0:
-            return 0.0, True
-        return self.config.epsilon * n_tau / total_n, False
+            return 0.0, 0.0, True
+        return 0.0, self.config.epsilon * n_tau / total_n, False
 
     # ---- dispatcher -----------------------------------------------------
 
-    def _allocate(self, aggregate: float, n_tau: int) -> tuple[float, bool]:
+    def _allocate(
+        self, aggregate: float, n_tau: int
+    ) -> tuple[float, float, bool]:
         strat = self.config.strategy
 
         if strat == BudgetStrategy.UNIFORM:
@@ -242,9 +327,9 @@ class StreamState:
         if strat == BudgetStrategy.SAMPLE:
             return self._alloc_sample()
         if strat == BudgetStrategy.BUDGET_DISTRIBUTION:
-            return self._alloc_budget_distribution(aggregate)
+            return self._alloc_budget_distribution(aggregate, n_tau)
         if strat == BudgetStrategy.BUDGET_ABSORPTION:
-            return self._alloc_budget_absorption(aggregate)
+            return self._alloc_budget_absorption(aggregate, n_tau)
 
         if strat == BudgetStrategy.N_WEIGHTED:
             # N_WEIGHTED is implicitly P-gated (uses population counts).
@@ -291,35 +376,47 @@ class StreamState:
             self._record(aggregate, self.last_released, 0.0, n_tau, deferred=True)
             return self.last_released
 
-        epsilon_tau, skip = self._allocate(aggregate, n_tau)
+        dissim_eps, pub_eps, skip = self._allocate(aggregate, n_tau)
 
-        # Enforce window budget constraint (cap at remaining budget).
+        # Enforce the sliding-window budget constraint on the combined cost
+        # of M_{i,1} and M_{i,2}.  The in-strategy accounting for BD/BA is
+        # already window-safe by construction; this cap is a defensive floor
+        # for Uniform/Sample/n-weighted and for strategy transitions.
         remaining = self._budget_remaining()
-        epsilon_tau = min(epsilon_tau, remaining)
+        total_eps = dissim_eps + pub_eps
+        if total_eps > remaining:
+            # Publication is cheaper to sacrifice than the already-drawn
+            # dissimilarity noise (which we cannot "un-spend").
+            pub_eps = max(0.0, remaining - dissim_eps)
+            total_eps = dissim_eps + pub_eps
 
-        # Floor on epsilon_tau: releasing with a near-zero share would give a
+        # Floor on pub_eps: releasing with a near-zero share would give a
         # Laplace scale that explodes numerically.  Treat anything below
         # 1e-6 * (eps / w) as a skip (equivalent to the window being full).
-        min_eps_tau = 1e-6 * (self.config.epsilon / self.config.window_size)
-        if skip or epsilon_tau <= min_eps_tau:
-            self._record(aggregate, self.last_released, 0.0, n_tau, deferred=True)
+        min_pub_eps = 1e-6 * (self.config.epsilon / self.config.window_size)
+        if skip or pub_eps <= min_pub_eps:
+            # No publication at this tau; record dissim cost (may be 0 for
+            # strategies without M_{i,1}) and repeat the last release.
+            self._record(aggregate, self.last_released, total_eps, n_tau, deferred=True)
             return self.last_released
 
-        lam = self.config.noise_scale(epsilon_tau, n_tau)
+        lam = self.config.noise_scale(pub_eps, n_tau)
         noise = np.random.laplace(loc=0.0, scale=lam)
         released = aggregate + noise
 
         self.last_released = released
         self.last_true_aggregate = aggregate
-        self._record(aggregate, released, epsilon_tau, n_tau, deferred=False)
+        self._record(aggregate, released, total_eps, n_tau, deferred=False)
         return released
 
     def _record(self, aggregate, released, eps_tau, n_tau, deferred):
         self.last_was_deferred = bool(deferred)
         self.budget_window.append(eps_tau)
-        # Only eligible (budget-spending) timestamps enter n_window, matching
-        # the paper's causal definition for n-weighted allocation.
-        if eps_tau > 0:
+        # Publications (not deferrals) define eligibility for n_window and
+        # the release/deferral counters.  The dissim budget that BD/BA spend
+        # on a skipped tau counts toward the sliding-window budget but not
+        # toward the publication rate.
+        if not deferred:
             self.n_window.append(n_tau)
             self.releases += 1
         else:

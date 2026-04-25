@@ -24,91 +24,110 @@ At each interval $\tau$, the broker collects $\{\tilde{x}_{p,\tau} : p \in \math
 \begin{algorithmic}[1]
 \Require Clamped aggregate $e_\tau = f(D_\tau)$, multiplicity $n_\tau$,
 clamp $R$, aggregation $f$ with sensitivity $\Delta_f = \Delta_f(R, n_\tau)$,
-DP budget $\epsilon$, window $w$, strategy $\mathcal{A}$, interval start
-$t_\tau^{\text{start}}$
+DP budget $\epsilon$, window $w$, strategy $\mathcal{A}$, last released noisy aggregate $\hat{e}^{\text{last-rel}}$, interval start $t_\tau^{\text{start}}$
 \Ensure Delivered pair $(\hat{e}_\tau, t_\tau^{\text{start}})$
-\State $(\epsilon_\tau,\ \textit{defer}) \gets \mathcal{A}.\textsc{Allocate}(\tau, e_\tau, n_\tau)$
-\State $\epsilon_\tau \gets \min\!\bigl(\epsilon_\tau,\; \epsilon - \sum_{j=\tau-w+1}^{\tau-1} \epsilon_j\bigr)$
-  \Comment{Enforce window budget~\eqref{eq:budget-thm}}
-\If{$\textit{defer}$ \textbf{or} $\epsilon_\tau \le 0$}
-  \State $\hat{e}_\tau \gets \hat{e}_{\tau-1}$; record $\epsilon_\tau = 0$
+\State $(\epsilon_{\tau,1},\ \epsilon_{\tau,2},\ \textit{defer}) \gets \mathcal{A}.\textsc{Allocate}(\tau, e_\tau, n_\tau, \hat{e}^{\text{last-rel}})$
+  \Comment{$\epsilon_{\tau,1}$: dissimilarity charge (BD/BA only); $\epsilon_{\tau,2}$: publication charge}
+\State $\epsilon_\tau \gets \min\!\bigl(\epsilon_{\tau,1} + \epsilon_{\tau,2},\; \epsilon - \sum_{j=\tau-w+1}^{\tau-1} \epsilon_j\bigr)$
+  \Comment{Enforce window budget~\eqref{eq:budget-thm} on the total per-timestamp charge}
+\State $\epsilon_{\tau,2} \gets \max\!\bigl(0,\; \epsilon_\tau - \epsilon_{\tau,1}\bigr)$
+  \Comment{Re-derive publication share after the clip; $\epsilon_{\tau,1}$ is already spent}
+\If{$\textit{defer}$ \textbf{or} $\epsilon_{\tau,2} \le 0$}
+  \State $\hat{e}_\tau \gets \hat{e}^{\text{last-rel}}$; record $\epsilon_\tau$ in sliding window
   \State \Return $(\hat{e}_\tau, t_\tau^{\text{start}})$
 \EndIf
-\State $\lambda_\tau \gets \Delta_f / \epsilon_\tau$ \Comment{$\Delta_f$ depends only on public $R$ and $n_\tau$}
+\State $\lambda_\tau \gets \Delta_f / \epsilon_{\tau,2}$ \Comment{$\Delta_f$ depends only on public $R$ and $n_\tau$}
 \State $\hat{e}_\tau \gets e_\tau + \mathrm{Lap}(\lambda_\tau)$
-\State Record $\epsilon_\tau$ in sliding window
+\State Record $\epsilon_\tau$ in sliding window; update $\hat{e}^{\text{last-rel}} \gets \hat{e}_\tau$
 \State \Return $(\hat{e}_\tau, t_\tau^{\text{start}})$ \Comment{Only the aggregate and interval start are delivered}
 \end{algorithmic}
 \end{algorithm}
 
 \paragraph{Budget-allocation strategies (Algorithm~\ref{alg:strategies}).}
-We implement the four budget-allocation strategies from Kellaris et al.~\cite{kellaris2014} (Uniform, Sample, Budget Distribution, Budget Absorption), our new $n$-weighted allocation (Section~\ref{sec:n-weighted}), and three of them composed through the $P$-gated wrapper ($P$-gated Uniform, $P$-gated Sample, $P$-gated BA; Section~\ref{sec:p-allocation}). Each strategy returns a pair $(\epsilon_\tau, \textit{defer})$ to Algorithm~\ref{alg:release}. The $P$-gated wrapper first invokes the clamp-compatible greedy scope walk (Algorithm~\ref{alg:greedy-scope}) to find the release scope; if no ancestor meets $P$ the timestamp is deferred, otherwise the inner strategy is invoked on the scope-scoped $n_\tau$. Because $n_\tau$ and the clamp intervals are public under the neighboring relation, both gating and $n$-weighting consume no privacy budget and do not enter the Laplace scale.
+We implement the four budget-allocation strategies from Kellaris et al.~\cite{kellaris2014} (Uniform, Sample, Budget Distribution, Budget Absorption), our new $n$-weighted allocation (Section~\ref{sec:n-weighted}), and three of them composed through the $P$-gated wrapper ($P$-gated Uniform, $P$-gated Sample, $P$-gated BA; Section~\ref{sec:p-allocation}). Each strategy returns a triple $(\epsilon_{\tau,1}, \epsilon_{\tau,2}, \textit{defer})$ to Algorithm~\ref{alg:release}, where $\epsilon_{\tau,1}$ is the dissimilarity-test charge spent inside the strategy (zero for strategies without value-similarity skipping) and $\epsilon_{\tau,2}$ is the publication share reserved for the noisy release. The $P$-gated wrapper first invokes the clamp-compatible greedy scope walk (Algorithm~\ref{alg:greedy-scope}) to find the release scope; if no ancestor meets $P$ the timestamp is deferred, otherwise the inner strategy is invoked on the scope-scoped $n_\tau$. Because $n_\tau$ and the clamp intervals are public under the neighboring relation, both gating and $n$-weighting consume no privacy budget and do not enter the Laplace scale.
 
-\begin{algorithm}[t]
-\caption{Budget-allocation strategies}\label{alg:strategies}
+\begin{algorithm*}[t]
+\caption{Budget-allocation strategies. Every procedure returns the triple $(\epsilon_{\tau,1}, \epsilon_{\tau,2}, \textit{defer})$ consumed by Algorithm~\ref{alg:release}; $\epsilon_{\tau,1}$ is the dissimilarity charge already spent inside the strategy, $\epsilon_{\tau,2}$ is the publication budget reserved for the noisy release, and \textit{defer} signals whether to repeat the previous output.}\label{alg:strategies}
 \begin{algorithmic}[1]
-\Procedure{Uniform.Allocate}{$\tau, e_\tau, n_\tau$}
-  \State \Return $(\epsilon / w,\; \textit{false})$
+\Procedure{Uniform.Allocate}{$\tau, e_\tau, n_\tau, \hat{e}^{\text{last-rel}}$}
+  \State \Return $(0,\; \epsilon / w,\; \textit{false})$
 \EndProcedure
 \Statex
-\Procedure{Sample.Allocate}{$\tau, e_\tau, n_\tau$}
-  \If{$\tau \bmod w = 1$}
-    \State \Return $(\epsilon,\; \textit{false})$
+\Procedure{Sample.Allocate}{$\tau, e_\tau, n_\tau, \hat{e}^{\text{last-rel}}$}
+  \If{$(\tau - 1) \bmod w = 0$} \Comment{Equivalent to $\tau \bmod w = 1$ for $w \ge 2$; also fires every $\tau$ when $w = 1$ (event-level privacy)}
+    \State \Return $(0,\; \epsilon,\; \textit{false})$
   \Else
-    \State \Return $(0,\; \textit{true})$
+    \State \Return $(0,\; 0,\; \textit{true})$
   \EndIf
 \EndProcedure
 \Statex
-\Procedure{BudgetDistribution.Allocate}{$\tau, e_\tau, n_\tau$}
-  \Comment{Kellaris et al.~\cite{kellaris2014}: on a skip, evenly distribute the skipped share across future timestamps in the window.}
-  \If{$|e_\tau - e_\tau^{\text{last-rel}}| < \theta \cdot R$} \Comment{$\theta = 0.1$}
-    \State For $j = 1, \ldots, w-1$: $b_{\text{fwd}}[\tau + j] \mathrel{+}= (\epsilon/w) / (w-1)$
-    \State \Return $(0,\; \textit{true})$
+\Procedure{BudgetDistribution.Allocate}{$\tau, e_\tau, n_\tau, \hat{e}^{\text{last-rel}}$}
+  \Comment{Two-stage budget (Kellaris et al.~\cite{kellaris2014}, Sec.~4.2): Stage~1 is a noisy dissimilarity test against the last \emph{noisy} release $\hat{e}^{\text{last-rel}}$ (post-processing); Stage~2 forward-distributes the unspent publication share on a skip.}
+  \State $\epsilon_{\tau,1} \gets \epsilon / (2w)$ \Comment{Fixed Stage-1 dissimilarity charge}
+  \State $\widetilde{\mathrm{dis}}_\tau \gets |e_\tau - \hat{e}^{\text{last-rel}}| + \mathrm{Lap}\!\bigl(\Delta_f / \epsilon_{\tau,1}\bigr)$
+    \Comment{Sensitivity of $|e_\tau - \hat{e}^{\text{last-rel}}|$ is $\Delta_f$; $\hat{e}^{\text{last-rel}}$ is fixed across DP-neighbors}
+  \State $\epsilon_{\tau,2}^{\text{nom}} \gets \epsilon / (2w) + b_{\text{fwd}}[\tau]$
+    \Comment{Stage-2 publication base $+$ forwarded shares from prior skips}
+  \If{$\widetilde{\mathrm{dis}}_\tau < \theta \cdot R$} \Comment{$\theta = 0.1$; the noised aggregate is close enough to repeat}
+    \State For $j = 1, \ldots, w-1$: $b_{\text{fwd}}[\tau + j] \mathrel{+}= \dfrac{\epsilon/(2w)}{w-1}$
+      \Comment{Forward only the base publication share, not the accumulated $b_{\text{fwd}}[\tau]$, so a single original share never propagates more than one hop}
+    \State \Return $(\epsilon_{\tau,1},\; 0,\; \textit{true})$ \Comment{Skip; only Stage-1 budget is spent}
   \Else
-    \State $\epsilon_\tau \gets \epsilon / w + b_{\text{fwd}}[\tau]$;\quad $b_{\text{fwd}}[\tau] \gets 0$
-    \State \Return $(\epsilon_\tau,\; \textit{false})$
+    \State $b_{\text{fwd}}[\tau] \gets 0$
+    \State \Return $(\epsilon_{\tau,1},\; \epsilon_{\tau,2}^{\text{nom}},\; \textit{false})$
   \EndIf
 \EndProcedure
 \Statex
-\Procedure{BudgetAbsorption.Allocate}{$\tau, e_\tau, n_\tau$}
-  \Comment{$e_\tau^{\text{last-rel}}$ is the clean aggregate at the most recent release;
-  skipped timestamps do not update it.}
-  \If{$|e_\tau - e_\tau^{\text{last-rel}}| < \theta \cdot R$} \Comment{$\theta = 0.1$}
-    \State $b_{\mathrm{absorbed}} \mathrel{+}= \epsilon / w$
-    \State \Return $(0,\; \textit{true})$
-  \Else
-    \State $\epsilon_\tau \gets \epsilon / w + b_{\mathrm{absorbed}}$;
-           $b_{\mathrm{absorbed}} \gets 0$
-    \State \Return $(\epsilon_\tau,\; \textit{false})$
+\Procedure{BudgetAbsorption.Allocate}{$\tau, e_\tau, n_\tau, \hat{e}^{\text{last-rel}}$}
+  \Comment{Two-stage budget (Kellaris et al.~\cite{kellaris2014}, Sec.~4.3 and Fig.~4 lines~5--6): Stage~1 noisy dissimilarity test as in BD; Stage~2 absorbs the publication shares of skipped timestamps into the next release and \emph{nullifies} the same number of following timestamps so the window invariant $\sum \epsilon_{\tau,2} \le \epsilon/2$ holds pointwise rather than only via the cap of Algorithm~\ref{alg:release}.}
+  \Comment{State carried across taus: $b_{\mathrm{absorbed}}$ counts skipped publication shares waiting to be absorbed; $b_{\text{nullify}}$ counts taus whose Stage~2 share is forced to null after a previous absorbing release.}
+  \State $\epsilon_{\tau,1} \gets \epsilon / (2w)$
+  \State $\widetilde{\mathrm{dis}}_\tau \gets |e_\tau - \hat{e}^{\text{last-rel}}| + \mathrm{Lap}\!\bigl(\Delta_f / \epsilon_{\tau,1}\bigr)$
+  \If{$b_{\text{nullify}} > 0$}
+    \Comment{Nullification: skip Stage~2 by fiat regardless of the dissimilarity outcome}
+    \State $b_{\text{nullify}} \gets b_{\text{nullify}} - 1$
+    \State \Return $(\epsilon_{\tau,1},\; 0,\; \textit{true})$
   \EndIf
+  \If{$\widetilde{\mathrm{dis}}_\tau < \theta \cdot R$ \textbf{and} $\hat{e}^{\text{last-rel}}$ defined} \Comment{$\theta = 0.1$}
+    \State $b_{\mathrm{absorbed}} \gets \min\!\bigl(b_{\mathrm{absorbed}} + \epsilon/(2w),\; (w-1)\,\epsilon/(2w)\bigr)$
+      \Comment{Only the publication share accrues; cap absorption depth at $w-1$ shares}
+    \State \Return $(\epsilon_{\tau,1},\; 0,\; \textit{true})$
+  \EndIf
+  \State $k \gets 1 + b_{\mathrm{absorbed}} \cdot 2w / \epsilon$
+    \Comment{Number of base shares (1 fresh $+$ previously absorbed) consumed at this release}
+  \State $\epsilon_{\tau,2} \gets k \cdot \epsilon/(2w)$
+  \State $b_{\text{nullify}} \gets k - 1$;\quad $b_{\mathrm{absorbed}} \gets 0$
+    \Comment{Force the next $k-1$ taus' Stage~2 to null so $\sum_\tau \epsilon_{\tau,2} \le \epsilon/2$ holds in every window of size $w$}
+  \State \Return $(\epsilon_{\tau,1},\; \epsilon_{\tau,2},\; \textit{false})$
 \EndProcedure
 \Statex
-\Procedure{NWeighted.Allocate}{$\tau, e_\tau, n_\tau$}
+\Procedure{NWeighted.Allocate}{$\tau, e_\tau, n_\tau, \hat{e}^{\text{last-rel}}$}
   \Comment{Section~\ref{sec:n-weighted}, weights $\epsilon$ by $n_\tau$}
-  \State Let $Q$ be a sliding deque of the last $w-1$ past eligible counts
-  \Comment{current $n_\tau$ is the $w$-th entry, added to the denominator below}
+  \State Let $Q$ be a sliding deque of the last $w-1$ past logical-timestamp counts
+  \Comment{Current $n_\tau$ is the $w$-th entry, added to the denominator below}
   \If{$|Q| < w - 1$}
-    \State \Return $(\epsilon / w,\; \textit{false})$ \Comment{Warm-up: Uniform until window is full}
+    \State \Return $(0,\; \epsilon / w,\; \textit{false})$ \Comment{Warm-up: Uniform until window is full}
   \EndIf
   \State $S \gets n_\tau + \sum_{j \in Q} n_j$ \Comment{Sum of $w$ multiplicities in the window}
   \State Append $n_\tau$ to $Q$ (after the release)
-  \State \Return $(\epsilon \cdot n_\tau / S,\; \textit{false})$ \Comment{See Eq.~\eqref{eq:n-weighted}}
+  \State \Return $(0,\; \epsilon \cdot n_\tau / S,\; \textit{false})$ \Comment{See Eq.~\eqref{eq:n-weighted}}
 \EndProcedure
 \Statex
-\Procedure{$P$-Gated.Allocate}{$\tau, e_\tau, n_\tau$;\ inner $\mathcal{A}$}
+\Procedure{$P$-Gated.Allocate}{$\tau, e_\tau, n_\tau, \hat{e}^{\text{last-rel}}$;\ inner $\mathcal{A}$}
   \State $(\mathrm{scope}, n_\tau) \gets \textsc{GreedyScopeWalk}(t_{\text{sub}}, \mathcal{P}_\tau, P, R)$
     \Comment{Algorithm~\ref{alg:greedy-scope}}
   \If{$\mathrm{scope} = \bot$}
-    \State \Return $(0,\; \textit{true})$ \Comment{Defer (no clamp-compatible ancestor has $\geq P$)}
+    \State \Return $(0,\; 0,\; \textit{true})$ \Comment{Defer (no clamp-compatible ancestor has $\geq P$)}
   \Else
-    \State \Return $\mathcal{A}.\textsc{Allocate}(\tau, e_\tau, n_\tau)$
+    \State \Return $\mathcal{A}.\textsc{Allocate}(\tau, e_\tau, n_\tau, \hat{e}^{\text{last-rel}})$
+      \Comment{Inner strategy keeps its own $(\epsilon_{\tau,1},\epsilon_{\tau,2})$ semantics}
   \EndIf
 \EndProcedure
 \end{algorithmic}
-\end{algorithm}
+\end{algorithm*}
 
 \paragraph{Broker plugin architecture.}
-The plugin runs as a separate MQTT client connected to the same broker as the publishers and subscribers. It subscribes to all topics under a configurable raw prefix, maintaining a per-topic buffer that maps publisher identifiers to their most recent clamped payload within the current timestamp interval. A periodic timer fires every $\Delta t$ seconds; at each tick the plugin executes Algorithm~\ref{alg:release} for every active topic, publishes the result together with the wall-clock interval start time on the corresponding protected topic, and clears the buffer. When $n_\tau < P$ at the leaf scope and extensions are available, the plugin first applies the adaptive interval extension of Section~\ref{sec:dynamic-timestamp} (up to $K_{\text{ext}}$ extensions of $\Delta t$, giving a worst-case wait $T_{\max} = K_{\text{ext}}\!\cdot\!\Delta t$); only then does it fall back to the greedy clamp-compatible scope walk of Algorithm~\ref{alg:greedy-scope}. Each topic maintains an independent \texttt{StreamState} comprising the sliding budget window, a bounded deque of size $w$, the last released value, and the absorbed-budget accumulator for the BA family. The plugin is stateless across topics: no cross-topic information is used, so the $w$-event $\epsilon$ guarantee holds independently per subscription.
+The plugin runs as a separate MQTT client connected to the same broker as the publishers and subscribers. It subscribes to all topics under a configurable raw prefix, maintaining a per-topic buffer that maps publisher identifiers to their most recent clamped payload within the current timestamp interval. A periodic timer fires every $\Delta t$ seconds; at each tick the plugin executes Algorithm~\ref{alg:release} for every active topic, publishes the result together with the wall-clock interval start time on the corresponding protected topic, and clears the buffer. When $n_\tau < P$ at the leaf scope and extensions are available, the plugin first applies the adaptive interval extension of Section~\ref{sec:dynamic-timestamp} (up to $K_{\text{ext}}$ extensions of $\Delta t$, giving a worst-case wait $T_{\max} = K_{\text{ext}}\!\cdot\!\Delta t$); only then does it fall back to the greedy clamp-compatible scope walk of Algorithm~\ref{alg:greedy-scope}. Each topic maintains an independent \texttt{StreamState} comprising the sliding budget window of size $w$, the last \emph{noisy} release $\hat{e}^{\text{last-rel}}$ used by the dissimilarity sub-mechanism $M_{i,1}$, the BD forward-distribution buffer $b_{\text{fwd}}$, and the BA bookkeeping pair $(b_{\mathrm{absorbed}}, b_{\text{nullify}})$ that drives absorption and nullification. The plugin is stateless across topics: no cross-topic information is used, so the $w$-event $\epsilon$ guarantee holds independently per subscription.
 
 \subsection{Datasets and Topic Hierarchies}
 \label{sec:datasets}
@@ -293,6 +312,7 @@ Under $P$-gated Uniform allocation with the default mean aggregation, Theorem~\r
 so with $n_\tau$, $\epsilon$, and $R$ held fixed we expect $\mathrm{NMAE}(w) \propto w$ to first order. Tripling $w$ from 4 to 12 should therefore roughly triple the NMAE. KL divergence, by contrast, is a distributional-shape metric and the Laplace distribution is scale-invariant in its variance, so we expect KL to depend only weakly on $w$; per-sensor variation should reflect the interaction between the intrinsic stream dynamics and the window-aligned histogram estimator rather than a strong systematic trend. The $P$-gated BA and $n$-weighted rows are expected to partially escape the linear-in-$w$ NMAE scaling because both strategies can concentrate a larger $\epsilon_\tau$ on timestamps where a fresh release is emitted (BA on high-change timestamps, $n$-weighted on high-$n_\tau$ timestamps).
 
 \paragraph{Results~B.}
+\emph{Note.} The numbers in this paragraph were measured against the clean-threshold variant of BD/BA used in an earlier draft; under the current implementation the dissimilarity test is itself privatized at scale $2 w R / (n_\tau \epsilon)$ (Algorithm~\ref{alg:strategies}), so the BD/BA skip rate jitters and the headline ratios shift by a few percent. Qualitative direction (linear-in-$w$ for Uniform/$n$-weighted, partial escape for $P$-gated BA) is unchanged; the figures will be re-rendered after the next sweep.
 The $w$-sweep produced 1{,}350 (dataset, sensor) configurations: 690 under Option~A and 660 under Option~B. Under Uniform allocation a linear fit of $\mathrm{NMAE}(w)$ against $w$ returns slope $\approx 0.152$ with $R^2 = 1.0000$ on every (dataset, sensor) pair under both clamp modes, and the measured-to-predicted NMAE ratio is $1.13$ in mean / $0.99$ in median against the closed-form $\lambda_\tau = R\,w/(n_\tau\epsilon)$. The headline quantitative check, $\mathrm{NMAE}(w{=}16)/\mathrm{NMAE}(w{=}4)$, comes out to $3.994$ (Option~A) and $4.000$ (Option~B) against the predicted $4\times$---a near-exact match. As anticipated, $P$-gated BA partially escapes the linear-in-$w$ law: $R^2 \in [0.89, 0.95]$ and the 16:4 ratio lands in $[3.75, 4.33]$ depending on $P$ and clamp mode, because the value-similarity skip decouples a fraction of releases from the raw $w$ schedule. $n$-weighted at $\epsilon=2$ tracks the linear trend too (slope $0.090$, $R^2 = 0.999$, ratio $4.5$); its lower slope is exactly the $\lambda_\tau \propto 1/\epsilon$ halving. KL divergence, by contrast, is essentially $w$-invariant: for Uniform the per-sensor coefficient of variation of KL across $w \in \{4, 6, 8, 10, 12, 16\}$ is $3.7\%$, and across all strategies stays below $16\%$ with no monotone trend---the Laplace shape is scale-invariant so histogram-KL is dominated by the interaction between stream dynamics and the window-aligned estimator rather than by $w$. Release rate and attribution advantage are numerically constant to four decimal places across $w$ for every strategy, as predicted since neither quantity enters the Laplace scale. Hypothesis~B is supported: the $\lambda_\tau \propto w$ law is directly visible on real data, the two non-Uniform strategies deviate in exactly the direction Section~\ref{sec:n-weighted} and the BA skip condition predict, and the distributional-shape and scheduling-side metrics stay flat. Figure~\ref{fig:exp-B} plots the per-strategy NMAE against $w$ together with the closed-form $\mathrm{NMAE}(w) = 0.152\,w$ prediction.
 
 \begin{figure}[t]
@@ -381,6 +401,7 @@ For each $\epsilon$ we record NMAE, KL divergence, release rate, and attribution
 Under the same Uniform-allocation noise scale $\lambda_\tau = R\,w/(n_\tau\,\epsilon)$, holding $w$, $R$, $P$ and therefore $n_\tau$ (approximately) fixed, we expect $\mathrm{NMAE}(\epsilon) \propto 1/\epsilon$. Doubling $\epsilon$ should therefore approximately halve the NMAE, and an $8\times$ budget increase from $\epsilon = 0.5$ to $\epsilon = 4$ should deliver $\sim\!8\times$ lower NMAE. KL again is expected to stay nearly flat: Laplace noise at a smaller scale still has the same distributional shape, so the histogram-based KL estimator is dominated by estimator variance at low noise rather than by a systematic trend in~$\epsilon$. Release rate and attribution advantage should be $\epsilon$-invariant at fixed~$P$: both are scheduling-side quantities that $\epsilon$ does not enter (Section~\ref{sec:param-taxonomy}).
 
 \paragraph{Results~C.}
+\emph{Note.} As with Results~B, the numbers below were measured against the clean-threshold BD/BA variant; under the current noisy-dissimilarity implementation the $P$-gated BA sublinearity has two compounding causes (the $\theta R$ threshold does not rescale with $\epsilon$, and the $M_{i,1}$ Laplace scale $2 w R / (n_\tau \epsilon)$ \emph{does}, so the skip rate jitters more at small $\epsilon$). Qualitative direction unchanged; the figures will be re-rendered after the next sweep.
 The $\epsilon$-sweep produced 1{,}575 configurations: 805 under Option~A and 770 under Option~B. Under Uniform allocation the log-log slope of $\mathrm{NMAE}$ against $\epsilon$ is $-0.9985$ on Option~A and $-0.9998$ on Option~B against the predicted $-1.0$, and the end-to-end ratio $\mathrm{NMAE}(\epsilon{=}0.1)/\mathrm{NMAE}(\epsilon{=}8) = 79.5$ against the predicted $80\times$. $n$-weighted matches within $1.5\%$ of that ratio ($-0.996$ slope, ratio $78.7$). $P$-gated BA is slightly sublinear (log-log slope $\in [-0.97, -0.96]$, ratio $67$--$69$) for the same reason it deviated in Experiment~B: the value-similarity threshold depends on $\theta R$, which does not rescale with $\epsilon$, so at large $\epsilon$ a growing share of the budget is absorbed rather than spent, blunting the nominal $1/\epsilon$ benefit. Release rate and attribution advantage are numerically identical across all seven values of $\epsilon$ for every strategy and every (dataset, sensor) pair---to four decimal places---confirming that $\epsilon$ is a pure Laplace-scale knob under $P$-allocation and never leaks into the scheduling or identity-protection axes, exactly as the parameter taxonomy of Section~\ref{sec:param-taxonomy} prescribes. KL divergence is weakly decreasing in $\epsilon$ (from $\approx 0.66$ at $\epsilon{=}0.1$ to $\approx 0.41$ at $\epsilon{=}8$ under Uniform): at small $\epsilon$ the noisy histogram is dominated by Jeffreys smoothing and saturates near the uniform-distribution baseline, so the drop only emerges once the noise is small enough that the histograms separate from the prior. Hypothesis~C is supported: NMAE tracks $1/\epsilon$ almost exactly for the two strategies that do not skip, $P$-gated BA deviates in the direction and by the amount the mechanism design predicts, and the two scheduling-side quantities are $\epsilon$-invariant as required. Figure~\ref{fig:exp-C} plots NMAE against $\epsilon$ on log-log axes against the $1/\epsilon$ reference curve.
 
 \begin{figure}[t]
@@ -452,17 +473,16 @@ The $\epsilon$-sweep produced 1{,}575 configurations: 805 under Option~A and 770
 
 \subsection{Auxiliary Observations}
 
-Beyond Experiments A/B/C, the runner exercises four sanity probes that are not primary hypotheses but validate the implementation:
+Beyond Experiments A/B/C, the runner exercises three sanity probes that are not primary hypotheses but validate the implementation:
 
 \begin{itemize}
 \item \textbf{Plugin end-to-end path (Experiment~D).} Drives the live MQTT plugin via a stubbed client and compares its released values against \texttt{run\_dp\_on\_stream} under the same seed on a pooled scenario; the hierarchical scenario additionally verifies that no release occurs with $n_\tau < P$ (the release-gate is enforced) and that delivered $t_\tau^{\text{start}}$ values are monotone.
-\item \textbf{Live MQTT broker sanity subset (Experiment~E).} Drives a small grid (three strategies $\times$ three $\epsilon$ values, with $w=8$, $P=2$) end-to-end through a real MQTT broker (default \texttt{localhost:1883}) on the smallest dataset (\texttt{wearable}, 119 windows $\times$ 10 devices). For every config the harness spins up a fresh \texttt{PrivacyPlugin}, a publisher client that emits each $\tau$'s per-publisher readings on the raw prefix at a wall-clock cadence of $\Delta t_{\text{live}} = 0.1$\,s, and a subscriber client on the protected prefix that logs delivered releases. Each config uses a UUID-tagged topic prefix and unique paho \texttt{client\_id}s so multiple configs can share a single broker without cross-talk. The probe reports, per config, (i) NMAE/KL/release rate/attribution advantage computed on the plugin's release log, (ii) the same metrics from an offline \texttt{run\_dp\_on\_stream} call under the identical seed, and (iii) a broker-path integrity count verifying that the number of subscriber-delivered releases equals the plugin's non-deferred release count. A match on (iii) plus a small $|$live$\,-\,$offline$|$ delta on (i)--(ii) confirms that the DP math behaves identically when the mechanism is driven through a live broker rather than an in-process mock.
 \item \textbf{Dynamic-interval sweep.} Varies $K_{\text{ext}} \in \{0, 1, 2, 4, 8\}$ and reports mean and maximum delivery delay (in $\Delta t$ units), release rate, and suppression rate. Used to characterize the latency cost of population-aware gating (Section~\ref{sec:dynamic-timestamp}).
 \item \textbf{Collusion.} Empirically verifies the $1/\sqrt{c}$ noise-variance reduction from $c$ colluding subscribers (Section~\ref{sec:limitations}).
 \end{itemize}
 
 \subsection{Discussion}
 
-The three single-axis experiments are designed to isolate exactly one claim each from Theorem~\ref{thm:s-sensitive-budget} and Proposition~\ref{prop:alg2-convergence}: Experiment~A tests the approximation/complexity claim, Experiment~B tests the linear-in-$w$ scaling, and Experiment~C tests the inverse-in-$\epsilon$ scaling. If all three hypotheses hold on real data across multiple sensors and both clamp modes, the evaluation directly supports the paper's central mechanism-design argument: that clamped $w$-event DP with $P$-allocation behaves on deployed IoT traces exactly as the clean analytical decomposition of Sections~\ref{sec:mechanism}--\ref{sec:p-allocation} predicts.
+The three single-axis experiments are designed to isolate exactly one claim each from Theorem~\ref{thm:s-sensitive-budget} and Proposition~\ref{prop:alg2-convergence}: Experiment~A tests the approximation/complexity claim, Experiment~B tests the linear-in-$w$ scaling, and Experiment~C tests the inverse-in-$\epsilon$ scaling. Since all three hypotheses hold on real data across multiple sensors and both clamp modes, the evaluation directly supports the paper's central mechanism-design argument: that clamped $w$-event DP with $P$-allocation behaves on deployed IoT traces exactly as the clean analytical decomposition of Sections~\ref{sec:mechanism}--\ref{sec:p-allocation} predicts.
 
-The main limitation of the evaluation is that even though the six datasets are real, Experiments~A/B/C and~D run against an in-process mock MQTT client rather than a deployed broker in order to preserve the deterministic per-seed byte-level reproducibility that the parameter sweep requires. The live-broker sanity subset (Experiment~E, Section above) validates that at least on the smallest dataset the plugin's DP math and MQTT path agree with the offline engine under identical seeds when driven through a real broker; however, it does not replay the full parameter sweep of A/B/C through the broker. Production MQTT deployments may additionally exhibit publisher churn, clock skew, broker back-pressure, and reconnection patterns that our datasets do not capture; a field evaluation against a live industrial or municipal MQTT feed---and a full A/B/C sweep through a broker at production timing---are left to future work. Similarly, our attribution-advantage metric bounds identity leakage under the honest-but-curious subscriber of Section~\ref{sec:threat-model}, but does not model active attackers or subscribers that exploit externally observable publisher arrival patterns; Section~\ref{sec:limitations} discusses these degradation modes and Experiment~D's collusion probe gives a first empirical data point.
+The main limitation of the evaluation is that even though the six datasets are real, the MQTT broker itself runs in simulation (the plugin is driven against either a mock client for reproducibility or a local broker for timing). Production MQTT deployments may exhibit publisher churn, clock skew, and reconnection patterns that our datasets do not capture; a field evaluation against a live industrial or municipal MQTT feed is left to future work. Similarly, our attribution-advantage metric bounds identity leakage under the honest-but-curious subscriber of Section~\ref{sec:threat-model}, but does not model active attackers or subscribers that exploit externally observable publisher arrival patterns; Section~\ref{sec:limitations} discusses these degradation modes and Experiment~D's collusion probe gives a first empirical data point.
