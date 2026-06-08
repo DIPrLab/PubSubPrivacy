@@ -14,13 +14,20 @@ broker:
 privacy:
   epsilon: 1.0              # sliding-window privacy budget
   window_size: 10           # w = number of timestamps in the sliding window
+  # eps_count: budget spent to release a differentially private publisher count
+  # |P_tau| (sensitivity 1) when gating / walking the hierarchy (Sec. 6.3 step 1,
+  # Table 3). Composes additively with epsilon. 0 = exact count.
+  epsilon_count: 0.0
 
 # Scheduling hyperparameters (Section 3.1): shape utility / latency only;
 # do NOT enter the DP calculation and can be tuned against a held-out trace.
 scheduling:
-  # Publisher threshold P for the P-allocation release gate (Section 5.3).
-  # Bounds attribution advantage at 1/P; does NOT appear in noise scale.
+  # Publisher threshold P_min for the P-allocation release gate (Section 5.3).
+  # Bounds attribution advantage at 1/P_min; does NOT appear in noise scale.
   min_publishers: 3
+  # P_max: caps the multiplicity folded into the mean so Delta_f = R/n changes
+  # by a bounded amount across stream elements (Sec. 6.5). null = no cap.
+  max_publishers: null
   # Budget-allocation strategy. Choices:
   #   uniform, sample, budget_distribution, budget_absorption,
   #   p_gated_uniform, p_gated_sample, p_gated_bd, p_gated_ba, n_weighted

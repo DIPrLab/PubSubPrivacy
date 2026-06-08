@@ -113,8 +113,16 @@ def run_dp_on_stream(
     payload_bound: float,
     strategy: str,
     seed: int = 0,
+    epsilon_count: float = 0.0,
+    max_publishers: int | None = None,
 ) -> dict:
-    """Run the DP engine on a pre-aggregated stream (offline evaluation)."""
+    """Run the DP engine on a pre-aggregated stream (offline evaluation).
+
+    ``epsilon_count`` > 0 makes the P-allocation release gate compare a
+    differentially private count |P_tau| (Laplace scale 1/eps_count, paper Sec.
+    6.3 step 1) against P_min instead of the exact count; ``max_publishers``
+    caps the multiplicity that enters the mean sensitivity (P_max, Sec. 6.5).
+    """
     np.random.seed(seed)
     config = PrivacyConfig(
         epsilon=float(epsilon),
@@ -122,6 +130,8 @@ def run_dp_on_stream(
         min_publishers=int(min_publishers),
         payload_bound=float(payload_bound),
         strategy=BudgetStrategy(strategy),
+        epsilon_count=float(epsilon_count),
+        max_publishers=int(max_publishers) if max_publishers else None,
     )
     stream = StreamState(config=config)
     for agg, n in zip(aggregates, pub_counts):
@@ -151,8 +161,12 @@ def run_dp_on_stream(
     )
     metrics["deferrals"] = stream.deferrals
     metrics["attribution_advantage"] = attribution_advantage(
-        stream.pub_counts, [b == 0 for b in stream.budgets_spent]
+        stream.pub_counts, stream.deferred_flags
     )
+    # Composed DP cost: the w-event budget epsilon plus the eps_count paid on
+    # every DP publisher-count release (paper Table 3 / Sec. 6.3 step 1).
+    metrics["eps_count_spent"] = stream.eps_count_spent
+    metrics["dp_count_releases"] = stream.dp_counts
 
     return {
         "metrics": metrics,
@@ -2806,6 +2820,12 @@ def _drive_plugin_scenario(
     delta_t: float,
     n_steps: int,
     seed: int,
+    strategy: str = "p_gated_uniform",
+    k_ext: int = 0,
+    enable_hierarchy_walk: bool = True,
+    epsilon_count: float = 0.0,
+    max_publishers: int | None = None,
+    force_P: int | None = None,
 ):
     """Feed a per-publisher trace into a PrivacyPlugin; return the plugin, the
     mock client, and the per-tau true-aggregate log for post-hoc comparison.
@@ -2829,6 +2849,9 @@ def _drive_plugin_scenario(
             return topic_of(pub_id, sensor)
         plugin_P = max(2, P)  # force walk-up (each leaf has n=1)
 
+    if force_P is not None:
+        plugin_P = int(force_P)
+
     # p_gated_uniform so the plugin's gate + Algorithm 1 walk logic actually
     # fires in the hierarchy scenario.  For pooled (plugin_P=1) the gate is a
     # no-op and the allocation dispatches to plain Uniform, so offline
@@ -2839,9 +2862,12 @@ def _drive_plugin_scenario(
         epsilon=epsilon,
         window_size=w,
         min_publishers=plugin_P,
-        strategy="p_gated_uniform",
+        strategy=strategy,
         timestamp_interval=delta_t,
-        k_ext=0,
+        k_ext=k_ext,
+        epsilon_count=epsilon_count,
+        max_publishers=max_publishers,
+        enable_hierarchy_walk=enable_hierarchy_walk,
         sensor_bounds={sensor: (lo, hi)},
     )
     mock = _MockMQTTClient()
@@ -3081,6 +3107,723 @@ def experiment_D_plugin_path(
         plt.close()
 
     return df_rel, df_sum
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  Experiment F (paper Sec. 7.8): incremental-module ablation
+# ═════════════════════════════════════════════════════════════════════════
+#
+# The ablation adds mechanism modules one at a time and measures the utility
+# impact of each, per the user-specified design:
+#
+#   M1  P-gated allocation only        gate on n_tau >= P_min, defer otherwise
+#   M2  + subscription rewriting       + adaptive interval extension (Sec. 6.7):
+#                                        hold an under-P scope open up to
+#                                        K_ext * Delta_t to pool more publishers
+#   M3  + walking up the tree          + Algorithm 1 hierarchy walk (Sec. 6.5):
+#                                        rewrite scope to the nearest ancestor
+#                                        whose range-compatible pool meets P
+#
+# It runs FULLY OFFLINE (no MQTT broker, no plugin object): each module is
+# modelled directly as a transform of the per-publisher trace into the
+# (aggregate, count) stream the subscriber's w-event stream would observe,
+# then scored with ``run_dp_on_stream``.  Two subscription scopes are reported
+# because the two rewriting modules dominate in different sparsity regimes:
+#
+#   * scope="leaf"   : the subscriber binds to ONE publisher's leaf.  n_tau in
+#                      {0,1}, so M1/M2 starve (interval extension cannot add
+#                      publishers to a single-pub leaf); only M3's walk-up,
+#                      which pools range-compatible siblings, restores utility.
+#                      Isolates the WALK-UP module (spatial sparsity).
+#   * scope="pooled" : the subscriber binds to the whole-sensor scope and the
+#                      gate is active (P_min > 1).  Temporal gaps make some
+#                      Delta_t buckets fall below P; M2's interval extension
+#                      merges consecutive buckets to recover them, while M3's
+#                      walk-up adds nothing (the pooled scope is already the
+#                      ancestor).  Isolates the INTERVAL-EXTENSION module
+#                      (temporal sparsity).
+#
+# Together the two scopes give the complete incremental picture the paper's
+# Sec. 6.6 utility analysis predicts (utility is dominated by the topic
+# hierarchy and by range-compatible publisher availability).
+
+def _adaptive_interval_rebuild(
+    per_pub: dict[str, list[float | None]],
+    P: int,
+    k_ext: int,
+    subset: list[str] | None = None,
+    base_dt: int = 1,
+) -> tuple[list[float], list[int]]:
+    """Re-bucket a per-publisher trace with adaptive interval extension
+    (paper Sec. 6.7).  A logical timestamp accumulates messages over one base
+    Delta_t (``base_dt`` raw slots); if fewer than P distinct publishers
+    contributed it merges the next Delta_t block (up to k_ext extensions)
+    before emitting (aggregate, count).
+
+    ``base_dt`` sets the base wall-clock interval in raw-slot units (the Delta_t
+    hyperparameter); k_ext == 0 reduces to the fixed-Delta_t stream.  ``subset``
+    restricts the pooled publisher set (used for the leaf/group scopes); None
+    pools all.
+    """
+    pubs = subset if subset is not None else list(per_pub.keys())
+    if not pubs:
+        return [], []
+    base_dt = max(1, int(base_dt))
+    T = len(per_pub[pubs[0]])
+    agg, cnt = [], []
+    tau = 0
+    while tau < T:
+        vals: list[float] = []
+        active: set[str] = set()
+        end = tau
+        ext = 0
+        while True:
+            block_end = min(end + base_dt, T)
+            for slot in range(end, block_end):
+                for p in pubs:
+                    v = per_pub[p][slot]
+                    if v is not None:
+                        vals.append(v)
+                        active.add(p)
+            end = block_end
+            if len(active) >= P or ext >= k_ext or end >= T:
+                break
+            ext += 1
+        agg.append(float(np.mean(vals)) if vals else 0.0)
+        cnt.append(len(active))
+        tau = end
+    return agg, cnt
+
+
+# Worker context for the parallel grid search: precomputed (agg, cnt) streams
+# keyed by (base_dt, k_ext, p_min), plus the fixed scoring params.
+_WORKER_GRID_CTX: tuple | None = None
+
+
+def _init_grid_worker(streams_by_key, payload_bound, epsilon, w, epsilon_count, seed):
+    global _WORKER_GRID_CTX
+    _WORKER_GRID_CTX = (streams_by_key, payload_bound, epsilon, w, epsilon_count, seed)
+
+
+def _grid_eval_task(task):
+    """Score one (strategy, base_dt, k_ext, p_min, p_max) grid cell."""
+    strat, base_dt, k_ext, p_min, p_max = task
+    streams_by_key, B, eps, w, eps_count, seed = _WORKER_GRID_CTX
+    agg, cnt = streams_by_key[(base_dt, k_ext, p_min)]
+    res = run_dp_on_stream(
+        agg, cnt, epsilon=eps, window_size=w, min_publishers=p_min,
+        payload_bound=B, strategy=strat, seed=seed,
+        epsilon_count=eps_count, max_publishers=p_max,
+    )
+    m = res["metrics"]
+    return {
+        "strategy": strat, "epsilon": eps, "w": w,
+        "P_min": p_min, "P_max": p_max, "delta_t": base_dt, "k_ext": k_ext,
+        "epsilon_count": eps_count,
+        "mae": m.get("mae"), "normalized_mae": m.get("normalized_mae"),
+        "kl_divergence": m.get("kl_divergence"),
+        "release_rate": m.get("release_rate"),
+        "avg_n_tau": float(np.mean(cnt)) if cnt else float("nan"),
+        "n_logical_timestamps": len(agg),
+    }
+
+
+def grid_search_hyperparameters(
+    per_pub: dict[str, list[float | None]],
+    payload_bound: float,
+    dataset_name: str,
+    sensor_name: str,
+    output_dir: str,
+    *,
+    epsilon: float,
+    w: int,
+    strategies: list[str],
+    p_min_grid: list[int],
+    p_max_grid: list[int | None],
+    dt_grid: list[int],
+    k_ext_grid: list[int],
+    epsilon_count: float = 0.0,
+    seed: int = 77,
+    workers: int = 1,
+) -> pd.DataFrame:
+    """Paper Sec. 7.5 utility-hyperparameter grid search.
+
+    For a fixed (epsilon, dataset, sensor) it sweeps the full utility grid
+    (P_min x P_max x Delta_t x K_ext) per budget strategy A and scores each
+    configuration by MAE, then records the MAE-optimal configuration per
+    strategy.  The (agg, cnt) stream depends only on (base_dt, k_ext, p_min),
+    so it is rebuilt ONCE per such key (not per strategy/p_max) and the DP
+    scoring is fanned out over ``workers`` processes.  Returns the full grid as
+    a DataFrame and writes both the grid and the per-strategy optimum.
+    """
+    # 1) Precompute every distinct stream once (rebuild is the costly part).
+    streams_by_key: dict = {}
+    for base_dt in dt_grid:
+        for k_ext in k_ext_grid:
+            for p_min in p_min_grid:
+                agg, cnt = _adaptive_interval_rebuild(
+                    per_pub, p_min, k_ext, base_dt=base_dt)
+                if len(agg) >= w + 2:
+                    streams_by_key[(base_dt, k_ext, p_min)] = (agg, cnt)
+    # 2) Build the task list (skip infeasible P_max < P_min and missing streams).
+    tasks = [
+        (strat, base_dt, k_ext, p_min, p_max)
+        for strat in strategies
+        for (base_dt, k_ext, p_min) in streams_by_key
+        for p_max in p_max_grid
+        if not (p_max is not None and p_max < p_min)
+    ]
+    # 3) Score every cell (parallel when workers > 1).
+    if workers and workers > 1 and len(tasks) > 1:
+        scored = _run_parallel_tasks(
+            tasks, _grid_eval_task, workers=workers,
+            initializer=_init_grid_worker,
+            initargs=(streams_by_key, payload_bound, epsilon, w, epsilon_count, seed),
+            progress_label=f"  [{dataset_name}/{sensor_name}] grid",
+            progress_every=max(20, len(tasks) // 10),
+        )
+    else:
+        _init_grid_worker(streams_by_key, payload_bound, epsilon, w, epsilon_count, seed)
+        scored = [_grid_eval_task(t) for t in tasks]
+    rows = [{"dataset": dataset_name, "sensor": sensor_name, **r} for r in scored]
+    df = pd.DataFrame(rows)
+    os.makedirs(output_dir, exist_ok=True)
+    df.to_csv(
+        os.path.join(output_dir, f"{dataset_name}_{sensor_name}_gridsearch.csv"),
+        index=False,
+    )
+    # MAE-optimal configuration per strategy (the canonical config the paper
+    # carries into the downstream experiments).
+    best_rows = []
+    if not df.empty:
+        finite = df[df["mae"].notna() & np.isfinite(df["mae"])]
+        for strat in strategies:
+            sub = finite[finite["strategy"] == strat]
+            if sub.empty:
+                continue
+            best_rows.append(sub.loc[sub["mae"].idxmin()].to_dict())
+    best_df = pd.DataFrame(best_rows)
+    best_df.to_csv(
+        os.path.join(output_dir,
+                     f"{dataset_name}_{sensor_name}_gridsearch_best.csv"),
+        index=False,
+    )
+    logger.info(
+        f"  [{dataset_name}/{sensor_name}] grid search: {len(df)} configs, "
+        f"{len(best_df)} per-strategy optima -> {output_dir}")
+    return df
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  Canonical config: the grid search fixes the params for every later experiment
+# ═════════════════════════════════════════════════════════════════════════
+#
+# Paper Sec. 7.5: "We utilize these optimized values as the canonical fixed
+# values for the following experiments."  The grid search writes one
+# grid_canonical.json at the run's output root, keyed by
+# (dataset, clamp_mode, strategy, epsilon) -> {P_min, P_max, delta_t, k_ext}.
+# Downstream experiments resolve their (P_min, P_max, K_ext, ...) from it when a
+# --use-grid-config path is supplied, falling back to CLI defaults otherwise.
+
+def _grid_canonical_path(output_dir: str) -> str:
+    return os.path.join(output_dir, "grid_canonical.json")
+
+
+def _write_grid_canonical(output_dir: str, best_records: list[dict]) -> str:
+    """Persist the per-(dataset,clamp,strategy,epsilon) MAE-optimal configs."""
+    path = _grid_canonical_path(output_dir)
+    payload = []
+    for r in best_records:
+        payload.append({
+            "dataset": r.get("dataset"),
+            "clamp_mode": r.get("clamp_mode"),
+            "strategy": r.get("strategy"),
+            "epsilon": float(r.get("epsilon")),
+            "P_min": int(r.get("P_min")) if r.get("P_min") is not None else None,
+            "P_max": (int(r["P_max"]) if r.get("P_max") is not None
+                      and not (isinstance(r.get("P_max"), float) and np.isnan(r["P_max"]))
+                      else None),
+            "delta_t": int(r.get("delta_t", 1)),
+            "k_ext": int(r.get("k_ext", 0)),
+            "mae": float(r.get("mae")) if r.get("mae") is not None else None,
+        })
+    with open(path, "w") as fh:
+        json.dump(payload, fh, indent=2)
+    logger.info(f"  wrote canonical grid config ({len(payload)} entries) -> {path}")
+    return path
+
+
+def _load_grid_config(path: str | None) -> dict | None:
+    """Load grid_canonical.json into a lookup dict keyed by
+    (dataset, clamp_mode, strategy, round(epsilon, 4))."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path) as fh:
+            records = json.load(fh)
+    except Exception as exc:  # pragma: no cover
+        logger.warning(f"could not read grid config {path}: {exc}")
+        return None
+    cfg = {}
+    for r in records:
+        key = (r.get("dataset"), r.get("clamp_mode"), r.get("strategy"),
+               round(float(r.get("epsilon", 0.0)), 4))
+        cfg[key] = r
+    logger.info(f"loaded canonical grid config ({len(cfg)} entries) from {path}")
+    return cfg
+
+
+def _resolve_params(grid_config: dict | None, dataset: str, clamp_mode: str,
+                    strategy: str, epsilon: float, defaults: dict) -> dict:
+    """Return {P_min, P_max, k_ext, delta_t} from the canonical grid config for
+    this (dataset, clamp, strategy, epsilon), else the supplied defaults."""
+    out = dict(defaults)
+    if grid_config is None:
+        return out
+    rec = grid_config.get(
+        (dataset, clamp_mode, strategy, round(float(epsilon), 4)))
+    if rec is None:
+        # Strategy-agnostic fallback: any entry for this (dataset, clamp, eps).
+        for (d, c, _s, e), r in grid_config.items():
+            if d == dataset and c == clamp_mode and e == round(float(epsilon), 4):
+                rec = r
+                break
+    if rec is None:
+        return out
+    for k_cfg, k_out in (("P_min", "P_min"), ("P_max", "P_max"),
+                         ("k_ext", "k_ext"), ("delta_t", "delta_t")):
+        if rec.get(k_cfg) is not None:
+            out[k_out] = rec[k_cfg]
+    return out
+
+
+def _ablation_module_streams(
+    per_pub: dict[str, list[float | None]],
+    P: int,
+    k_ext: int,
+    scope: str,
+) -> dict[str, tuple[list[float], list[int]]]:
+    """Build the (aggregate, count) stream each cumulative module produces for
+    one subscription scope.  Returns {module_name -> (agg, cnt)}.
+    """
+    pubs = list(per_pub.keys())
+    if scope == "leaf":
+        # Subscriber binds to the single busiest publisher's leaf.
+        leaf_pub = max(pubs, key=lambda p: sum(v is not None for v in per_pub[p]))
+        leaf_subset = [leaf_pub]
+        # M1: gate only, native Delta_t, single-pub leaf (n in {0,1}).
+        m1 = _adaptive_interval_rebuild(per_pub, P, 0, subset=leaf_subset)
+        # M2: + interval extension on that leaf (still a single publisher).
+        m2 = _adaptive_interval_rebuild(per_pub, P, k_ext, subset=leaf_subset)
+        # M3: + walk-up pools the range-compatible siblings (whole sensor).
+        m3 = _adaptive_interval_rebuild(per_pub, P, k_ext, subset=pubs)
+        return {"M1_pgate": m1, "M2_interval_ext": m2, "M3_walk_up": m3}
+    # scope == "pooled": gate active on the whole-sensor scope.
+    m1 = _adaptive_interval_rebuild(per_pub, P, 0, subset=pubs)
+    m2 = _adaptive_interval_rebuild(per_pub, P, k_ext, subset=pubs)
+    # Walk-up has no ancestor above the pooled root, so M3 == M2 here.
+    m3 = m2
+    return {"M1_pgate": m1, "M2_interval_ext": m2, "M3_walk_up": m3}
+
+
+def ablation_experiment(
+    datasets,
+    clamp_mode,
+    output_dir,
+    args,
+    *,
+    epsilon: float = 1.0,
+    w: int = 8,
+    P: int = 3,
+    k_ext: int = 3,
+    epsilon_count: float = 0.0,
+    strategy: str = "p_gated_uniform",
+    seed: int = 77,
+    grid_config: dict | None = None,
+) -> pd.DataFrame:
+    """Paper Sec. 7.8 incremental-module ablation (fully offline).
+
+    For each dataset (first suitable sensor) and each subscription scope in
+    {leaf, pooled}, scores the three cumulative module sets M1/M2/M3 and writes
+    NMAE / KL / release-rate / avg n_tau so the utility delta of each added
+    module is read directly off the CSV.  When ``grid_config`` is supplied the
+    per-dataset (P_min, P_max, K_ext) come from the Sec. 7.5 grid optimum.
+    """
+    MODULES = ["M1_pgate", "M2_interval_ext", "M3_walk_up"]
+    rows = []
+    for ds_name in datasets:
+        prepared = prepare_dataset(
+            ds_name, clamp_mode=clamp_mode, eps_clip=args.eps_clip,
+            seed=args.seed, max_rows=_dataset_max_rows(ds_name, args),
+        )
+        if prepared is None or not prepared.per_pubs:
+            continue
+        sensor = next(
+            (s for s in prepared.spec["sensors"]
+             if s in prepared.per_pubs
+             and s in prepared.spec["static_clamps"]
+             and len(prepared.per_pubs[s][0]) >= 2),
+            None,
+        )
+        if sensor is None:
+            logger.warning(f"[exp F/ablation] no suitable sensor in {ds_name}; skip")
+            continue
+        prm = _resolve_params(grid_config, ds_name, clamp_mode, strategy, epsilon,
+                              {"P_min": P, "P_max": None, "k_ext": k_ext})
+        P_ds, P_max_ds, k_ext_ds = prm["P_min"], prm["P_max"], prm["k_ext"]
+        per_pub, B = prepared.per_pubs[sensor]
+        for scope in ("leaf", "pooled"):
+            streams = _ablation_module_streams(per_pub, P_ds, k_ext_ds, scope)
+            for m_idx, module in enumerate(MODULES, start=1):
+                agg, cnt = streams[module]
+                if len(agg) < w + 2:
+                    res_metrics = {"normalized_mae": float("nan"),
+                                   "kl_divergence": float("nan"),
+                                   "release_rate": float("nan"), "mae": float("nan")}
+                else:
+                    res = run_dp_on_stream(
+                        agg, cnt, epsilon=epsilon, window_size=w,
+                        min_publishers=P_ds, payload_bound=B, strategy=strategy,
+                        seed=seed, epsilon_count=epsilon_count,
+                        max_publishers=P_max_ds,
+                    )
+                    res_metrics = res["metrics"]
+                rows.append({
+                    "dataset": ds_name, "sensor": sensor, "clamp_mode": clamp_mode,
+                    "scope": scope, "module": module, "module_idx": m_idx,
+                    "epsilon": epsilon, "w": w, "P": P_ds, "P_max": P_max_ds,
+                    "k_ext": k_ext_ds,
+                    "epsilon_count": epsilon_count, "strategy": strategy,
+                    "payload_bound": B,
+                    "normalized_mae": res_metrics.get("normalized_mae"),
+                    "mae": res_metrics.get("mae"),
+                    "kl_divergence": res_metrics.get("kl_divergence"),
+                    "release_rate": res_metrics.get("release_rate"),
+                    "avg_n_tau": float(np.mean(cnt)) if cnt else float("nan"),
+                    "n_logical_timestamps": len(agg),
+                })
+            # Per-scope module deltas (utility gained by adding each module).
+            scope_rows = [r for r in rows if r["dataset"] == ds_name
+                          and r["scope"] == scope]
+            base_rr = scope_rows[0]["release_rate"]
+            for r in scope_rows:
+                rr = r["release_rate"]
+                r["release_rate_gain_vs_M1"] = (
+                    (rr - base_rr) if rr is not None and base_rr is not None
+                    and np.isfinite(rr) and np.isfinite(base_rr) else float("nan")
+                )
+    exp_dir = os.path.join(output_dir, "experiments", "F_ablation")
+    os.makedirs(exp_dir, exist_ok=True)
+    df = pd.DataFrame(rows)
+    df.to_csv(os.path.join(exp_dir, "experiment_F_ablation.csv"), index=False)
+    logger.info(f"  Experiment F (ablation) wrote {len(df)} rows -> {exp_dir}")
+
+    if not df.empty and getattr(args, "generate_plots", False):
+        _plot_single_axis_experiment(
+            df[df["scope"] == "leaf"], "module_idx", "module (cumulative)",
+            os.path.join(exp_dir, "experiment_F_ablation_leaf.png"),
+            f"Ablation (leaf scope) [clamp={clamp_mode}]",
+        )
+    return df
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  Local Differential Privacy (the P_min = 1 regime)
+# ═════════════════════════════════════════════════════════════════════════
+#
+# Paper Sec. 1 (Extreme 2) & Sec. 6.6: when P_min = 1 the mechanism dissolves
+# to LOCAL differential privacy.  Each publisher is its own stream element with
+# a single contributor (n_tau = 1), so the mean sensitivity is Delta_f = R and
+# the Laplace scale under Uniform allocation is lambda = R * w / eps -- noise of
+# magnitude proportional to the full payload range R, injected per publisher
+# BEFORE any pooling (input / local privacy) rather than on a pooled aggregate
+# (output privacy).  This is the canonical LDP baseline used by Figure 1's
+# rightmost (per-publisher) point and by the Sec. 7.9 overhead comparison.
+
+def run_ldp_on_per_pub(
+    per_pub: dict[str, list[float | None]],
+    payload_bound: float,
+    epsilon: float,
+    window_size: int,
+    seed: int = 0,
+) -> dict:
+    """Local DP baseline (P_min = 1): perturb each publisher's clamped payload
+    independently with Laplace(R * w / eps) (sensitivity R, Uniform w-event
+    share eps/w), then form the per-tau mean of the noisy inputs.
+
+    Returns the same metric dict shape as ``run_dp_on_stream`` so callers can
+    compare LDP to the pooled output-DP mechanism directly.  The per-publisher
+    perturbation is the defining feature of LOCAL DP: noise is added to inputs,
+    so the released mean's error does not shrink as 1/n the way the pooled
+    output-DP release does.
+    """
+    rng = np.random.default_rng(seed)
+    pubs = list(per_pub.keys())
+    if not pubs:
+        return {"metrics": {"mae": float("nan"), "normalized_mae": float("nan"),
+                            "kl_divergence": float("nan"), "release_rate": float("nan"),
+                            "attribution_advantage": 1.0}}
+    T = len(per_pub[pubs[0]])
+    scale = payload_bound * window_size / epsilon if epsilon > 0 else float("inf")
+    true_means, noisy_means = [], []
+    for tau in range(T):
+        true_vals, noisy_vals = [], []
+        for p in pubs:
+            v = per_pub[p][tau]
+            if v is None:
+                continue
+            true_vals.append(v)
+            # Local perturbation: each publisher noises its OWN value.
+            noisy_vals.append(v + float(rng.laplace(loc=0.0, scale=scale)))
+        if true_vals:
+            true_means.append(float(np.mean(true_vals)))
+            noisy_means.append(float(np.mean(noisy_vals)))
+    metrics = compute_utility_metrics(true_means, noisy_means)
+    metrics["normalized_mae"] = (
+        metrics["mae"] / payload_bound if payload_bound > 0 else float("nan")
+    )
+    metrics["kl_divergence"] = compute_kl_divergence(true_means, noisy_means)
+    metrics["release_rate"] = 1.0  # LDP releases every populated timestamp
+    # LDP exposes every contributor (n_tau = 1 stream elements): attribution
+    # advantage is 1 (the subscriber sees a single publisher's value per leaf).
+    metrics["attribution_advantage"] = 1.0
+    metrics["ldp_noise_scale"] = scale
+    return {"metrics": metrics, "true_values": true_means, "noisy_values": noisy_means}
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  Experiment G (paper Sec. 7.9): overhead / privacy-utility comparison
+# ═════════════════════════════════════════════════════════════════════════
+#
+# Compares our clamped w-event DP with P-allocation against the baselines the
+# paper contrasts it with (Sec. 7.9 + the two extremes of Sec. 1):
+#
+#   classic         no privacy: the broker releases the true aggregate.  Sets
+#                   the utility ceiling (NMAE = 0, KL = 0) and the throughput
+#                   reference (no Laplace draws, no eps_count).
+#   ldp             P_min = 1 LOCAL DP: per-publisher input perturbation,
+#                   lambda = R*w/eps (run_ldp_on_per_pub).  Strongest privacy,
+#                   worst utility (Extreme 2).
+#   per_type_wevent one stream per sensor TYPE (Extreme 1.1): output-DP on the
+#                   per-type mean, Delta_f = R/n_type, topic semantics collapsed.
+#   ours            clamped w-event DP with P-allocation at the topic scope
+#                   (p_gated / n_weighted), Delta_f = R/n_tau.
+#
+# Utility/privacy (NMAE, KL, release rate, attribution advantage) is fully
+# offline-measurable and reported here.  A compute-overhead proxy (mean
+# wall-clock per released element and the eps_count surcharge) is also
+# recorded; true broker throughput/latency under concurrency is measured by
+# the live-broker Experiment E, which this experiment cross-references.
+
+def overhead_experiment(
+    datasets,
+    clamp_mode,
+    output_dir,
+    args,
+    *,
+    epsilon: float = 1.0,
+    w: int = 8,
+    P: int = 3,
+    epsilon_count: float = 0.0,
+    our_strategy: str = "p_gated_uniform",
+    seed: int = 77,
+    grid_config: dict | None = None,
+) -> pd.DataFrame:
+    """Paper Sec. 7.9 overhead / privacy-utility comparison (offline).
+
+    When ``grid_config`` is supplied, the 'ours' approach uses the Sec. 7.5
+    grid-optimal (P_min, P_max) per dataset.
+    """
+    rows = []
+    for ds_name in datasets:
+        prepared = prepare_dataset(
+            ds_name, clamp_mode=clamp_mode, eps_clip=args.eps_clip,
+            seed=args.seed, max_rows=_dataset_max_rows(ds_name, args),
+        )
+        if prepared is None or not prepared.per_pubs:
+            continue
+        sensor = next(
+            (s for s in prepared.spec["sensors"]
+             if s in prepared.per_pubs and s in prepared.streams
+             and s in prepared.spec["static_clamps"]),
+            None,
+        )
+        if sensor is None:
+            continue
+        prm = _resolve_params(grid_config, ds_name, clamp_mode, our_strategy,
+                              epsilon, {"P_min": P, "P_max": None})
+        P_ds, P_max_ds = prm["P_min"], prm["P_max"]
+        per_pub, B = prepared.per_pubs[sensor]
+        agg, cnt, _B = prepared.streams[sensor]
+
+        def _emit(approach, metrics, compute_s, extra=None):
+            row = {
+                "dataset": ds_name, "sensor": sensor, "clamp_mode": clamp_mode,
+                "approach": approach, "epsilon": epsilon, "w": w, "P": P,
+                "payload_bound": B,
+                "normalized_mae": metrics.get("normalized_mae"),
+                "mae": metrics.get("mae"),
+                "kl_divergence": metrics.get("kl_divergence"),
+                "release_rate": metrics.get("release_rate"),
+                "attribution_advantage": metrics.get("attribution_advantage"),
+                "eps_count_spent": metrics.get("eps_count_spent", 0.0),
+                "compute_ms_per_element": 1000.0 * compute_s / max(1, len(agg)),
+            }
+            if extra:
+                row.update(extra)
+            rows.append(row)
+
+        # classic: no privacy (true aggregate released verbatim).
+        _emit("classic",
+              {"normalized_mae": 0.0, "mae": 0.0, "kl_divergence": 0.0,
+               "release_rate": 1.0, "attribution_advantage": float("nan")},
+              0.0)
+
+        # ldp: P_min = 1 local DP (per-publisher input perturbation).
+        t0 = time.perf_counter()
+        ldp = run_ldp_on_per_pub(per_pub, B, epsilon, w, seed=seed)
+        _emit("ldp", ldp["metrics"], time.perf_counter() - t0,
+              {"noise_scale": ldp["metrics"].get("ldp_noise_scale")})
+
+        # per_type_wevent: one stream per sensor type (Extreme 1.1) -- here the
+        # single sensor's pooled mean over ALL its publishers, output-DP with
+        # Uniform allocation, no P-gate (topic scope collapsed to the type).
+        t0 = time.perf_counter()
+        pt = run_dp_on_stream(agg, cnt, epsilon=epsilon, window_size=w,
+                              min_publishers=1, payload_bound=B,
+                              strategy="uniform", seed=seed)
+        _emit("per_type_wevent", pt["metrics"], time.perf_counter() - t0)
+
+        # ours: clamped w-event DP with P-allocation (P-gate + eps_count),
+        # at the Sec. 7.5 grid-optimal (P_min, P_max).
+        t0 = time.perf_counter()
+        ours = run_dp_on_stream(agg, cnt, epsilon=epsilon, window_size=w,
+                                min_publishers=P_ds, payload_bound=B,
+                                strategy=our_strategy, seed=seed,
+                                epsilon_count=epsilon_count,
+                                max_publishers=P_max_ds)
+        _emit("ours", ours["metrics"], time.perf_counter() - t0,
+              {"strategy": our_strategy, "P_min": P_ds, "P_max": P_max_ds})
+
+    exp_dir = os.path.join(output_dir, "experiments", "G_overhead")
+    os.makedirs(exp_dir, exist_ok=True)
+    df = pd.DataFrame(rows)
+    df.to_csv(os.path.join(exp_dir, "experiment_G_overhead.csv"), index=False)
+    logger.info(f"  Experiment G (overhead) wrote {len(df)} rows -> {exp_dir}")
+    return df
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  Experiment H (paper Sec. 7.11): average-case utility
+# ═════════════════════════════════════════════════════════════════════════
+#
+# Paper Sec. 6.6 / 7.11: average-case utility is governed by (i) the proportion
+# of publishers range-compatible with a subscription, |P_R| / |P| in [0, 1],
+# and (ii) the topic-hierarchy depth h (how many levels a subscription may have
+# to walk up).  As the range-compatible fraction -> 1 utility improves; deeper
+# trees cost more eps_count on the walk.  This experiment measures both
+# structural quantities per dataset and pairs them with the realized utility.
+
+def _topic_depth(spec: dict, per_pubs: dict) -> int:
+    """Number of levels in the dataset's topic tree (max '/'-segment count over
+    a sample of publisher topics)."""
+    topic_of = spec.get("publisher_topic")
+    if topic_of is None:
+        return 0
+    depths = []
+    for sensor, (pp, _B) in per_pubs.items():
+        for pub_id in list(pp.keys())[:5]:
+            try:
+                depths.append(len(topic_of(pub_id, sensor).split("/")))
+            except Exception:
+                continue
+        break
+    return max(depths) if depths else 0
+
+
+def _range_compatible_fraction(spec: dict, sensors: list[str], ref_sensor: str) -> float:
+    """Fraction of the dataset's sensor types whose static clamp is
+    range-compatible with the reference sensor (hull width <= R), a proxy for
+    |P_R| / |P| at the cross-type pooling scope (Definition 6.3)."""
+    clamps = spec.get("static_clamps", {})
+    if ref_sensor not in clamps:
+        return float("nan")
+    a_ref, b_ref = clamps[ref_sensor]
+    R = b_ref - a_ref
+    compatible, total = 0, 0
+    for s in sensors:
+        if s not in clamps:
+            continue
+        total += 1
+        a, b = clamps[s]
+        hull = max(b_ref, b) - min(a_ref, a)
+        if hull <= R + 1e-9:
+            compatible += 1
+    return compatible / total if total else float("nan")
+
+
+def average_case_utility_experiment(
+    datasets,
+    clamp_mode,
+    output_dir,
+    args,
+    *,
+    epsilon: float = 1.0,
+    w: int = 8,
+    P: int = 3,
+    epsilon_count: float = 0.5,
+    strategy: str = "p_gated_uniform",
+    seed: int = 77,
+    grid_config: dict | None = None,
+) -> pd.DataFrame:
+    """Paper Sec. 7.11 average-case utility: relate range-compatible fraction
+    and topic-hierarchy depth h to realized utility, per dataset.  Uses the
+    Sec. 7.5 grid-optimal (P_min, P_max) per dataset when ``grid_config`` is
+    supplied."""
+    rows = []
+    for ds_name in datasets:
+        prepared = prepare_dataset(
+            ds_name, clamp_mode=clamp_mode, eps_clip=args.eps_clip,
+            seed=args.seed, max_rows=_dataset_max_rows(ds_name, args),
+        )
+        if prepared is None or not prepared.per_pubs:
+            continue
+        sensors = [s for s in prepared.spec["sensors"] if s in prepared.streams]
+        if not sensors:
+            continue
+        ref_sensor = sensors[0]
+        depth_h = _topic_depth(prepared.spec, prepared.per_pubs)
+        frac = _range_compatible_fraction(prepared.spec, sensors, ref_sensor)
+        prm = _resolve_params(grid_config, ds_name, clamp_mode, strategy, epsilon,
+                              {"P_min": P, "P_max": None})
+        P_ds, P_max_ds = prm["P_min"], prm["P_max"]
+        agg, cnt, B = prepared.streams[ref_sensor]
+        res = run_dp_on_stream(
+            agg, cnt, epsilon=epsilon, window_size=w, min_publishers=P_ds,
+            payload_bound=B, strategy=strategy, seed=seed,
+            epsilon_count=epsilon_count, max_publishers=P_max_ds,
+        )
+        m = res["metrics"]
+        rows.append({
+            "dataset": ds_name, "ref_sensor": ref_sensor, "clamp_mode": clamp_mode,
+            "range_compatible_fraction": frac,
+            "topic_hierarchy_depth_h": depth_h,
+            "n_sensor_types": len(sensors),
+            "avg_n_tau": float(np.mean(cnt)) if cnt else float("nan"),
+            "normalized_mae": m.get("normalized_mae"),
+            "kl_divergence": m.get("kl_divergence"),
+            "release_rate": m.get("release_rate"),
+            "eps_count_spent": m.get("eps_count_spent", 0.0),
+            "dp_count_releases": m.get("dp_count_releases", 0),
+            "epsilon": epsilon, "w": w, "P": P_ds, "P_max": P_max_ds,
+            "epsilon_count": epsilon_count,
+        })
+    exp_dir = os.path.join(output_dir, "experiments", "H_average_case")
+    os.makedirs(exp_dir, exist_ok=True)
+    df = pd.DataFrame(rows)
+    df.to_csv(os.path.join(exp_dir, "experiment_H_average_case.csv"), index=False)
+    logger.info(f"  Experiment H (average-case utility) wrote {len(df)} rows -> {exp_dir}")
+    return df
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -4010,6 +4753,32 @@ def run_single_axis_experiments(
                 os.path.join(output_dir, "cross_dataset", clamp_mode),
                 args,
             )
+        grid_config = getattr(args, "grid_config", None)
+        if "F" in which:
+            ablation_experiment(
+                datasets, clamp_mode,
+                os.path.join(output_dir, "cross_dataset", clamp_mode),
+                args, epsilon=1.0, w=8, P=getattr(args, "ablation_P", 3),
+                k_ext=getattr(args, "k_ext", 3),
+                epsilon_count=getattr(args, "epsilon_count", 0.0),
+                grid_config=grid_config,
+            )
+        if "G" in which:
+            overhead_experiment(
+                datasets, clamp_mode,
+                os.path.join(output_dir, "cross_dataset", clamp_mode),
+                args, epsilon=1.0, w=8, P=getattr(args, "ablation_P", 3),
+                epsilon_count=getattr(args, "epsilon_count", 0.0),
+                grid_config=grid_config,
+            )
+        if "H" in which:
+            average_case_utility_experiment(
+                datasets, clamp_mode,
+                os.path.join(output_dir, "cross_dataset", clamp_mode),
+                args, epsilon=1.0, w=8, P=getattr(args, "ablation_P", 3),
+                epsilon_count=getattr(args, "epsilon_count", 0.5),
+                grid_config=grid_config,
+            )
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -4017,6 +4786,50 @@ def run_single_axis_experiments(
 # ═════════════════════════════════════════════════════════════════════════
 
 CLAMP_MODES = ["static", "dp_released"]
+
+
+def _run_grid_search_block(args, targets, clamp_modes, eps_values, strategies):
+    """Paper Sec. 7.5 grid search over (P_min x P_max x Delta_t x K_ext) scored
+    by MAE, per dataset/clamp/strategy/epsilon.  Writes per-(dataset,eps) grids
+    and the consolidated grid_canonical.json.  Returns the canonical config path.
+    """
+    p_min_grid = [1, 2, 3, 4, 6]
+    p_max_grid = [None, 4, 8, 16]
+    dt_grid = [1, 2, 4]
+    k_ext_grid = [0, 2, 4]
+    canonical_records: list[dict] = []
+    for clamp_mode in clamp_modes:
+        for name in targets:
+            first_sensor = DATASETS[name]["sensors"][0]
+            prepared = prepare_dataset(
+                name, clamp_mode=clamp_mode, eps_clip=args.eps_clip,
+                seed=args.seed, max_rows=_dataset_max_rows(name, args),
+                sensors=[first_sensor],
+            )
+            if prepared is None or first_sensor not in prepared.per_pubs:
+                continue
+            pp, B = prepared.per_pubs[first_sensor]
+            dirs = _dataset_dirs(args.output_dir, name, clamp_mode)
+            grid_dir = os.path.join(dirs["tuning"], "grid_search")
+            for eps in eps_values:
+                grid_search_hyperparameters(
+                    pp, B, name, f"{first_sensor}_eps{eps}", grid_dir,
+                    epsilon=eps, w=8, strategies=strategies,
+                    p_min_grid=p_min_grid, p_max_grid=p_max_grid,
+                    dt_grid=dt_grid, k_ext_grid=k_ext_grid,
+                    epsilon_count=args.epsilon_count,
+                    workers=args.workers,
+                )
+                best_csv = os.path.join(
+                    grid_dir, f"{name}_{first_sensor}_eps{eps}_gridsearch_best.csv")
+                if os.path.exists(best_csv):
+                    bdf = pd.read_csv(best_csv)
+                    for _i, r in bdf.iterrows():
+                        rec = r.to_dict()
+                        rec["dataset"] = name
+                        rec["clamp_mode"] = clamp_mode
+                        canonical_records.append(rec)
+    return _write_grid_canonical(args.output_dir, canonical_records)
 
 
 def main():
@@ -4039,6 +4852,23 @@ def main():
     )
     parser.add_argument("--eps-clip", type=float, default=0.1,
                         help="Option B calibration budget epsilon_clip (Def 3.2)")
+    parser.add_argument("--epsilon-count", type=float, default=0.0,
+                        help="eps_count: per-step budget spent to release a "
+                             "differentially private publisher count |P_tau| "
+                             "(sensitivity 1) when gating / walking the topic "
+                             "hierarchy (paper Sec. 6.3 step 1, Table 3).  0 "
+                             "uses the exact count (Kellaris baselines).")
+    parser.add_argument("--max-publishers", type=int, default=None,
+                        help="P_max: cap the multiplicity folded into the mean "
+                             "so Delta_f = R/n changes by a bounded amount "
+                             "across stream elements (Sec. 6.5).  None = no cap.")
+    parser.add_argument("--ablation-P", type=int, default=3,
+                        help="P_min used by the ablation / overhead / "
+                             "average-case experiments (F/G/H).")
+    parser.add_argument("--k-ext", type=int, default=3,
+                        help="K_ext: max adaptive interval extensions used by "
+                             "the ablation (F) interval-extension module and "
+                             "the plugin path (Sec. 6.7).")
     parser.add_argument("--alpha", type=float, default=0.25,
                         help="Attribution-advantage target; Algorithm 2 seeds P_0 = ceil(1/alpha)")
     parser.add_argument("--I-max", type=int, default=20,
@@ -4087,18 +4917,37 @@ def main():
                         help="Skip the n-weighted / collusion / K_ext / tuning experiments")
     parser.add_argument("--tune-only", action="store_true",
                         help="Only run the Section 5.7 hyperparameter tuning")
+    parser.add_argument("--grid-search", action="store_true",
+                        help="Run the Section 7.5 utility-hyperparameter grid "
+                             "search (P_min x P_max x Delta_t x K_ext, scored "
+                             "by MAE) per dataset/strategy/epsilon, write "
+                             "grid_canonical.json, then exit.")
+    parser.add_argument("--use-grid-config", default=None,
+                        help="Path to a grid_canonical.json produced by "
+                             "--grid-search.  Downstream experiments resolve "
+                             "their (P_min, P_max, K_ext) from the MAE-optimal "
+                             "grid config per (dataset, clamp, strategy, eps) "
+                             "instead of CLI defaults (paper Sec. 7.5: grid "
+                             "search fixes the params for the rest).  Defaults "
+                             "to auto-detecting <output-dir>/grid_canonical.json.")
+    parser.add_argument("--grid-first", action="store_true",
+                        help="Run the Section 7.5 grid search FIRST, write the "
+                             "canonical config, and have this same run consume "
+                             "it for every downstream experiment.")
     parser.add_argument(
         "--experiment",
-        choices=["full", "sweep", "tune", "A", "B", "C", "D", "E",
-                 "ABC", "ABCD", "none"],
+        choices=["full", "sweep", "tune", "A", "B", "C", "D", "E", "F", "G", "H",
+                 "ABC", "ABCD", "ABCDFGH", "FGH", "none"],
         default="full",
-        help="'full' runs sweep + intro + tuning + experiments A/B/C/D.  "
+        help="'full' runs sweep + intro + tuning + experiments A/B/C/D/F/G/H.  "
              "'sweep' is the main grid only.  'tune' is just Algorithm 2 / "
-             "brute-force tuning.  A/B/C/D pick one single-axis experiment "
-             "(D is the end-to-end plugin path).  'E' runs the live-broker "
-             "sanity subset (requires a real MQTT broker, default "
-             "localhost:1883; recommend --dataset wearable).  'ABC' or 'ABCD' "
-             "runs the single-axis experiments only.",
+             "brute-force tuning.  A/B/C/D/F/G/H pick one single-axis "
+             "experiment: A greedy-vs-brute P-tuning, B vary-w, C vary-eps, "
+             "D plugin end-to-end, F incremental-module ablation (Sec. 7.8, "
+             "offline, no broker), G overhead/privacy-utility comparison "
+             "(Sec. 7.9), H average-case utility (Sec. 7.11).  'E' runs the "
+             "live-broker sanity subset.  'ABC'/'ABCD'/'FGH'/'ABCDFGH' run "
+             "those subsets without the main sweep.",
     )
     parser.add_argument(
         "--broker-host", default="localhost",
@@ -4197,6 +5046,25 @@ def main():
     brute_frames: list[pd.DataFrame] = []
     gap_frames: list[pd.DataFrame] = []
 
+    # Resolve the canonical grid config (paper Sec. 7.5): explicit path wins,
+    # else auto-detect <output-dir>/grid_canonical.json.
+    grid_cfg_path = args.use_grid_config or _grid_canonical_path(args.output_dir)
+    args.grid_config = _load_grid_config(grid_cfg_path)
+
+    if args.grid_first:
+        # Run the grid search first, then consume its canonical config below.
+        path = _run_grid_search_block(args, targets, clamp_modes,
+                                      eps_values, strategies)
+        args.grid_config = _load_grid_config(path)
+
+    if args.grid_search:
+        _run_grid_search_block(args, targets, clamp_modes, eps_values, strategies)
+        logger.info("Section 7.5 grid search complete; canonical config written. "
+                    "Re-run the experiments with --use-grid-config "
+                    f"{_grid_canonical_path(args.output_dir)} to consume it "
+                    "(or use --grid-first to do both in one run).")
+        return
+
     if args.tune_only:
         for clamp_mode in clamp_modes:
             for name in targets:
@@ -4236,7 +5104,10 @@ def main():
         return
 
     run_main_pipeline = args.experiment in ("full", "sweep")
-    run_single_axis = args.experiment in ("full", "ABC", "ABCD", "A", "B", "C", "D")
+    run_single_axis = args.experiment in (
+        "full", "ABC", "ABCD", "ABCDFGH", "FGH",
+        "A", "B", "C", "D", "F", "G", "H",
+    )
     run_live_E = args.experiment == "E"
 
     if run_live_E:
@@ -4303,12 +5174,12 @@ def main():
                                     greedy_frames, brute_frames, gap_frames)
 
     if run_single_axis:
-        if args.experiment in ("full", "ABCD"):
-            which = "ABCD"
-        elif args.experiment == "ABC":
-            which = "ABC"
-        else:
+        if args.experiment == "full":
+            which = "ABCDFGH"   # full pipeline runs every single-axis experiment
+        elif args.experiment in ("ABCD", "ABC", "ABCDFGH", "FGH"):
             which = args.experiment
+        else:
+            which = args.experiment  # single letter A/B/C/D/F/G/H
         run_single_axis_experiments(
             targets, clamp_modes, args.output_dir, args, strategies, which=which,
         )

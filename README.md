@@ -88,24 +88,35 @@ Publishers (IoT sensors)
 | `epsilon` | ε | Global privacy budget per sliding window |
 | `window_size` | w | Number of logical timestamps per sliding window |
 | `payload_bound` | R | Global clamp range = sup_p(b_p − a_p) |
+| `epsilon_count` | ε_count | Budget spent per step to release a **differentially private publisher count** `\|P_τ\|` (sensitivity 1) when gating / walking the topic hierarchy (§6.3 step 1, Alg. 1 step 3, Table 3). Composes additively with ε (like `ε_clip`). `0` = exact count (Kellaris baselines). CLI: `--epsilon-count`. |
 
 Per-element sensitivity for the default mean aggregation is
 `Δf = R / n_τ`; Laplace scale is `λ_τ = R / (n_τ · ε_τ)`. Under uniform
-allocation `ε_τ = ε/w`, this becomes `λ_τ = R·w / (n_τ · ε)`.
+allocation `ε_τ = ε/w`, this becomes `λ_τ = R·w / (n_τ · ε)`. The publisher
+count that drives the **release gate and the hierarchy walk** is released under
+`ε_count` (`StreamState._dp_count` / `plugin._dp_count`); the noise
+**calibration** still divides by the actual pooled `n_τ`, which is public under
+the neighboring relation (Def. 5.1 holds `P_τ` fixed across DP neighbors).
 
 ### Scheduling hyperparameters (do NOT enter the DP calculation)
 
 | Parameter | Symbol | Description |
 |-----------|--------|-------------|
-| `min_publishers` | P | Publisher threshold for the P-allocation release gate |
+| `min_publishers` | P_min | Publisher threshold for the P-allocation release gate |
+| `max_publishers` | P_max | Caps the multiplicity folded into the mean so `Δf = R/n_τ` changes by a bounded amount across stream elements (§6.5); `n_τ > P_max` aggregates only the first P_max publishers. `None` = no cap. CLI: `--max-publishers`. |
 | `timestamp_interval` | Δt | Base wall-clock interval per logical timestamp |
-| `k_ext` | K_ext | Max number of Δt extensions when `n_τ < P`; `T_max = K_ext·Δt` |
+| `k_ext` | K_ext | Max number of Δt extensions when `n_τ < P_min`; `T_max = K_ext·Δt` |
 | `strategy` | A | Inner budget-allocation strategy |
 | `ba_threshold` | θ | BA similarity threshold (fraction of R) |
 
-P bounds the publisher-identity attribution advantage at 1/P. Tuning P
+`P_min` bounds the publisher-identity attribution advantage at 1/P_min; the
+`[P_min, P_max]` band bounds the per-element sensitivity *change*. Tuning P
 does **not** change the ε guarantee; it trades subscriber accuracy +
-identity protection against latency and scope coarsening.
+identity protection against latency and scope coarsening. **`P_min = 1`
+dissolves to local differential privacy** (per-publisher input perturbation,
+`λ = R·w/ε`; paper §1 Extreme 2, §6.6) — `run_ldp_on_per_pub` makes this LDP
+regime explicit and it is the LDP baseline in the §7.9 overhead comparison and
+the rightmost (per-publisher) point of Figure 1.
 
 ## Budget-allocation strategies
 
@@ -348,10 +359,10 @@ runner emits two CSVs per run so the MQTT topology is fully transparent:
 |---------|-----------------|---------------------------|--------------------------------|----------------|
 | **energy** | `energy/building01/{circuit}/{metric}` (e.g. `energy/building01/CT5/power_kw`) | Utility analytics / demand-response provider | `energy/building01/#`, `energy/building01/+/power_kw`, `energy/building01/CT1/#` | Smart-meter energy monitoring (§1.1.2) |
 | **traffic** | `traffic/intersection01/{radar\|lidar}/{sensor_id}/{metric}` (e.g. `traffic/intersection01/radar/EVO_RADAR_1/speed`) | City traffic-management / navigation service | `traffic/intersection01/#`, `traffic/intersection01/+/+/speed`, `traffic/intersection01/radar/#` | Traffic monitoring (§1.1.1) |
-| **wearable** | `health/clinic01/{device_id}/{metric}` (e.g. `health/clinic01/Device_5/heart_rate`) | Clinical RPM dashboard / cardiac alerting | `health/clinic01/#`, `health/clinic01/+/heart_rate`, `health/clinic01/Device_5/#` | Wearable health telemetry (§1.1.3) |
+| **wearable** | `health/{hospital}/{device_id}/{metric}` (e.g. `health/hospital03/Device_5/heart_rate`) | Clinical RPM dashboard / cardiac alerting | `health/#`, `health/+/+/heart_rate`, `health/hospital01/#`, `health/+/Device_5/#` | Wearable health telemetry (§1.1.3); PSMark-HC 5-hospital deployment |
 | **pune** | `air_quality/pune/{station_slug}/{pollutant}` (e.g. `air_quality/pune/Hadapsar_Gadital_01/pm10`) | Municipal air-quality dashboard / pollution alerts | `air_quality/pune/#`, `air_quality/pune/+/pm10`, `air_quality/pune/Hadapsar_Gadital_01/#` | Environmental monitoring (extension of §1.1) |
 | **mobility** | `mobility/nyc/{NE\|NW\|SE\|SW}/{grid_cell}/{metric}` (e.g. `mobility/nyc/NE/cell_3_2/traffic_speed`) | Congestion / ride-sharing optimizer | `mobility/nyc/#`, `mobility/nyc/NE/#`, `mobility/nyc/+/+/traffic_speed` | Smart-city mobility (§1.1.1 extension) |
-| **manufacturing** | `factory/line1/{machine_id}/{sensor}` (e.g. `factory/line1/machine01/vibration`) | Plant-floor dashboard / predictive-maintenance | `factory/line1/#`, `factory/line1/+/vibration`, `factory/line1/machine01/#` | Factory IoT (§1.3, §5.1 motivating topology) |
+| **manufacturing** | `factory/line1/{station}/{machine_id}/{sensor}` (e.g. `factory/line1/processing/machine01/vibration`) | Plant-floor dashboard / predictive-maintenance | `factory/line1/#`, `factory/line1/+/+/vibration`, `factory/line1/processing/#`, `factory/line1/+/machine01/#` | Factory IoT (§1.3, §5.1); PSMark-F station/machine deployment |
 
 The topic hierarchies match the paper's motivating conventions (`factory/line/machine/sensor`,
 `health/device_id/metric`, `traffic/segment_id/metric`) so Algorithm 1's
@@ -360,6 +371,36 @@ though the offline evaluator runs one subscription at a time (the leaf),
 all the wildcard filters above are semantically valid against the emitted
 topic set — the `<dataset>_topics.csv` manifest makes the subscriber-side
 attachment point explicit for downstream regression / attack tests.
+
+#### How the trees follow PSMark (PerCom)
+
+The paper builds the topic hierarchies "based on standard publish–subscribe
+benchmarking on the same datasets" — i.e. **PSMark** (*PSMark: A Distributed
+IoT Benchmark for Publish/Subscribe Under Domain-Based Workloads*, PerCom).
+PSMark itself does **not** prescribe literal topic strings; its
+[device specification](https://github.com/DAMSlabUMBC/PSMark) defines, per
+domain, the **device types**, the **per-device metrics**, and an
+**edge-server / deployment grouping** (e.g. *3 factory floors*, *5 regional
+hospitals*, smart-city sub-domains). Our trees realize exactly that structure —
+`<domain>/<edge-server-or-grouping>/<device>/<metric>` — and our sensor lists
+match PSMark's metric lists (smart-meter kWh/voltage/current; factory
+temperature/speed/quality/vibration/energy; wearable heart_rate/steps/
+temperature/calories; Pune humidity/PM/ozone/CO2/sound):
+
+| PSMark domain | PSMark grouping (PerCom) | Our dataset(s) | Realized topic tree |
+|---------------|--------------------------|----------------|---------------------|
+| Smart City | smart meters + smart mobility + Pune air quality, per edge server | `energy`, `traffic`, `mobility`, `pune` | `energy/building01/{circuit}/{metric}`, `traffic/intersection01/{radar\|lidar}/{id}/{metric}`, `mobility/nyc/{quadrant}/{cell}/{metric}`, `air_quality/pune/{station}/{pollutant}` |
+| Smart Factory | assembly line, 6 machines grouped into stations across floors | `manufacturing` | `factory/line1/{station}/{machine}/{sensor}` (stations: sorting / processing / warehouse / robotics) |
+| Smart Healthcare | ICU beds across **5 regional hospitals**, one edge server each | `wearable` | `health/{hospital}/{device}/{metric}` (devices distributed over hospital01..hospital05) |
+| Smart Home | UNSW device deployment | — (not in our six datasets) | — |
+
+The **manufacturing** and **wearable** trees were deepened in this pass to add
+PSMark's station and hospital grouping levels, which (a) makes Algorithm 1's
+walk-up ladder realistic (machine → station → line → factory; device →
+hospital → region) and (b) gives the §7.11 average-case experiment a
+meaningful topic-hierarchy depth `h`. The four smart-city datasets keep their
+existing roots (each is one facet of PSMark-C) and already carry multi-level
+grouping (radar/lidar class, NE/NW/SE/SW quadrant, circuit, station).
 
 ### Clamp ranges actually used (Option A from Definition 3.2)
 
@@ -531,6 +572,105 @@ All four write per-dataset CSVs and a cross-dataset aggregate under
 `results/cross_dataset/<clamp_mode>/experiments/{A,B,C,D}_*/`.
 `--experiment ABCD` runs all four without the main sweep; `--experiment full`
 (default) runs the main sweep plus A/B/C/D.
+
+### Ablation, overhead, and average-case experiments (`--experiment {F|G|H}`)
+
+Three additional paper experiments, all **fully offline** (no MQTT broker, no
+plugin object required):
+
+**Experiment F — incremental-module ablation (§7.8, `--experiment F`).** Adds
+the mechanism's modules one at a time and measures the utility impact of each:
+
+1. **M1 — P-gated allocation only**: gate on `n_τ ≥ P_min`, defer otherwise.
+2. **M2 — + subscription rewriting**: + adaptive interval extension (§6.7) —
+   hold an under-P scope open up to `K_ext·Δt` to pool more publishers.
+3. **M3 — + walking up the tree**: + Algorithm 1 hierarchy walk (§6.5) — rewrite
+   scope to the nearest ancestor whose range-compatible pool meets P.
+
+It reports two subscription scopes because the two rewriting modules dominate in
+different sparsity regimes: at the `leaf` scope (one publisher) only **M3**'s
+walk-up restores utility (spatial sparsity); at the `pooled` scope (gate active
+on the whole-sensor topic) **M2**'s interval extension recovers the
+temporally-sparse buckets. Together they give the complete incremental picture
+§6.6 predicts. CSV: `cross_dataset/<clamp>/experiments/F_ablation/`.
+
+**Experiment G — overhead / privacy-utility comparison (§7.9, `--experiment G`).**
+Compares **classic** (no privacy), **ldp** (`P_min=1` local DP, per-publisher
+input perturbation `λ=R·w/ε`), **per_type_wevent** (one stream per sensor type),
+and **ours** (clamped w-event DP with P-allocation). Reports NMAE, KL, release
+rate, attribution advantage (identity protection), and a compute-overhead proxy
+(`compute_ms_per_element`, `eps_count` surcharge). True broker throughput/
+latency is measured by the live Experiment E. CSV: `.../G_overhead/`.
+
+**Experiment H — average-case utility (§7.11, `--experiment H`).** Relates the
+**range-compatible publisher fraction** (`|P_R|/|P|`) and the **topic-hierarchy
+depth `h`** to realized utility per dataset, per §6.6's continuum. CSV:
+`.../H_average_case/`.
+
+`--experiment FGH` runs all three; `--experiment full` and `ABCDFGH` include
+them alongside A/B/C/D.
+
+### §7.5 grid search fixes the params for every other experiment
+
+```bash
+# Run the Section 7.5 grid search (P_min x P_max x Δt x K_ext, scored by MAE)
+# per dataset/strategy/epsilon, write the canonical config, and exit.
+python run_experiment.py --grid-search --output-dir results_3
+# -> results_3/grid_canonical.json + per-(dataset,ε) grid CSVs under tuning/grid_search/
+
+# Run the grid search FIRST, then have the SAME run consume the MAE-optimal
+# (P_min, P_max, K_ext) for every downstream experiment (paper §7.5: "we
+# utilize these optimized values as the canonical fixed values for the
+# following experiments").
+python run_experiment.py --grid-first --experiment full --output-dir results_3
+
+# Or consume a previously-written canonical config:
+python run_experiment.py --experiment FGH \
+    --use-grid-config results_3/grid_canonical.json --output-dir results_3
+```
+
+When a canonical config is present (`--use-grid-config`, or auto-detected at
+`<output-dir>/grid_canonical.json`), Experiments F/G/H and the "ours" overhead
+baseline resolve their `(P_min, P_max, K_ext)` per `(dataset, clamp, strategy,
+ε)` from the grid optimum instead of the CLI defaults.
+
+## Running on a cluster
+
+The full suite is embarrassingly parallel across shards (one
+`run_experiment.py` per `dataset × clamp_mode`, each using `--workers` for
+intra-shard parallelism). Two launchers are provided under [`cluster/`](cluster/):
+
+**Generic shell + GNU parallel** (laptop, workstation, or any SSH node pool):
+
+```bash
+cluster/run_cluster.sh                         # local, all cores, aggregate at end
+JOBS=8 cluster/run_cluster.sh                  # cap concurrent shards
+SSHLOGINFILE=nodes.txt JOBS=4 cluster/run_cluster.sh   # multi-node over ssh
+DRY_RUN=1 cluster/run_cluster.sh               # print the plan, run nothing
+```
+
+**PSU Research Computing (Coeus) SLURM job array** — Coeus uses SLURM and
+[recommends job arrays](https://sites.google.com/pdx.edu/research-computing/faqs/coeus-hpc-faqs/slurm-parallelism)
+for exactly this "same computation on different data" pattern (GNU parallel is
+not installed there, so the array indexes the same joblist directly):
+
+```bash
+# From the repo root on Coeus (activate a Python >= 3.10 env first):
+CPUS=16 PARTITION=medium TIME=2-00:00:00 \
+  PUBSUB_ENV_SETUP='source ~/pubsub/.venv/bin/activate' \
+  cluster/submit_coeus.sh
+# Submits a 1..N job array (one shard per array task, CPUS cores each as
+# --workers) + a dependent aggregation job (afterok) -> results_cluster/combined/.
+DRY_RUN=1 cluster/submit_coeus.sh              # print the array plan, submit nothing
+```
+
+Each coarse shard runs `--grid-first --experiment full`, so the §7.5 grid
+search runs first and the full pipeline (sweep + intro/Fig. 1 + tuning + extras
+incl. the §7.10 K_ext latency sweep + single-axis A/B/C/D/F/G/H) consumes the
+grid-optimal params — covering **all** of §7 per shard, with no cross-shard
+coordination. See [`cluster/README.md`](cluster/README.md) for every knob, and
+[`cluster/COEUS_RUNBOOK.md`](cluster/COEUS_RUNBOOK.md) for the **step-by-step
+PSU Coeus runbook** (env setup → submit → monitor → results → figures).
 
 ## Adding a new dataset
 

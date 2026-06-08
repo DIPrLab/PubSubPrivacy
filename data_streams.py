@@ -631,14 +631,23 @@ DATASETS: dict[str, dict] = {
             "heart_rate": 250.0, "steps": 10000.0,
             "temperature": 60.0, "calories_burned": 100.0,
         },
-        # Hierarchy: health/{site}/{device}/{metric}.
-        "topic_root": "health/clinic01",
-        "publisher_topic": lambda pub_id, sensor: f"health/clinic01/{pub_id}/{sensor}",
+        # Hierarchy: health/{hospital}/{device}/{metric}, following PSMark-HC's
+        # smart-healthcare deployment (PerCom): continuously-monitored ICU beds
+        # spread across 5 regional hospitals (one edge server each).  We map
+        # each wearable Device_i to a regional hospital (hospital01..hospital05)
+        # so the hierarchy walk pools a hospital's devices before falling back
+        # to the cross-hospital root.
+        "topic_root": "health",
+        "publisher_topic": lambda pub_id, sensor: (
+            f"health/hospital{(int(''.join(filter(str.isdigit, str(pub_id))) or 0) % 5) + 1:02d}/"
+            f"{pub_id}/{sensor}"
+        ),
         "subscriber_filters": [
-            "health/clinic01/#",                 # hospital-wide RPM dashboard
-            "health/clinic01/+/heart_rate",      # cardiac alerts across all patients
-            "health/clinic01/Device_5/#",        # one patient's full telemetry
-            "health/clinic01/+/steps",           # activity analytics
+            "health/#",                          # region-wide RPM dashboard
+            "health/+/+/heart_rate",             # cardiac alerts across hospitals
+            "health/hospital01/#",               # one hospital's feed
+            "health/+/Device_5/#",               # one patient's full telemetry
+            "health/+/+/steps",                  # activity analytics
         ],
     },
     "pune": {
@@ -727,18 +736,26 @@ DATASETS: dict[str, dict] = {
             "temperature": 500.0, "machine_speed": 10000.0,
             "quality": 20.0, "vibration": 5.0, "energy": 50.0,
         },
-        # Hierarchy: factory/{line}/{machine}/{sensor}.  The source dataset
+        # Hierarchy: factory/{line}/{station}/{machine}/{sensor}, following
+        # PSMark-F's smart-factory deployment (PerCom): an assembly line whose
+        # six instrumented machines group into stations (sorting, processing =
+        # oven+milling, warehouse, robotics = gripper+AMR).  The source dataset
         # is a single machine, so we map the sub_i sub-publishers to distinct
-        # virtual machines m01..m10 on the same line.
+        # virtual machines and assign each to a PSMark station, giving the
+        # hierarchy walk (Algorithm 1) a realistic machine -> station -> line
+        # -> factory ladder.
         "topic_root": "factory/line1",
         "publisher_topic": lambda pub_id, sensor: (
-            f"factory/line1/{pub_id.replace('sub_', 'machine')}/{sensor}"
+            f"factory/line1/"
+            f"{['sorting','processing','warehouse','robotics'][int(pub_id.split('_')[1]) % 4]}/"
+            f"{pub_id.replace('sub_', 'machine')}/{sensor}"
         ),
         "subscriber_filters": [
-            "factory/line1/#",                      # line-level dashboard
-            "factory/line1/+/vibration",            # predictive-maintenance
-            "factory/line1/machine01/#",            # single-machine feed
-            "factory/line1/+/quality",              # QC rollup
+            "factory/line1/#",                          # line-level dashboard
+            "factory/line1/+/+/vibration",              # predictive-maintenance
+            "factory/line1/processing/#",               # one station's feed
+            "factory/line1/+/machine01/#",              # single-machine feed
+            "factory/line1/+/+/quality",                # QC rollup
         ],
     },
 }
@@ -854,9 +871,11 @@ def _clamp_dp_released(per_pub, fallback_M, eps_clip, seed=0):
     for p, series in per_pub.items():
         vals = [v for v in series if v is not None]
         if not vals:
+            # Publisher never emitted: it contributes nothing to any release, so
+            # it must NOT inflate the global range R.  Give it the widest public
+            # interval for clamping consistency but EXCLUDE it from max_width.
             out[p] = series
             per_pub_clamps[p] = (-M, M)
-            max_width = max(max_width, 2 * M)
             continue
         true_min = float(min(vals)); true_max = float(max(vals))
         a_hat = true_min + rng.laplace(scale=M / eps_clip)
@@ -980,6 +999,13 @@ class PreparedDataset:
         return sensor in self.per_pubs
 
 
+# Process-local cache: the same (dataset, clamp_mode, ...) is prepared by
+# several experiments in one process (e.g. F/G/H + grid within one cluster
+# shard).  Loading + clamping the CSV once and reusing it is a large speedup;
+# the cache is keyed on every argument that affects the result so it is safe.
+_PREPARE_CACHE: dict = {}
+
+
 def prepare_dataset(
     name: str,
     *,
@@ -994,21 +1020,32 @@ def prepare_dataset(
     Returns ``None`` if the dataset source cannot be opened.  Returns a
     ``PreparedDataset`` with ``is_empty == True`` if streams all failed the
     clamp step — callers should check that rather than silently proceeding.
+
+    Result is memoized per process on the full argument tuple (see
+    ``_PREPARE_CACHE``); deterministic in all args including ``seed``, so the
+    cache never changes behaviour, only avoids re-reading the CSV.
     """
+    cache_key = (name, clamp_mode, round(float(eps_clip), 9), int(seed),
+                 max_rows, tuple(sensors) if sensors is not None else None)
+    if cache_key in _PREPARE_CACHE:
+        return _PREPARE_CACHE[cache_key]
     spec = DATASETS[name]
     try:
         obj = load_dataset_object(name, max_rows=max_rows)
     except FileNotFoundError as e:
         logger.warning(f"Skipping {name}: {e}")
+        _PREPARE_CACHE[cache_key] = None
         return None
 
     raw_streams, raw_per_pubs = build_sensor_streams(name, obj, sensors=sensors)
     streams, per_pubs, meta = reclamp_dataset(
         raw_streams, raw_per_pubs, spec, clamp_mode, eps_clip, seed=seed,
     )
-    return PreparedDataset(
+    prepared = PreparedDataset(
         name=name, spec=spec,
         streams=streams, per_pubs=per_pubs, clamp_meta=meta,
         clamp_mode=clamp_mode,
         raw_streams=raw_streams, raw_per_pubs=raw_per_pubs,
     )
+    _PREPARE_CACHE[cache_key] = prepared
+    return prepared

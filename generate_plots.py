@@ -668,6 +668,123 @@ def plot_experiment_D(exp_dir: str, clamp_mode: str):
     _savefig(os.path.join(exp_dir, "experiment_D_plugin_path.png"))
 
 
+def plot_experiment_F(exp_dir: str, clamp_mode: str):
+    """Ablation (Sec. 7.8): per-dataset AND aggregate module-utility curves.
+
+    Writes one figure per dataset (experiment_F_ablation_<dataset>.png) plus an
+    aggregate facet (experiment_F_ablation_all.png) showing release-rate and
+    NMAE as the M1->M2->M3 modules are added, for the leaf and pooled scopes.
+    """
+    df = _safe_read_csv(os.path.join(exp_dir, "experiment_F_ablation.csv"))
+    if df is None or df.empty or "module_idx" not in df.columns:
+        return
+    datasets_present = sorted(df["dataset"].unique())
+    scopes = ["leaf", "pooled"]
+
+    def _one(ax, sub, metric, ylabel):
+        for scope in scopes:
+            s = sub[sub["scope"] == scope].sort_values("module_idx")
+            if s.empty:
+                continue
+            ax.plot(s["module_idx"], s[metric], "o-", label=scope, alpha=0.85)
+        ax.set(xlabel="module (1=P-gate, 2=+rewrite, 3=+walk-up)",
+               ylabel=ylabel, title=ylabel)
+        ax.set_xticks([1, 2, 3])
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+
+    # Per-dataset figures.
+    for ds in datasets_present:
+        sub = df[df["dataset"] == ds]
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+        _one(axes[0], sub, "release_rate", "release rate")
+        _one(axes[1], sub, "normalized_mae", "NMAE")
+        fig.suptitle(f"Ablation [{ds}, clamp={clamp_mode}]: utility vs module",
+                     fontsize=12)
+        _savefig(os.path.join(exp_dir, f"experiment_F_ablation_{ds}.png"))
+
+    # Aggregate: release-rate gain of each module, averaged across datasets.
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    for scope in scopes:
+        s = (df[df["scope"] == scope]
+             .groupby("module_idx")[["release_rate", "normalized_mae"]]
+             .mean().reset_index())
+        if s.empty:
+            continue
+        axes[0].plot(s["module_idx"], s["release_rate"], "o-", label=scope)
+        axes[1].plot(s["module_idx"], s["normalized_mae"], "o-", label=scope)
+    for ax, yl in ((axes[0], "mean release rate"), (axes[1], "mean NMAE")):
+        ax.set(xlabel="module (cumulative)", ylabel=yl, title=yl)
+        ax.set_xticks([1, 2, 3]); ax.grid(True, alpha=0.3); ax.legend(fontsize=8)
+    fig.suptitle(f"Ablation (all datasets) [clamp={clamp_mode}]", fontsize=12)
+    _savefig(os.path.join(exp_dir, "experiment_F_ablation_all.png"))
+
+
+def plot_experiment_G(exp_dir: str, clamp_mode: str):
+    """Overhead / privacy-utility (Sec. 7.9): per-dataset AND aggregate bars
+    over {classic, ldp, per_type_wevent, ours} for NMAE, KL, and attribution
+    advantage (identity protection; lower = better)."""
+    df = _safe_read_csv(os.path.join(exp_dir, "experiment_G_overhead.csv"))
+    if df is None or df.empty or "approach" not in df.columns:
+        return
+    order = ["classic", "ldp", "per_type_wevent", "ours"]
+    metrics = [("normalized_mae", "NMAE (lower=better utility)"),
+               ("kl_divergence", "KL divergence"),
+               ("attribution_advantage", "attribution adv. (lower=better privacy)")]
+
+    def _bars(sub, title, path):
+        appr = [a for a in order if a in set(sub["approach"])]
+        x = np.arange(len(appr))
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4.3))
+        for i, (m, yl) in enumerate(metrics):
+            vals = [float(sub[sub["approach"] == a][m].iloc[0]) for a in appr]
+            axes[i].bar(x, vals, color=["C7", "C3", "C1", "C2"][:len(appr)])
+            axes[i].set(xticks=x, ylabel=yl, title=yl)
+            axes[i].set_xticklabels(appr, rotation=20, fontsize=8)
+            axes[i].grid(True, alpha=0.3, axis="y")
+        fig.suptitle(title, fontsize=12)
+        _savefig(path)
+
+    for ds in sorted(df["dataset"].unique()):
+        _bars(df[df["dataset"] == ds],
+              f"Overhead [{ds}, clamp={clamp_mode}]",
+              os.path.join(exp_dir, f"experiment_G_overhead_{ds}.png"))
+    # Aggregate: mean across datasets per approach.
+    agg = df.groupby("approach", as_index=False)[
+        ["normalized_mae", "kl_divergence", "attribution_advantage"]].mean()
+    _bars(agg, f"Overhead (all datasets) [clamp={clamp_mode}]",
+          os.path.join(exp_dir, "experiment_G_overhead_all.png"))
+
+
+def plot_experiment_H(exp_dir: str, clamp_mode: str):
+    """Average-case utility (Sec. 7.11): aggregate scatter of range-compatible
+    fraction vs utility (one point per dataset) plus per-dataset bars."""
+    df = _safe_read_csv(os.path.join(exp_dir, "experiment_H_average_case.csv"))
+    if df is None or df.empty or "range_compatible_fraction" not in df.columns:
+        return
+    # Aggregate scatter: range-compat fraction (and depth h) vs release_rate / NMAE.
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    axes[0].scatter(df["range_compatible_fraction"], df["release_rate"], s=60)
+    axes[1].scatter(df["range_compatible_fraction"], df["normalized_mae"], s=60,
+                    c=df.get("topic_hierarchy_depth_h", None), cmap="viridis")
+    for _i, r in df.iterrows():
+        axes[0].annotate(str(r["dataset"]),
+                         (r["range_compatible_fraction"], r["release_rate"]),
+                         fontsize=7)
+        axes[1].annotate(str(r["dataset"]),
+                         (r["range_compatible_fraction"], r["normalized_mae"]),
+                         fontsize=7)
+    axes[0].set(xlabel="range-compatible fraction |P_R|/|P|",
+                ylabel="release rate", title="coverage vs range-compatibility")
+    axes[1].set(xlabel="range-compatible fraction |P_R|/|P|",
+                ylabel="NMAE", title="utility vs range-compatibility (color=depth h)")
+    for ax in axes:
+        ax.grid(True, alpha=0.3)
+    fig.suptitle(f"Average-case utility (all datasets) [clamp={clamp_mode}]",
+                 fontsize=12)
+    _savefig(os.path.join(exp_dir, "experiment_H_average_case_all.png"))
+
+
 def plot_cross_dataset(cross_dir: str):
     """Render cross_dataset/*.csv into their plots."""
     combined = _safe_read_csv(
@@ -823,6 +940,12 @@ def run_all(output_dir: str, only: set[str] | None = None):
                 plot_experiment_C(os.path.join(exp_root, "C_vary_epsilon"),
                                   clamp_mode)
                 plot_experiment_D(os.path.join(exp_root, "D_plugin_path"),
+                                  clamp_mode)
+                plot_experiment_F(os.path.join(exp_root, "F_ablation"),
+                                  clamp_mode)
+                plot_experiment_G(os.path.join(exp_root, "G_overhead"),
+                                  clamp_mode)
+                plot_experiment_H(os.path.join(exp_root, "H_average_case"),
                                   clamp_mode)
 
     # Experiment E lives at the top level (not per-clamp-mode), with one
