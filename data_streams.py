@@ -20,6 +20,7 @@ no experimental / plotting / tuning code lives in this module.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from dataclasses import dataclass, field
@@ -27,6 +28,17 @@ from typing import Callable
 
 import numpy as np
 import pandas as pd
+
+
+def _stable_hash(s: str) -> int:
+    """Deterministic, process-independent hash of a string -> [0, 10000).
+
+    Python's built-in ``hash()`` is salted per process (PYTHONHASHSEED), so
+    using it to derive a per-sensor RNG seed makes Option-B DP-released clamps
+    NON-reproducible across runs/processes.  md5 gives a stable digest so the
+    same sensor always seeds the same clamp noise.
+    """
+    return int(hashlib.md5(s.encode("utf-8")).hexdigest(), 16) % 10000
 
 logger = logging.getLogger(__name__)
 
@@ -952,7 +964,7 @@ def reclamp_dataset(
         try:
             new_pp, R, m = apply_clamp_option(
                 pp, sensor, dataset_spec, clamp_mode,
-                eps_clip=eps_clip, seed=seed + hash(sensor) % 10000,
+                eps_clip=eps_clip, seed=seed + _stable_hash(sensor),
             )
         except ValueError as e:
             logger.warning(f"    clamp {clamp_mode} failed for {sensor}: {e}")

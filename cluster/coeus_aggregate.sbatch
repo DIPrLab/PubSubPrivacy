@@ -29,5 +29,9 @@ fi
 
 PLOTS_FLAG=""
 [ "${PLOTS:-0}" = "1" ] && PLOTS_FLAG="--plots"
-python cluster/aggregate.py --shards-dir "$OUT/shards" --out "$OUT/combined" $PLOTS_FLAG
+# Always also build the curated single-directory paper bundle so the key
+# individual + combined results download in one small scp (see $OUT/paper_bundle).
+python cluster/aggregate.py --shards-dir "$OUT/shards" --out "$OUT/combined" \
+  --paper-bundle "$OUT/paper_bundle" $PLOTS_FLAG
 echo "[$(date)] aggregation complete -> $OUT/combined"
+echo "[$(date)] key paper results bundled -> $OUT/paper_bundle  (scp this one dir)"

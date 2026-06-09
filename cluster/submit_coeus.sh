@@ -59,8 +59,8 @@ ARRAY_SPEC="1-$N"
 # 'dataset-clamp-exp' sharding maximizes node usage (heavy datasets spread
 # their experiments across many nodes instead of one straggler shard).
 GRIDLIST="$OUT/joblist.grid.txt"; RESTLIST="$OUT/joblist.rest.txt"
-grep -- '--grid-search' "$JOBLIST" > "$GRIDLIST" || true
-grep -v -- '--grid-search' "$JOBLIST" > "$RESTLIST" || true
+grep -- '-m experiments.grid_search' "$JOBLIST" > "$GRIDLIST" || true
+grep -v -- '-m experiments.grid_search' "$JOBLIST" > "$RESTLIST" || true
 NG=$(wc -l < "$GRIDLIST"); NR=$(wc -l < "$RESTLIST")
 TWO_PHASE=0; [ "$NG" -gt 0 ] && [ "$NR" -gt 0 ] && TWO_PHASE=1
 

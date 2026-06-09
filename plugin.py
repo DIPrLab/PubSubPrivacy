@@ -323,14 +323,18 @@ class PrivacyPlugin:
         merged.start_time = earliest_start
         return merged
 
-    def _scope_walk(self, topic: str, skip_leaf: bool = False) -> tuple[str, TopicBuffer]:
+    def _scope_walk(self, topic: str, skip_leaf: bool = False
+                    ) -> tuple[str, TopicBuffer, int]:
         """Walk up the topic tree to the first clamp-compatible ancestor with
-        a DP count |P_tau^R(s)| >= P.  Returns (scope, pooled_buffer).
+        a DP count |P_tau^R(s)| >= P.  Returns (scope, pooled_buffer, n_gate),
+        where ``n_gate`` is the differentially private count at the returned
+        scope that the P-gate decision was based on (>= P_min on success;
+        the last probed count < P_min when the root is reached without meeting
+        P, so the caller's gate will defer).
 
         ``skip_leaf`` starts the walk at parent(topic) when the caller has
         already drawn (and charged) a DP count at the leaf scope, so the leaf
-        is not re-probed / re-charged.  If the root is reached without meeting
-        P, returns the last visited scope + buffer (caller decides to defer).
+        is not re-probed / re-charged.
         """
         R = self._payload_range_for(topic)
         # Reference clamp: use the leaf-topic's declared bounds.
@@ -344,16 +348,17 @@ class PrivacyPlugin:
         scopes = self._ancestors(topic)
         if skip_leaf and len(scopes) > 1:
             scopes = scopes[1:]
-        last_scope, last_buf = topic, TopicBuffer()
+        last_scope, last_buf, last_n_gate = topic, TopicBuffer(), 0
         for scope in scopes:
             buf = self._clamp_compatible_buffer(scope, ref, R)
-            last_scope, last_buf = scope, buf
             # Algorithm 1 step 3: compare a DIFFERENTIALLY PRIVATE count of the
             # range-compatible publishers at this scope against P, spending
             # eps_count (sensitivity 1) at each level we probe.
-            if self._dp_count(buf.num_publishers) >= self.min_publishers:
-                return scope, buf
-        return last_scope, last_buf
+            n_gate = self._dp_count(buf.num_publishers)
+            last_scope, last_buf, last_n_gate = scope, buf, n_gate
+            if n_gate >= self.min_publishers:
+                return scope, buf, n_gate
+        return last_scope, last_buf, last_n_gate
 
     # ------------------------------------------------- release pipeline
 
@@ -392,11 +397,18 @@ class PrivacyPlugin:
                     extend = True
                 else:
                     scope, pooled = (leaf, buf_leaf)
+                    # The DP count that the P-gate decision is based on: the
+                    # leaf count by default, or the walk's final scope count if
+                    # we walk up.  This single noisy count is handed to
+                    # stream.release(n_gate=...) so the engine does NOT re-gate
+                    # on the exact pooled count (no second, inconsistent gate).
+                    n_gate_decision = leaf_n_gate
                     if (needs_walk and leaf_n_gate < self.min_publishers
                             and self.enable_hierarchy_walk):
                         # Algorithm 1 walk (charges eps_count per ancestor),
                         # under the same lock so the pool snapshot is consistent.
-                        scope, pooled = self._scope_walk(leaf, skip_leaf=True)
+                        scope, pooled, n_gate_decision = self._scope_walk(
+                            leaf, skip_leaf=True)
                     # P_max sensitivity cap (Sec. 6.5): fold at most P_max
                     # publishers into the aggregate.
                     pooled = self._truncate_to_pmax(pooled, self.max_publishers)
@@ -414,8 +426,14 @@ class PrivacyPlugin:
 
             # Use the leaf's DP stream state (each subscription binding is a
             # distinct stream in the paper; here we key by subscribed topic).
+            # Hand the engine the SAME differentially private count the plugin
+            # gated on (Algorithm 1), so it does not re-gate on the exact pooled
+            # count.  Kellaris baselines (not needs_walk) pass n_gate=None and
+            # are not gated at all.
             stream = self._get_or_create_stream(leaf)
-            released = stream.release(aggregate, n_tau)
+            released = stream.release(
+                aggregate, n_tau,
+                n_gate=(n_gate_decision if needs_walk else None))
             deferred = stream.last_was_deferred
 
             if released is not None:

@@ -149,7 +149,6 @@ class StreamState:
     current_tau: int = 0
     last_released: Optional[float] = None
     last_true_aggregate: Optional[float] = None
-    absorbed_budget: float = 0.0
     # Budget Distribution forward buffer (Kellaris et al. BD, half-budget
     # variant).  Index 0 is the share landing at the current tau; when we
     # skip at tau we add (eps/(2w))/(w-1) to indices 0..w-2 (i.e. to taus
@@ -359,8 +358,6 @@ class StreamState:
         pub_share = base * to_absorb
         self.ba_nullify_remaining = to_absorb - 1
         self.ba_skipped_since_last_pub = 0
-        # Kept for backwards compatibility; ignored by the new path.
-        self.absorbed_budget = 0.0
         return eps_dissim, pub_share, False
 
     def _alloc_n_weighted(self, n_tau: int) -> tuple[float, float, bool]:
@@ -430,13 +427,24 @@ class StreamState:
 
     # ---- public release entry point -------------------------------------
 
-    def release(self, aggregate: float, n_tau: int) -> Optional[float]:
+    def release(self, aggregate: float, n_tau: int,
+                n_gate: Optional[int] = None) -> Optional[float]:
         """
         Process one aggregate stream element with multiplicity n_tau.
 
         Returns the delivered (noisy or repeated) value.  The P-allocation gate
-        is enforced here for P-gated / n-weighted strategies: if n_tau < P the
-        element is deferred (last release is repeated) and no budget is spent.
+        is enforced here for P-gated / n-weighted strategies: if the gate count
+        < P the element is deferred (last release is repeated) and no budget is
+        spent.
+
+        ``n_gate`` lets the CALLER supply the (already differentially private)
+        publisher count that the gate should compare against P_min — used by the
+        broker plugin, which draws and charges ONE DP count during its
+        Algorithm-1 hierarchy walk and must not have the engine re-gate on the
+        exact pooled count (that would be a second, inconsistent gate).  When
+        ``n_gate`` is None (the offline path) the engine draws its own DP count
+        from ``epsilon_count`` as before, so the gate is single-sourced either
+        way.
         """
         self.current_tau += 1
 
@@ -455,9 +463,12 @@ class StreamState:
         # step 1.  When eps_count == 0 this is the exact n_tau.  The DP count is
         # only paid for population-aware strategies (P-gated / n-weighted);
         # the Kellaris baselines never gate on a count so they never charge it.
+        # If the caller already produced the gate count (``n_gate``), use it
+        # verbatim (no second draw, no double charge) so the broker's
+        # Algorithm-1 decision is the SINGLE authority on release vs. defer.
         if is_p_gated(self.config.strategy) or self.config.strategy == BudgetStrategy.N_WEIGHTED:
-            n_gate = self._dp_count(n_tau)
-            if n_gate < self.config.min_publishers:
+            gate_count = self._dp_count(n_tau) if n_gate is None else int(n_gate)
+            if gate_count < self.config.min_publishers:
                 self._record(aggregate, self.last_released, 0.0, n_tau, deferred=True)
                 return self.last_released
 
@@ -473,19 +484,32 @@ class StreamState:
         # is consistent with the calibrated noise.
         n_eff = self.config.effective_n(n_tau)
 
+        # Snapshot the BA absorb/nullify counters BEFORE allocation so that, if
+        # the defensive sliding-window cap below turns a planned BA *release*
+        # into a skip, we can roll them back — otherwise the absorbed skips
+        # would be lost and the following taus over-nullified (Kellaris Fig. 4
+        # accounting would drift).  No-op for non-BA strategies (counters stay 0).
+        _ba_null_before = self.ba_nullify_remaining
+        _ba_skipped_before = self.ba_skipped_since_last_pub
+
         dissim_eps, pub_eps, skip = self._allocate(aggregate, n_eff)
 
         # Enforce the sliding-window budget constraint on the combined cost
         # of M_{i,1} and M_{i,2}.  The in-strategy accounting for BD/BA is
         # already window-safe by construction; this cap is a defensive floor
-        # for Uniform/Sample/n-weighted and for strategy transitions.
+        # for Uniform/Sample/n-weighted and for strategy transitions, and it
+        # GUARANTEES the w-event budget invariant holds regardless of any
+        # sub-mechanism edge case (DP correctness never depends on the
+        # sub-mechanism being perfectly tight).
         remaining = self._budget_remaining()
         total_eps = dissim_eps + pub_eps
+        capped = False
         if total_eps > remaining:
             # Publication is cheaper to sacrifice than the already-drawn
             # dissimilarity noise (which we cannot "un-spend").
             pub_eps = max(0.0, remaining - dissim_eps)
             total_eps = dissim_eps + pub_eps
+            capped = True
 
         # Floor on pub_eps: releasing with a near-zero share would give a
         # Laplace scale that explodes numerically.  Treat anything below
@@ -494,6 +518,14 @@ class StreamState:
         if skip or pub_eps <= min_pub_eps:
             # No publication at this tau; record dissim cost (may be 0 for
             # strategies without M_{i,1}) and repeat the last release.
+            if capped and not skip:
+                # The defensive cap (not the sub-mechanism) converted a planned
+                # release into a skip; restore the BA counters so the saved
+                # skips aren't lost and future taus aren't wrongly nullified.
+                # This only moves counters, never budget, so the window
+                # invariant is unaffected.
+                self.ba_nullify_remaining = _ba_null_before
+                self.ba_skipped_since_last_pub = _ba_skipped_before
             self._record(aggregate, self.last_released, total_eps, n_eff, deferred=True)
             return self.last_released
 

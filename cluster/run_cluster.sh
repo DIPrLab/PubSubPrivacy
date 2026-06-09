@@ -73,8 +73,8 @@ fi
 # shards have no '--grid-search' line, so this collapses to a single phase.
 GRIDLIST="$OUT/joblist.grid.txt"
 RESTLIST="$OUT/joblist.rest.txt"
-grep -- '--grid-search' "$JOBLIST" > "$GRIDLIST" || true
-grep -v -- '--grid-search' "$JOBLIST" > "$RESTLIST" || true
+grep -- '-m experiments.grid_search' "$JOBLIST" > "$GRIDLIST" || true
+grep -v -- '-m experiments.grid_search' "$JOBLIST" > "$RESTLIST" || true
 NG=$(wc -l < "$GRIDLIST"); NR=$(wc -l < "$RESTLIST")
 
 if [ "$NG" -gt 0 ] && [ "$NR" -gt 0 ]; then
@@ -91,7 +91,9 @@ echo "All shards complete."
 
 if [ "$AGGREGATE" = "1" ]; then
   echo "Aggregating shards -> $OUT/combined ..."
-  AGG_ARGS=(--shards-dir "$OUT/shards" --out "$OUT/combined")
+  AGG_ARGS=(--shards-dir "$OUT/shards" --out "$OUT/combined"
+            --paper-bundle "$OUT/paper_bundle")
   [ "$PLOTS" = "1" ] && AGG_ARGS+=(--plots)
   "$PYTHON" "$HERE/aggregate.py" "${AGG_ARGS[@]}"
+  echo "Key paper results bundled -> $OUT/paper_bundle  (download this one dir)."
 fi

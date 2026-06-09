@@ -13,9 +13,14 @@ et al. (2014) to the pub/sub setting with:
     guarantee never depends on a private payload value.
   * **P-allocation** (Section 5.3), a population-aware budget-allocation
     strategy family joining Kellaris et al.'s Uniform, Sample, BD, and BA.
-  * **n-weighted P-allocation** (Section 5.4) — distributes ε across a window
-    in proportion to `n_τ`, shrinking the Laplace scale quadratically in
-    publisher density.
+  * **n-weighted P-allocation** (Section 6.4) — distributes ε across a window
+    **inversely** proportional to `n_τ`: `ε_τ = ε·(1/n_τ) / Σ_j(1/n_j)`. Because
+    the mean sensitivity is `R/n_τ`, this *equalizes* the released Laplace scale
+    across the window (`λ_τ = R·Σ_j(1/n_j)/ε`, independent of `n_τ`) so a few
+    dense-pool timestamps don't dominate the window budget. (The paper's printed
+    Eq. 5 denominator `Σ_j n_j` is a typo for `Σ_j(1/n_j)` — the inverse-weight
+    form is the only reading consistent with both "inversely proportional" and
+    "shares sum to ε"; see `dp_engine._alloc_n_weighted`.)
   * **Clamp-compatible topic-hierarchy walk** (Algorithm 1), operating on a
     normative MQTT topic tree per dataset (e.g. `energy/building01/{circuit}/{metric}`,
     `factory/line1/{machine}/{sensor}`, `health/clinic01/{device}/{metric}`).
@@ -69,15 +74,23 @@ Publishers (IoT sensors)
 
 ## Components
 
+The code is organized as a **shared engine library + thin per-experiment
+modules + a CLI wrapper**, so each paper experiment is independently runnable
+and cluster-shardable:
+
 | File | Description |
 |------|-------------|
-| `dp_engine.py` | Core DP engine. Laplace mechanism, sliding-window budget, all eight budget strategies exercised by the paper (Uniform, Sample, BD with the Algorithm 4 forward buffer, BA, P-gated Uniform/Sample/BA, n-weighted), utility metrics (MAE/NMAE, windowed + global KL), attribution advantage. |
-| `plugin.py` | MQTT privacy plugin. Per-publisher clamping (Def. 3.2), Algorithm 1 hierarchy walk with clamp-compatibility, dynamic interval extension (Section 5.6), delivery of only `(ê_τ, t_start_τ)` pairs per Def. 3.4. |
-| `data_streams.py` | Dataset ingestion, stream construction, `DATASETS` registry (six real-world datasets), and the Definition 3.2 clamp options (static / DP-released). |
-| `run_experiment.py` | Single entry-point for the full pipeline: per-dataset parameter sweep, strategy comparison, paper's four intro figures, n-weighted spotlight, collusion experiment, K_ext sweep, Section 5.7 multi-strategy hyperparameter tuning, Experiments A/B/C/D (Section 6.5–6.8), and cross-dataset aggregates. Writes only CSVs by default. |
-| `message_logger.py` | Per-release message serialization. Flattens every DP run's `(true_aggregate, noisy_value, n_τ, ε_τ, λ_τ, deferred, ...)` into append-friendly CSV rows. Used by every experiment that records per-message data. |
-| `generate_plots.py` | Post-hoc plot generator. Reads every CSV produced by `run_experiment.py` and renders the full PNG catalogue (sweep, intro, tuning, extras, experiments A/B/C/D, cross-dataset). Run it after `run_experiment.py` — or pass `--generate-plots` to the latter to restore the inline workflow. |
-| `config.yaml` | Configuration mirroring the paper's DP / scheduling parameter taxonomy. |
+| `dp_engine.py` | Core DP engine. Laplace mechanism, sliding-window budget invariant, all nine budget strategies (Uniform, Sample, BD with the Algorithm 4 forward buffer, BA with absorb/nullify, P-gated Uniform/Sample/BD/BA, n-weighted), the differentially-private publisher count (`ε_count`), the `P_max` sensitivity cap, utility metrics (MAE/NMAE, windowed + global KL), attribution advantage. The P-gate accepts a caller-supplied count (`release(…, n_gate=…)`) so the broker's Algorithm-1 decision is the single authority on release-vs-defer (no double-gate). |
+| `plugin.py` | MQTT privacy plugin (broker middleware). Per-publisher clamping (Def. 3.2), Algorithm 1 clamp-compatible hierarchy walk, dynamic interval extension (§6.7), `ε_count` DP counts charged per probed level, `P_max` truncation, delivery of only `(ê_τ, t_start_τ)` pairs (Def. 3.4). Hands its DP gate count to `StreamState.release` so the engine doesn't re-gate on the exact count. |
+| `data_streams.py` | Dataset ingestion, stream construction, the `DATASETS` registry (six real-world datasets) + their normative PerCom topic hierarchies, and the Definition 3.2 clamp options (static Option A / DP-released Option B, with a process-stable per-sensor seed). |
+| `message_logger.py` | Per-release message serialization → append-friendly CSV rows. Built only when message logging is on; **all metrics are computed without it**, so `--no-log-messages` (the cluster default) avoids the per-release buffer that otherwise OOMs the largest dataset. |
+| **`experiments/engine.py`** | **The shared core library.** The DP runners (`run_dp_on_stream`, `run_ldp_on_per_pub`), the `ProcessPoolExecutor` pool + worker-global stream caches, the topic-hierarchy / per-level subscription primitives (`_topic_level_groups`, `level_subscription_streams`), dataset/grid resolution (`_resolve_params`, grid-canonical I/O), the stubbed-MQTT plugin driver, plotting, trial aggregation, and the per-dataset / cross-dataset orchestration (`run_dataset`, `run_single_axis_experiments`, `_run_grid_search_block`). Every module imports it as `core`. |
+| **`experiments/<name>.py`** | One module per paper experiment, each runnable as `python -m experiments.<name>`: `sweep`, `grid_search`, `intro` (Extreme 1 / 1.1 / 2, U-shape, Figure 1), `tuning`, `extras` (n-weighted spotlight, collusion, K_ext §7.10), `greedy_vs_brute` (A), `window` (B), `epsilon` (C), `plugin_path` (D), `ablation` (F), `overhead` (G), `average_case` (H), `subscription_levels` (L). `_common.py` provides the shared CLI/arg resolution. |
+| **`experiments/live_broker.py`** | Experiment E: live MQTT broker end-to-end (embedded broker + real paho publishers/subscribers through the plugin). Kept out of the offline engine because it needs a running broker. |
+| `run_experiment.py` | **Thin CLI wrapper** over `experiments/engine.py` — builds the argument parser and dispatches into the engine + experiment modules. Carries no functional code itself. |
+| `generate_plots.py` | Post-hoc plot generator. Reads the CSVs (including the per-trial `*_aggregate.csv` files) and renders the full PNG catalogue. Run after the experiments, or pass `--generate-plots` for the inline workflow. |
+| `cluster/` | Cluster launchers: `gen_jobs.sh` (emits one shard per `dataset×clamp×experiment`), `submit_coeus.sh` (SLURM two-phase array), `run_cluster.sh` (GNU parallel), `aggregate.py` (merge shards + build the `paper_bundle/`), and the SLURM `.sbatch` files. See `cluster/COEUS_RUNBOOK.md`. |
+| `test_engine.py` / `test_extremes.py` | DP correctness tests (w-event budget invariant for all strategies, single-sourced gate, BA cap-rollback) and the intro extremes (LDP scale, Extreme 1.1 per-level, Extreme 1/2 figures). |
 
 ## Parameter taxonomy (paper §3.1)
 
@@ -127,7 +140,7 @@ the rightmost (per-publisher) point of Figure 1.
 | `budget_distribution` (BD) | Kellaris et al. Algorithm 4 lines 11–18: on a value-similar skip, forward the base share `(ε/w)/(w−1)` into each of the next `w−1` slots via a `fwd` buffer; on a release spend `ε/w + fwd[τ]` and reset that slot. |
 | `budget_absorption` (BA) | Kellaris et al. Algorithm 4 lines 20–28: skip value-similar timestamps, absorb the unused share into a pot, drain the pot on the next value-different release. |
 | `p_gated_uniform` / `p_gated_sample` / `p_gated_ba` | P-allocation wrappers (Section 5.3) — only spend budget when `n_τ ≥ P`, otherwise repeat the last output (deferred). |
-| `n_weighted` | **Paper Section 5.4 contribution**: `ε_τ = ε · n_τ / Σ_j n_j`; dense-pool timestamps get more budget so Laplace scale shrinks quadratically in `n_τ`. |
+| `n_weighted` | **Paper Section 6.4 contribution**: `ε_τ = ε · (1/n_τ) / Σ_j(1/n_j)` — budget **inversely** proportional to pool size, which equalizes the released Laplace scale `λ_τ = R·Σ_j(1/n_j)/ε` across the window (independent of `n_τ`). Implicitly P-gated (uses the population count). |
 
 ## Quick start
 
@@ -211,11 +224,15 @@ python run_experiment.py --experiment ABCD     # ABC plus plugin end-to-end
 
 Every `--experiment full` invocation produces, for each dataset × clamp mode:
 
-* the full parameter sweep (all strategies × P × ε × w),
-* the four paper intro figures (two extremes + U-shape + KL bar),
+* the full parameter sweep (all strategies × P × ε × w), at every topic level,
+* the paper intro figures — **Extreme 1** (global), **Extreme 1.1** (one stream
+  per publisher type, with the per-level distortion it inflicts on finer
+  subscriptions), **Extreme 2 / LDP** (per-publisher), the **U-shape**, the
+  **KL bar**, and the **Figure 1** reproduction,
 * Section 5.7 hyperparameter tuning across **all** strategies,
 * the n-weighted spotlight, collusion experiment, and K_ext sweep,
-* Experiments A/B/C/D (Section 6.5–6.8, single-axis + plugin end-to-end),
+* Experiments A/B/C/D (single-axis + plugin end-to-end) and F/G/H/L
+  (ablation, overhead, average-case, per-level subscriptions),
 
 plus cross-dataset aggregates: combined sweep CSV, combined tuning CSV, the
 best `(strategy, P, Δt)` per dataset, an aggregated Figure 1 averaging KL
@@ -366,11 +383,40 @@ runner emits two CSVs per run so the MQTT topology is fully transparent:
 
 The topic hierarchies match the paper's motivating conventions (`factory/line/machine/sensor`,
 `health/device_id/metric`, `traffic/segment_id/metric`) so Algorithm 1's
-clamp-compatible scope walk operates over a realistic tree structure. Even
-though the offline evaluator runs one subscription at a time (the leaf),
-all the wildcard filters above are semantically valid against the emitted
-topic set — the `<dataset>_topics.csv` manifest makes the subscriber-side
-attachment point explicit for downstream regression / attack tests.
+clamp-compatible scope walk operates over a realistic tree structure. The
+`<dataset>_topics.csv` manifest makes every subscriber-side attachment point
+explicit for downstream regression / attack tests.
+
+### Subscriptions at every topic level (per-level evaluation)
+
+The evaluator does **not** test a single leaf subscription — every experiment
+binds subscriptions at **every level of the PerCom topic hierarchy** and reports
+utility per level. A subscription at level `L` pools the publishers under one
+subtree prefix (level 1 = the domain root / whole type, the deepest level = a
+single-publisher leaf); the helper `core.level_subscription_streams(dataset,
+sensor, per_pub)` enumerates `(level, scope, aggregate, count, n_pubs)` for
+every `(level × subtree)` and the experiments fan those out over the worker
+pool. Result rows carry `subscription_level` and `scope` columns so you can read
+utility vs. aggregation depth directly. Concretely:
+
+| Experiment | Per-level coverage |
+|---|---|
+| **sweep** (main grid) | every level × subtree, for every sensor, × strategy × P × ε × w |
+| **B** (vary w), **C** (vary ε) | every level × subtree × canonical combo |
+| **L** (`subscription_levels`) | the dedicated per-level utility experiment |
+| **G** (overhead), **H** (average-case) | every level × subtree (LDP baseline uses the per-publisher subset of each subtree) |
+| **intro / Extreme 1.1** | every level — quantifies the distortion a level-`L` subscriber suffers when a single per-*type* release is delivered to all of them |
+| **A** (greedy-vs-brute walk-up) | the full leaf→root level chain (the candidate rewrite depths) |
+| **F** (ablation) | the `leaf` and `pooled` scopes (by design — they isolate the walk-up vs. interval-extension modules) |
+
+### Trials and per-dataset aggregates
+
+Every config is repeated over `--trials N` independent noise seeds (the paper
+runs **6**). Each experiment writes **both** the per-trial rows (a `trial`
+column) **and** a `*_aggregate.csv` with the mean/std of every metric grouped
+per dataset (and per `subscription_level`/`scope` where applicable), so the
+reported numbers are seed-averaged with visible variance. `generate_plots.py`
+renders per-dataset + cross-dataset (`_all`) figures from those aggregates.
 
 #### How the trees follow PSMark (PerCom)
 
@@ -522,19 +568,27 @@ and the complete brute-force curve, so the **empirical gap**
 claims is small on the 1-D `P`-loss surface. Cross-dataset gap bars land in
 `cross_dataset/tuning_greedy_vs_brute_gap.png`.
 
-### Three single-axis experiments (`--experiment {A|B|C|ABC|full}`)
+### Single-axis experiments (`--experiment {A|B|C|ABC|full}`, or `python -m experiments.<name>`)
 
-On top of the main sweep, the runner exposes three focused experiments that
-hold every hyperparameter fixed except one. Each produces its own CSV + PNG
-per clamp mode, in addition to the main sweep:
+On top of the main sweep, the runner exposes focused experiments that hold
+every hyperparameter fixed except one. Each produces its own CSV + PNG per
+clamp mode (per-trial rows + a `*_aggregate.csv`), runnable either via the CLI
+`--experiment` flag or directly as a cluster-shardable module
+(`python -m experiments.<name>`).
 
-**Experiment A — Greedy vs naive P-tuning (`--experiment A`).** For each
-`(dataset, sensor, strategy)` and several `(ε, w)` points, runs Algorithm 2
-greedy hill-climb and brute-force enumeration over every integer
-`P ∈ [1, max n_τ]`. Records `greedy_P`, `brute_P`, `gap_loss`, and
-`speedup = brute_evals / greedy_evals`. The cross-dataset plot shows mean
-speedup per dataset and a `greedy_loss` vs `brute_loss` scatter so the
-empirical optimality gap is visible at a glance.
+**Experiment A — greedy subscription walk-up vs brute over rewrite depths
+(`--experiment A`, `experiments/greedy_vs_brute`).** This is about **Algorithm 1
+(the subscription walk-up), not P-tuning.** For a subscription bound at a leaf,
+the broker must pick a rewrite depth in the topic tree that pools ≥ P
+range-compatible publishers while spending as little `ε_count` on discovery as
+possible. **Greedy** walks the leaf→root chain spending one `ε_count` per probed
+level and stops at the first ancestor whose **differentially-private** count
+meets P; **brute** probes every level. Records the chosen level, utility,
+`greedy_eps_count_spent` / `brute_eps_count_spent`, the `eps_count_saved`, and
+the `probe_speedup` — so the cost of greedy discovery (and what it saves over
+exhaustive probing) is explicit, accounting for the DP-count spend. (P-tuning
+proper — Algorithm 2 greedy vs brute over `P` — lives separately in
+`experiments/tuning`.)
 
 **Experiment B — Vary w (`--experiment B`).** Fixes `(P, ε, strategy)` at
 five canonical combinations (e.g. `P=2, ε=1.0, uniform`) and sweeps
@@ -595,20 +649,30 @@ temporally-sparse buckets. Together they give the complete incremental picture
 §6.6 predicts. CSV: `cross_dataset/<clamp>/experiments/F_ablation/`.
 
 **Experiment G — overhead / privacy-utility comparison (§7.9, `--experiment G`).**
-Compares **classic** (no privacy), **ldp** (`P_min=1` local DP, per-publisher
-input perturbation `λ=R·w/ε`), **per_type_wevent** (one stream per sensor type),
-and **ours** (clamped w-event DP with P-allocation). Reports NMAE, KL, release
-rate, attribution advantage (identity protection), and a compute-overhead proxy
-(`compute_ms_per_element`, `eps_count` surcharge). True broker throughput/
-latency is measured by the live Experiment E. CSV: `.../G_overhead/`.
+At **every topic level × subtree** (per-level, fanned out over the worker pool),
+compares **classic** (no privacy), **ldp** (`P_min=1` local DP, per-publisher
+input perturbation `λ=R·w/ε`, using the per-publisher subset of each subtree),
+**per_type_wevent** (one stream per sensor type), and **ours** (clamped w-event
+DP with P-allocation). Reports NMAE, KL, release rate, attribution advantage
+(identity protection), and a compute-overhead proxy (`compute_ms_per_element`,
+`eps_count` surcharge). Rows carry `subscription_level`/`scope`/`approach`. True
+broker throughput/latency is measured by the live Experiment E. CSV:
+`.../G_overhead/`.
 
-**Experiment H — average-case utility (§7.11, `--experiment H`).** Relates the
-**range-compatible publisher fraction** (`|P_R|/|P|`) and the **topic-hierarchy
-depth `h`** to realized utility per dataset, per §6.6's continuum. CSV:
+**Experiment H — average-case utility (§7.11, `--experiment H`).** At **every
+topic level × subtree**, relates the **range-compatible publisher fraction**
+(`|P_R|/|P|`) and the **topic-hierarchy depth `h`** to realized utility per
+dataset, per §6.6's continuum. Rows carry `subscription_level`/`scope`. CSV:
 `.../H_average_case/`.
 
-`--experiment FGH` runs all three; `--experiment full` and `ABCDFGH` include
-them alongside A/B/C/D.
+**Experiment L — subscriptions at every topic level (`python -m experiments.subscription_levels`).**
+The dedicated per-level experiment: evaluates the utility a subscriber receives
+bound at each level of the PerCom tree (root/type → … → leaf) for every dataset,
+making the utility-vs-aggregation-depth curve explicit. CSV:
+`.../I_subscription_levels/`.
+
+`--experiment FGH` runs F/G/H; `--experiment full` and `ABCDFGH` include them
+alongside A/B/C/D. F/G/H/L consume the §7.5 grid optimum via `--use-grid-config`.
 
 ### §7.5 grid search fixes the params for every other experiment
 
@@ -636,9 +700,17 @@ baseline resolve their `(P_min, P_max, K_ext)` per `(dataset, clamp, strategy,
 
 ## Running on a cluster
 
-The full suite is embarrassingly parallel across shards (one
-`run_experiment.py` per `dataset × clamp_mode`, each using `--workers` for
-intra-shard parallelism). Two launchers are provided under [`cluster/`](cluster/):
+Every paper experiment is now its own module under
+[`experiments/`](experiments/) (`sweep`, `grid_search`, `intro`, `tuning`,
+`extras`, `greedy_vs_brute`=A, `window`=B, `epsilon`=C, `plugin_path`=D,
+`ablation`=F, `overhead`=G, `average_case`=H, `subscription_levels`=L), each run
+as `python -m experiments.<name> --dataset … --clamp-mode … --workers …`.
+`run_experiment.py` is a thin wrapper that dispatches to these modules and holds
+the shared infrastructure they import. Every module runs on **all six datasets**,
+builds the **PerCom/PSMark topic hierarchy**, tests **subscriptions at every
+level of that hierarchy**, and repeats each config **≥6 trials** (per-trial rows
++ mean/std aggregate per dataset). Two launchers are provided under
+[`cluster/`](cluster/):
 
 **Generic shell + GNU parallel** (laptop, workstation, or any SSH node pool):
 
@@ -646,6 +718,7 @@ intra-shard parallelism). Two launchers are provided under [`cluster/`](cluster/
 cluster/run_cluster.sh                         # local, all cores, aggregate at end
 JOBS=8 cluster/run_cluster.sh                  # cap concurrent shards
 SSHLOGINFILE=nodes.txt JOBS=4 cluster/run_cluster.sh   # multi-node over ssh
+SHARD_BY=dataset-clamp-exp JOBS=32 cluster/run_cluster.sh   # finest shards
 DRY_RUN=1 cluster/run_cluster.sh               # print the plan, run nothing
 ```
 
@@ -655,22 +728,67 @@ for exactly this "same computation on different data" pattern (GNU parallel is
 not installed there, so the array indexes the same joblist directly):
 
 ```bash
-# From the repo root on Coeus (activate a Python >= 3.10 env first):
-CPUS=16 PARTITION=medium TIME=2-00:00:00 \
-  PUBSUB_ENV_SETUP='source ~/pubsub/.venv/bin/activate' \
+# From the repo root on Coeus (activate a Python >= 3.10 env first).
+# Maximally-parallel fine mode (recommended): ~138 shards, static clamp.
+SHARD_BY=dataset-clamp-exp CPUS=10 PARTITION=medium TIME=1-00:00:00 THROTTLE=80 \
+  EXTRA_ARGS="--trials 6 --no-log-messages" \
+  PUBSUB_ENV_SETUP='source ~/PubSubPrivacy/.venv/bin/activate' \
   cluster/submit_coeus.sh
-# Submits a 1..N job array (one shard per array task, CPUS cores each as
-# --workers) + a dependent aggregation job (afterok) -> results_cluster/combined/.
-DRY_RUN=1 cluster/submit_coeus.sh              # print the array plan, submit nothing
+DRY_RUN=1 SHARD_BY=dataset-clamp-exp cluster/submit_coeus.sh   # print plan, submit nothing
 ```
 
-Each coarse shard runs `--grid-first --experiment full`, so the §7.5 grid
-search runs first and the full pipeline (sweep + intro/Fig. 1 + tuning + extras
-incl. the §7.10 K_ext latency sweep + single-axis A/B/C/D/F/G/H) consumes the
-grid-optimal params — covering **all** of §7 per shard, with no cross-shard
-coordination. See [`cluster/README.md`](cluster/README.md) for every knob, and
+**Two sharding granularities:**
+
+* **`dataset-clamp-exp` (fine, recommended)** — one shard per
+  `dataset × clamp × experiment`, ~138 shards (static clamp). Submitted in
+  **two SLURM phases**: **phase 1** runs the 24 `grid` shards (the §7.5 grid
+  search split one-per-`(dataset × ε)`, writing `grid_canonical_eps<ε>.json`
+  fragments into a shared `<ds>__<clamp>__grid` dir); **phase 2** runs the 114
+  experiment shards with `--dependency=afterok` on phase 1, where F/G/H/L
+  consume their dataset's merged grid optimum via `--use-grid-config`. The heavy
+  per-level **sweep is split into 8 per-strategy shards per dataset**
+  (`--strategies <s>`) and the **grid into 4 per-ε shards** (`--grid-eps <ε>`)
+  so both long poles spread across nodes — the heavy `energy` dataset fans its
+  work across ~23 nodes instead of one straggler.
+* **`dataset-clamp` (coarse, default)** — one self-contained
+  `--grid-first --experiment full` shard per `dataset × clamp` (6 shards, static
+  clamp, no phases). The grid search runs first and the full in-process pipeline
+  consumes the grid-optimal params — all of §7 per shard, capped at 6 nodes.
+
+See [`cluster/README.md`](cluster/README.md) for every knob, and
 [`cluster/COEUS_RUNBOOK.md`](cluster/COEUS_RUNBOOK.md) for the **step-by-step
-PSU Coeus runbook** (env setup → submit → monitor → results → figures).
+PSU Coeus runbook** (env setup → submit → monitor → **copy results back** →
+figures).
+
+### Copying cluster results back to your machine
+
+The aggregation job builds **`results_cluster/paper_bundle/`** — the curated
+key individual (per-dataset) + combined (cross-dataset) results the paper
+references, in one small section-organized directory (bulky per-release message
+dumps excluded; see its `INDEX.md`). For most purposes scp just that one dir.
+Run these **from your local machine**:
+
+```bash
+# RECOMMENDED: just the curated paper results (small, single download):
+scp -r jacoboli@login1.coeus.rc.pdx.edu:~/PubSubPrivacy/results_cluster/paper_bundle \
+       ./paper_bundle
+
+# The full merged tree (one CSV per artifact, all datasets — larger):
+scp -r jacoboli@login1.coeus.rc.pdx.edu:~/PubSubPrivacy/results_cluster/combined \
+       ./results_cluster_combined
+
+# Everything (combined + paper_bundle + every per-shard dir + joblists + logs):
+scp -r jacoboli@login1.coeus.rc.pdx.edu:~/PubSubPrivacy/results_cluster \
+       ./results_cluster
+
+# rsync is better for large/resumable transfers (skips unchanged files):
+rsync -avz --progress \
+  jacoboli@login1.coeus.rc.pdx.edu:~/PubSubPrivacy/results_cluster/paper_bundle/ \
+  ./paper_bundle/
+
+# Render figures locally from the full tree if you didn't pass PLOTS=1:
+python generate_plots.py --output-dir ./results_cluster_combined
+```
 
 ## Adding a new dataset
 
