@@ -13,25 +13,28 @@ dependent aggregation job.
 
 **Maximize parallelism with the fine `dataset-clamp-exp` granularity** (the
 recommended mode on a real cluster — see Step 2). It splits the work into
-**~138 shards** (6 datasets × {grid×4 per-ε, sweep×8 per-strategy, intro,
-tuning, extras, A, B, C, D, F, G, H, L}, static clamp) scheduled in **two SLURM
-phases**:
+**~354 shards** (6 datasets × {grid×24 per-(ε×trial), sweep×24 per-(strategy×
+sensor-group), intro, tuning, extras, A, B, C, D, F, G, H, L}, static clamp)
+scheduled in **two SLURM phases**:
 
-* **Phase 1** — the §7.5 grid search, **split one shard per (dataset × ε)** (24
-  tasks, run in parallel) so the heavy energy/traffic grids run their epsilons
-  on separate nodes instead of serially. Each shard writes a
-  `grid_canonical_eps<ε>.json` fragment into the shared `<ds>__<clamp>__grid`
-  dir; the downstream consumers merge the fragments automatically.
-* **Phase 2** — the experiment shards (114 tasks, `--dependency=afterok` on
-  phase 1). The per-level **sweep is split into 8 per-strategy shards/dataset**
-  to spread its cost across nodes; F/G/H/L consume their dataset's merged grid
+* **Phase 1** — the §7.5 grid search, **split one shard per (dataset × ε ×
+  trial)** (144 tasks) so the grid runs its **6 noise-seed trials as separate
+  tasks** across nodes. Each shard writes a `grid_trial_eps<ε>_t<trial>.json`
+  full-grid fragment into the shared `<ds>__<clamp>__grid` dir; the downstream
+  consumers **average MAE across the trial fragments** and pick each strategy's
+  optimum automatically (`_load_grid_config`).
+* **Phase 2** — the experiment shards (210 tasks, `--dependency=afterok` on
+  phase 1). The per-level **sweep is split into 8 strategies × 3 sensor-groups =
+  24 shards/dataset** (`--strategies <s> --sensor-shard i/3`) so the heavy
+  `energy` sweep fans across nodes one sensor-group per task (its ~8 h long pole
+  drops to ~⅓); F/G/H/L consume their dataset's merged grid
   optimum via `--use-grid-config`; sweep/A/B/C/D/intro/tuning/extras are
   grid-independent (except F/G/H/L). Every experiment tests subscriptions at
   each topic level.
 
 This is what makes it *maximally* parallel: the heavy `energy` dataset spreads
-its ~19 experiment shards (incl. the 8 per-strategy sweep shards) across ~19
-nodes instead of stranding everything on one straggler shard. The two-level
+its ~35 experiment shards (incl. 24 sweep shards = 8 strategies × 3
+sensor-groups) across dozens of nodes instead of stranding everything on one straggler shard. The two-level
 parallelism is **shards across nodes** × **`--workers` cores within a shard**.
 
 > The coarser default (`dataset-clamp`, 6 shards with the static clamp, each a
@@ -107,25 +110,29 @@ export PUBSUB_ENV_SETUP='source ~/PubSubPrivacy/.venv/bin/activate'
 
 ```bash
 cd ~/PubSubPrivacy
-# Maximally-parallel fine mode (recommended): ~138 shards (static clamp), two-phase.
+# Maximally-parallel fine mode (recommended): ~354 shards (static clamp), two-phase.
 DRY_RUN=1 SHARD_BY=dataset-clamp-exp cluster/submit_coeus.sh
 ```
 
-You should see `scheduling : TWO-PHASE (phase1 grid=24 -> phase2 experiments=114,
-afterok)` and the 138 shard commands (grid shards invoke `-m experiments.grid_search`
-with `--grid-eps`;
-F/G/H/L shards carry `--use-grid-config`; the sweep appears as 8 per-strategy
-shards per dataset). Confirm it looks right.
+You should see `scheduling : TWO-PHASE (phase1 grid=144 -> phase2 experiments=210,
+afterok)` and the 354 shard commands (grid shards invoke `-m experiments.grid_search`
+with `--grid-eps`/`--grid-trial`;
+F/G/H/L shards carry `--use-grid-config`; the sweep appears as 24 shards/dataset
+(8 strategies × 3 sensor-groups)). Confirm it looks right.
 
 ---
 
 ## 2. Submit the full suite (maximally parallel)
 
 ```bash
-# ~138 shards (dataset x experiment, static clamp), 10 cores each (2 shards/
+# ~354 shards (dataset x experiment, static clamp), 10 cores each (2 shards/
 # 20-core node), two SLURM phases.  --trials 6 repeats every config over 6 noise
 # seeds (per-trial rows + mean/std aggregate per dataset); --no-log-messages
 # avoids the per-release message buffer that OOMs the energy sweep.
+# The DP publisher count is ON by default (eps_count = 0.05): n_tau is treated
+# as DP-private and the count spent at each timestamp is charged INSIDE the one
+# w-event budget eps (it takes from the usable eps for releases).  Override with
+# EXTRA_ARGS="... --epsilon-count <v>" (0 = exact count / Kellaris baselines).
 SHARD_BY=dataset-clamp-exp CPUS=10 PARTITION=medium TIME=1-00:00:00 \
   THROTTLE=80 \
   EXTRA_ARGS="--trials 6 --no-log-messages" \
@@ -134,19 +141,18 @@ SHARD_BY=dataset-clamp-exp CPUS=10 PARTITION=medium TIME=1-00:00:00 \
 ```
 
 What it does:
-1. `gen_jobs.sh` writes `results_cluster/joblist.txt` (138 lines) and
-   `submit_coeus.sh` splits it into a grid joblist (24) and an experiment
-   joblist (114).
-2. submits **PHASE 1** job array `1-24` — the §7.5 grid shards (per dataset × ε).
-3. submits **PHASE 2** job array `1-114` with `--dependency=afterok` on phase 1
-   — the sweep(×8 strategies)/intro/tuning/extras/A/B/C/D/F/G/H/L shards
+1. `gen_jobs.sh` writes `results_cluster/joblist.txt` (354 lines) and
+   `submit_coeus.sh` splits it into a grid joblist (144) and an experiment
+   joblist (210).
+2. submits **PHASE 1** job array `1-144` — the §7.5 grid shards (per dataset × ε × trial).
+3. submits **PHASE 2** job array `1-210` with `--dependency=afterok` on phase 1
+   — the sweep(×24 = 8 strategies × 3 sensor-groups)/intro/tuning/extras/A/B/C/D/F/G/H/L shards
    (F/G/H/L read their grid optimum).
 4. submits a **dependent** aggregation job (`afterok` on phase 2,
    `coeus_aggregate.sbatch`) merging every shard into `results_cluster/combined/`.
 
 It prints all three job ids. `THROTTLE=80` caps concurrent tasks at 80; with
-`CPUS=10` that fits the 114 experiment shards across the 86×20-core nodes (2
-shards/node, no over-subscription). Raise/drop `THROTTLE` to use more nodes / be
+`CPUS=10` that fits the 210 experiment shards across the 86×20-core nodes. Raise/drop `THROTTLE` to use more nodes / be
 gentler on the queue. `--trials 6` makes each shard do 6× the DP runs, but they
 fan out over the shard's 10 workers, so per-shard wall time barely moves.
 
@@ -272,9 +278,13 @@ EXTRA_ARGS="--quick --max-rows 5000 --max-energy-timestamps 3000 --max-traffic-r
   joblist directly. (GNU parallel is the local / multi-node-SSH path; see
   `run_cluster.sh`.)
 * **Walltime**: the `energy` dataset is the largest (~36k windows/sensor). In
-  the fine mode its work is split across ~19 experiment shards, so a 1-day `TIME`
-  per shard is ample; in coarse mode one shard does all of energy, so give it
-  2 days (`medium` caps at 7).
+  the fine mode its work is split across ~35 experiment shards — and each sweep
+  shard now covers ONE sensor (`--sensor-shard i/3`) and each grid shard ONE
+  (ε, trial) — so a 1-day `TIME` per shard is ample; in coarse mode one shard
+  does all of energy, so give it 2 days (`medium` caps at 7).
+* **Array size**: phase 1 is `1-144` and phase 2 `1-210`; both are well under
+  SLURM's default `MaxArraySize` (1001+ on Coeus), so no array-size tuning is
+  needed. `THROTTLE` still caps how many run at once.
 * **Reproducibility**: every DP run reseeds (`run_experiment.py --seed`), so
   array tasks are order-independent and results are deterministic per seed.
 * **Live-broker Experiment E** is intentionally NOT part of the array (it needs

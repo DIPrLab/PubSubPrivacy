@@ -22,6 +22,9 @@
 #                 'grid' = paper Sec. 7.5; sweep is split per SWEEP_STRATEGIES)
 #   SWEEP_STRATEGIES  one sweep shard per strategy in fine mode (default: 8)
 #   GRID_EPS          one grid shard per epsilon in fine mode (default: 0.5 1 2 4)
+#   GRID_TRIALS       grid noise-seed trials, each its own task (default: 6)
+#   SWEEP_SENSOR_SHARDS  split each sweep strategy across N sensor-groups
+#                        (default: 3; 1 disables -- shortens the energy sweep)
 #   LOG_MESSAGES      1 to re-enable per-release message CSVs (default: 0 = off)
 #   WORKERS      --workers per shard (intra-node fan-out)(default: 0 = cpu-1)
 #   EXTRA_ARGS   appended verbatim to every command      (e.g. "--max-rows 5000")
@@ -75,6 +78,14 @@ SWEEP_STRATEGIES="${SWEEP_STRATEGIES:-uniform sample budget_distribution budget_
 # _load_grid_config merges them for the F/G/H/L consumers.  Must match the
 # epsilon set the experiments use (experiments/_common.py eps_values).
 GRID_EPS="${GRID_EPS:-0.5 1.0 2.0 4.0}"
+# The §7.5 grid runs GRID_TRIALS independent noise seeds, each its own SLURM
+# task; _load_grid_config averages MAE across them before choosing the optimum.
+GRID_TRIALS="${GRID_TRIALS:-6}"
+# Split each sweep strategy across this many sensor-groups (round-robin) so a
+# heavy multi-sensor dataset (energy has 3 sensors) spreads its long sweep
+# across nodes.  1 = no sensor split.  3 keeps the energy non-gated sweep
+# (the ~8 h long pole) to roughly a third per task.
+SWEEP_SENSOR_SHARDS="${SWEEP_SENSOR_SHARDS:-3}"
 
 # token -> experiments.<module>
 _module_of() {
@@ -154,18 +165,31 @@ for ds in $DATASETS; do
       dataset-clamp-exp)
         for exp in $EXPERIMENTS; do
           if [ "$exp" = "sweep" ]; then
-            # Split the heavy per-level sweep into one shard per strategy.
+            # Split the heavy per-level sweep per strategy AND (when
+            # SWEEP_SENSOR_SHARDS>1) per sensor-group, so a multi-sensor dataset
+            # like energy fans its ~8 h sweep across nodes one sensor per task.
             for strat in $SWEEP_STRATEGIES; do
-              EXTRA_ARGS="$EXTRA_ARGS --strategies $strat" \
-                emit "$ds" "$clamp" sweep "${ds}__${clamp}__sweep_${strat}"
+              if [ "${SWEEP_SENSOR_SHARDS:-1}" -gt 1 ]; then
+                for si in $(seq 0 $((SWEEP_SENSOR_SHARDS - 1))); do
+                  EXTRA_ARGS="$EXTRA_ARGS --strategies $strat --sensor-shard $si/$SWEEP_SENSOR_SHARDS" \
+                    emit "$ds" "$clamp" sweep "${ds}__${clamp}__sweep_${strat}_s${si}"
+                done
+              else
+                EXTRA_ARGS="$EXTRA_ARGS --strategies $strat" \
+                  emit "$ds" "$clamp" sweep "${ds}__${clamp}__sweep_${strat}"
+              fi
             done
           elif [ "$exp" = "grid" ]; then
-            # Split the §7.5 grid into one shard per epsilon (across nodes).  All
-            # share the ${ds}__${clamp}__grid dir, so the per-eps canonical
-            # fragments land together for the merge the F/G/H/L consumers read.
+            # Split the §7.5 grid into one shard per (epsilon x trial) across
+            # nodes.  All share the ${ds}__${clamp}__grid dir, so the per-trial
+            # full-grid fragments land together; _load_grid_config averages MAE
+            # over the trials and picks each strategy's optimum for the F/G/H/L
+            # consumers.  GRID_TRIALS independent noise seeds, as separate tasks.
             for geps in $GRID_EPS; do
-              EXTRA_ARGS="$EXTRA_ARGS --grid-eps $geps" \
-                emit "$ds" "$clamp" grid "${ds}__${clamp}__grid"
+              for gt in $(seq 0 $((GRID_TRIALS - 1))); do
+                EXTRA_ARGS="$EXTRA_ARGS --grid-eps $geps --grid-trial $gt" \
+                  emit "$ds" "$clamp" grid "${ds}__${clamp}__grid"
+              done
             done
           else
             emit "$ds" "$clamp" "$exp" "${ds}__${clamp}__${exp}"

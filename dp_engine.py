@@ -83,11 +83,19 @@ class PrivacyConfig:
         payload_bound : global clamp range R = sup_p (b_p - a_p)
         epsilon_count : eps_count, the per-step budget spent to release a
                         differentially private publisher count |P_tau| with
-                        sensitivity 1 when deciding release eligibility / when
-                        walking up the topic hierarchy (paper Sec. 6.3 step 1,
-                        Sec. 6.5 step 3, Table 3).  0 disables the DP count and
-                        falls back to the exact n_tau (Kellaris-style baselines
-                        that never gate on a population count).
+                        sensitivity 1 (paper Sec. 6.3 step 1, Sec. 6.5 step 3,
+                        Table 3).  n_tau is DP-private: ONE noisy count is drawn
+                        per timestamp/scope and reused for the P_min gate, the
+                        Laplace-scale denominator, and the n-weighted
+                        denominator (reuse is free by post-processing), so the
+                        exact n_tau never enters the released noise scale.
+                        eps_count is charged INSIDE the single w-event budget
+                        eps: the count spent at each timestamp takes from the
+                        usable eps, so Sum_{window} (eps_count draws + releases)
+                        <= eps (the value-driven allocators run against
+                        eps_inner = eps - w*eps_count).  Default 0.05.  0 disables
+                        the DP count and falls back to the exact n_tau
+                        (Kellaris-style baselines that never gate on a count).
 
     Scheduling hyperparameters (do NOT enter the DP calculation):
         min_publishers     : P_min, the publisher threshold for P-allocation
@@ -104,8 +112,9 @@ class PrivacyConfig:
     payload_bound: float  # R
     strategy: BudgetStrategy = BudgetStrategy.UNIFORM
     ba_threshold: float = 0.1
-    # DP count budget (Table 3): separate from epsilon, composes additively.
-    epsilon_count: float = 0.0
+    # DP count budget (Table 3): charged INSIDE the single w-event budget
+    # epsilon (the per-timestamp count draw takes from the usable epsilon).
+    epsilon_count: float = 0.05
     # P_max sensitivity-binding cap (Sec. 6.5).  None => no upper cap.
     max_publishers: Optional[int] = None
 
@@ -194,6 +203,12 @@ class StreamState:
         past_window = max(0, self.config.window_size - 1)
         self.budget_window = deque(maxlen=past_window)
         self.n_window = deque(maxlen=past_window)
+        # Budget the value-driven allocators may spend per timestamp.  Equals
+        # the full epsilon for the Kellaris baselines; for population-aware
+        # strategies with a DP count it is reduced by the per-window count
+        # reservation (w * eps_count) so that releases + count draws together
+        # never breach Sum_{window} eps_j <= eps.  Set per call in release().
+        self._alloc_eps = self.config.epsilon
         # BD forward buffer: length w, zero-initialized, no maxlen so we can
         # safely popleft + append per tick.
         self.bd_forward = deque([0.0] * self.config.window_size)
@@ -218,10 +233,12 @@ class StreamState:
         disabled and the exact n_tau is used (Kellaris-style baselines that do
         not gate on a population threshold).
 
-        IMPORTANT: the DP count drives only the *eligibility / scope* decision
-        (gate, hierarchy walk).  The noise calibration still uses the actual
-        pooled multiplicity, which is public under the neighboring relation of
-        Definition 5.1 (P_tau is held fixed across neighbors).
+        The caller draws this ONCE per timestamp/scope and reuses the returned
+        value for every downstream use of the multiplicity (the P_min gate, the
+        Laplace-scale denominator, and the n-weighted denominator).  Reuse is
+        free by post-processing, and because the exact n_tau is treated as
+        DP-private it never enters the released noise scale -- only this noisy
+        count does.
         """
         if self.config.epsilon_count <= 0:
             return int(n_tau)
@@ -250,7 +267,7 @@ class StreamState:
         if self.last_released is None or n_tau <= 0:
             return float("inf"), 0.0
         w = self.config.window_size
-        eps_dissim = self.config.epsilon / (2 * w)
+        eps_dissim = self._alloc_eps / (2 * w)
         sensitivity = self.config.payload_bound / n_tau
         scale = sensitivity / eps_dissim
         raw_dis = abs(aggregate - self.last_released)
@@ -265,14 +282,14 @@ class StreamState:
     # ``dissim_eps + pub_eps``; both participate in the sliding-window cap.
 
     def _alloc_uniform(self) -> tuple[float, float, bool]:
-        return 0.0, self.config.epsilon / self.config.window_size, False
+        return 0.0, self._alloc_eps / self.config.window_size, False
 
     def _alloc_sample(self) -> tuple[float, float, bool]:
         # Release full budget every w-th eligible timestamp; else skip.
         # (tau - 1) % w == 0 handles w == 1 (every tau publishes) and
         # matches the paper's "i mod w == 1" for w > 1.
         if (self.current_tau - 1) % self.config.window_size == 0:
-            return 0.0, self.config.epsilon, False
+            return 0.0, self._alloc_eps, False
         return 0.0, 0.0, True
 
     def _alloc_budget_distribution(
@@ -299,14 +316,14 @@ class StreamState:
             if noisy_dis < threshold:
                 # Forward the base share across the w-1 future slots.
                 if w > 1 and len(self.bd_forward) >= w - 1:
-                    per_slot = (self.config.epsilon / (2 * w)) / (w - 1)
+                    per_slot = (self._alloc_eps / (2 * w)) / (w - 1)
                     for i in range(w - 1):
                         self.bd_forward[i] += per_slot
                 return eps_dissim, 0.0, True
 
-        pub_share = self.config.epsilon / (2 * w) + pending_now
+        pub_share = self._alloc_eps / (2 * w) + pending_now
         pub_share = max(pub_share, 0.0)
-        pub_share = min(pub_share, self.config.epsilon / 2)
+        pub_share = min(pub_share, self._alloc_eps / 2)
         return eps_dissim, pub_share, False
 
     def _alloc_budget_absorption(
@@ -334,7 +351,7 @@ class StreamState:
         slots, so the pub mass in the window never exceeds w * eps/(2w).
         """
         w = self.config.window_size
-        base = self.config.epsilon / (2 * w)
+        base = self._alloc_eps / (2 * w)
         noisy_dis, eps_dissim = self._private_dissimilarity(aggregate, n_tau)
 
         # Nullification: skip by fiat, regardless of dissimilarity.
@@ -392,7 +409,7 @@ class StreamState:
         inv_total = sum(1.0 / m for m in self.n_window if m > 0) + 1.0 / n_tau
         if inv_total <= 0:
             return 0.0, 0.0, True
-        eps_nom = self.config.epsilon * (1.0 / n_tau) / inv_total
+        eps_nom = self._alloc_eps * (1.0 / n_tau) / inv_total
         return 0.0, eps_nom, False
 
     # ---- dispatcher -----------------------------------------------------
@@ -428,7 +445,8 @@ class StreamState:
     # ---- public release entry point -------------------------------------
 
     def release(self, aggregate: float, n_tau: int,
-                n_gate: Optional[int] = None) -> Optional[float]:
+                n_gate: Optional[int] = None,
+                n_count_draws: int = 1) -> Optional[float]:
         """
         Process one aggregate stream element with multiplicity n_tau.
 
@@ -439,12 +457,16 @@ class StreamState:
 
         ``n_gate`` lets the CALLER supply the (already differentially private)
         publisher count that the gate should compare against P_min — used by the
-        broker plugin, which draws and charges ONE DP count during its
+        broker plugin, which draws and charges the DP count(s) during its
         Algorithm-1 hierarchy walk and must not have the engine re-gate on the
         exact pooled count (that would be a second, inconsistent gate).  When
         ``n_gate`` is None (the offline path) the engine draws its own DP count
         from ``epsilon_count`` as before, so the gate is single-sourced either
-        way.
+        way.  ``n_count_draws`` is how many eps_count draws the caller made for
+        THIS element (offline: 1; broker walk: leaf + one per probed ancestor),
+        so the full per-timestamp count cost ``n_count_draws * eps_count`` is
+        charged inside the window budget eps — the caller must ensure the window
+        can afford it (the plugin pre-checks before each probe).
         """
         self.current_tau += 1
 
@@ -457,32 +479,68 @@ class StreamState:
         else:
             self._bd_pending_now = 0.0
 
-        # --- P-allocation release gate ---------------------------------
-        # The gate compares a *differentially private* count |P_tau| (released
-        # under eps_count, sensitivity 1) against P_min, per paper Sec. 6.3
-        # step 1.  When eps_count == 0 this is the exact n_tau.  The DP count is
-        # only paid for population-aware strategies (P-gated / n-weighted);
-        # the Kellaris baselines never gate on a count so they never charge it.
-        # If the caller already produced the gate count (``n_gate``), use it
-        # verbatim (no second draw, no double charge) so the broker's
-        # Algorithm-1 decision is the SINGLE authority on release vs. defer.
-        if is_p_gated(self.config.strategy) or self.config.strategy == BudgetStrategy.N_WEIGHTED:
-            gate_count = self._dp_count(n_tau) if n_gate is None else int(n_gate)
-            if gate_count < self.config.min_publishers:
+        # --- DP publisher count (eps_count) + P-allocation gate ----------
+        # For our population-aware strategies the multiplicity n_tau is
+        # DP-PRIVATE.  We draw ONE noisy count |P_tau| under eps_count
+        # (sensitivity 1, scale 1/eps_count) and REUSE that single value for
+        # everything downstream -- the P_min gate, the Laplace-scale
+        # denominator, and the n-weighted denominator -- so the exact private
+        # n_tau never leaves the broker and reuse is free by post-processing
+        # (paper Sec. 6.3 step 1, Table 3).  eps_count is charged INSIDE the
+        # w-event budget eps: the count draw counts toward the sliding-window
+        # sum, so Sum_{window} (eps_count draws + releases) <= eps and the
+        # count utilizes the same budgeted epsilon as the releases.  Each of the
+        # w timestamps may draw a count, so the value-driven allocators run
+        # against eps_inner = eps - w * eps_count (reserved below).  The Kellaris
+        # baselines (Uniform/Sample/BD/BA) do not gate on a count and keep the
+        # exact n_tau (public in their row-addition model).  A caller that
+        # already drew the count (``n_gate``, the broker path) supplies it
+        # verbatim so the broker's Algorithm-1 decision is the single authority.
+        eps_count_tau = 0.0
+        population_aware = (is_p_gated(self.config.strategy)
+                            or self.config.strategy == BudgetStrategy.N_WEIGHTED)
+        if population_aware:
+            ec = self.config.epsilon_count
+            # Pre-check: never draw the DP count if the window can't pay for it,
+            # else the eps_count spend would breach the w-event invariant.
+            if n_gate is None and ec > 0 and self._budget_remaining() < ec:
                 self._record(aggregate, self.last_released, 0.0, n_tau, deferred=True)
                 return self.last_released
+            n_dp = self._dp_count(n_tau) if n_gate is None else int(n_gate)
+            # Offline draws ONE count here; the broker may have drawn several
+            # (leaf + one per probed ancestor) -- or zero, if its budget-aware
+            # pre-check could not afford even the leaf count -- and reports the
+            # total so the full per-timestamp count cost is charged inside the
+            # window budget.
+            n_draws = 1 if n_gate is None else max(0, int(n_count_draws))
+            eps_count_tau = ec * n_draws if ec > 0 else 0.0
+            if n_dp < self.config.min_publishers:
+                # Deferred -- the count draw already spent eps_count, so it still
+                # consumes window budget.
+                self._record(aggregate, self.last_released, eps_count_tau, n_tau, deferred=True)
+                return self.last_released
+        else:
+            n_dp = n_tau
 
-        # Must have at least one publisher for the mean to be defined.
-        if n_tau <= 0:
-            self._record(aggregate, self.last_released, 0.0, n_tau, deferred=True)
+        # Must have at least one (effective) publisher for the mean to be defined.
+        if n_dp <= 0:
+            self._record(aggregate, self.last_released, eps_count_tau, n_tau, deferred=True)
             return self.last_released
 
         # P_max cap (Sec. 6.5): fold at most P_max publishers into the mean so
         # the sensitivity Delta_f = R/n_eff changes by a bounded amount across
-        # stream elements.  n_eff drives the Laplace scale; the n_window used by
-        # n-weighted allocation also sees the capped value so its denominator
-        # is consistent with the calibrated noise.
-        n_eff = self.config.effective_n(n_tau)
+        # stream elements.  For population-aware strategies n_eff is derived
+        # from the DP count n_dp (so the released noise scale reveals nothing
+        # about the exact private count); the n_window used by n-weighted
+        # allocation also stores this DP-count-derived value, keeping its
+        # denominator consistent with the calibrated noise.
+        n_eff = self.config.effective_n(n_dp)
+
+        # Reserve the per-window DP-count budget so releases + count draws
+        # together stay under eps: eps_inner = eps - w * eps_count
+        # (eps_count == 0 -> eps_inner == eps).
+        self._alloc_eps = max(
+            0.0, self.config.epsilon - self.config.window_size * eps_count_tau)
 
         # Snapshot the BA absorb/nullify counters BEFORE allocation so that, if
         # the defensive sliding-window cap below turns a planned BA *release*
@@ -501,7 +559,9 @@ class StreamState:
         # GUARANTEES the w-event budget invariant holds regardless of any
         # sub-mechanism edge case (DP correctness never depends on the
         # sub-mechanism being perfectly tight).
-        remaining = self._budget_remaining()
+        # eps_count is charged inside the one w-event budget, so the release
+        # shares what is left of eps after this timestamp's count draw.
+        remaining = self._budget_remaining() - eps_count_tau
         total_eps = dissim_eps + pub_eps
         capped = False
         if total_eps > remaining:
@@ -514,7 +574,7 @@ class StreamState:
         # Floor on pub_eps: releasing with a near-zero share would give a
         # Laplace scale that explodes numerically.  Treat anything below
         # 1e-6 * (eps / w) as a skip (equivalent to the window being full).
-        min_pub_eps = 1e-6 * (self.config.epsilon / self.config.window_size)
+        min_pub_eps = 1e-6 * (self._alloc_eps / self.config.window_size)
         if skip or pub_eps <= min_pub_eps:
             # No publication at this tau; record dissim cost (may be 0 for
             # strategies without M_{i,1}) and repeat the last release.
@@ -526,7 +586,8 @@ class StreamState:
                 # invariant is unaffected.
                 self.ba_nullify_remaining = _ba_null_before
                 self.ba_skipped_since_last_pub = _ba_skipped_before
-            self._record(aggregate, self.last_released, total_eps, n_eff, deferred=True)
+            self._record(aggregate, self.last_released, eps_count_tau + total_eps,
+                         n_eff, deferred=True)
             return self.last_released
 
         # Sensitivity uses the post-P_max effective multiplicity (n_eff).
@@ -536,7 +597,7 @@ class StreamState:
 
         self.last_released = released
         self.last_true_aggregate = aggregate
-        self._record(aggregate, released, total_eps, n_eff, deferred=False)
+        self._record(aggregate, released, eps_count_tau + total_eps, n_eff, deferred=False)
         return released
 
     def _record(self, aggregate, released, eps_tau, n_tau, deferred):

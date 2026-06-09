@@ -35,11 +35,11 @@ JOBS=8 cluster/run_cluster.sh
 # See the exact plan without running anything.
 DRY_RUN=1 cluster/run_cluster.sh
 
-# MAXIMALLY parallel: finer shards (dataset x clamp x experiment, ~138 shards
+# MAXIMALLY parallel: finer shards (dataset x clamp x experiment, ~354 shards
 # static clamp) for a big node pool, 32 concurrent.  run_cluster.sh /
 # submit_coeus.sh run the grid shards in PHASE 1 and the experiment shards in
 # PHASE 2 automatically (F/G/H/L consume the grid via --use-grid-config; the
-# heavy sweep is split into 8 per-strategy shards/dataset and the grid into 4
+# heavy sweep is split into 8 strategies x 3 sensor-groups/dataset and the grid into 24
 # per-eps shards/dataset); no manual two-step.
 SHARD_BY=dataset-clamp-exp JOBS=32 cluster/run_cluster.sh
 

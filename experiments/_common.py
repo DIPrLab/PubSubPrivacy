@@ -49,7 +49,7 @@ def make_parser(description: str) -> argparse.ArgumentParser:
     p.add_argument("--trials", type=int, default=1,
                    help="Independent noise-seed repetitions per config "
                         "(per-trial rows + mean/std aggregate).")
-    p.add_argument("--epsilon-count", type=float, default=0.0,
+    p.add_argument("--epsilon-count", type=float, default=0.05,
                    help="eps_count for the DP publisher count (Sec. 6.3 step 1).")
     p.add_argument("--max-publishers", type=int, default=None,
                    help="P_max sensitivity-binding cap (Sec. 6.5).")
@@ -73,6 +73,18 @@ def make_parser(description: str) -> argparse.ArgumentParser:
                    help="Restrict the §7.5 grid search to this single epsilon and "
                         "write a grid_canonical_eps<eps>.json fragment, so the "
                         "grid phase can be split across nodes per epsilon "
+                        "(experiments.grid_search only).")
+    p.add_argument("--sensor-shard", default=None,
+                   help="Round-robin sensor sharding 'i/k': process only "
+                        "sensors[i::k] of each dataset, so a heavy dataset's "
+                        "per-level sweep can run one task per sensor-group on "
+                        "separate nodes (shortens the energy sweep long pole).")
+    p.add_argument("--grid-trial", type=int, default=None,
+                   help="Run ONE trial (noise seed) of the §7.5 grid and write a "
+                        "per-trial full-grid fragment, so the grid's --trials "
+                        "repetitions can be split across nodes as separate tasks. "
+                        "_load_grid_config averages MAE across the trial fragments "
+                        "before picking each strategy's optimum "
                         "(experiments.grid_search only).")
     p.add_argument("--quick", action="store_true", help="Reduced grids.")
     p.add_argument("--no-log-messages", dest="log_messages", action="store_false",
@@ -105,6 +117,15 @@ def resolve(args) -> argparse.Namespace:
         args.s_values = [1, 2, 4, 6]
         args.eps_values = [0.5, 1.0, 2.0, 4.0]
         args.w_values = [4, 8, 10, 12]
+    # Optional round-robin sensor shard 'i/k' -> args._sensor_shard = (i, k).
+    args._sensor_shard = None
+    if getattr(args, "sensor_shard", None):
+        try:
+            i, k = (int(x) for x in str(args.sensor_shard).split("/"))
+            if k > 0 and 0 <= i < k:
+                args._sensor_shard = (i, k)
+        except Exception:
+            raise SystemExit(f"--sensor-shard must be 'i/k' (got {args.sensor_shard!r})")
     # Canonical grid config (Sec. 7.5): explicit path, else auto-detect.
     path = args.use_grid_config or core._grid_canonical_path(args.output_dir)
     args.grid_config = core._load_grid_config(path)

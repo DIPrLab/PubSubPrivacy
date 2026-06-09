@@ -729,7 +729,7 @@ not installed there, so the array indexes the same joblist directly):
 
 ```bash
 # From the repo root on Coeus (activate a Python >= 3.10 env first).
-# Maximally-parallel fine mode (recommended): ~138 shards, static clamp.
+# Maximally-parallel fine mode (recommended): ~354 shards, static clamp.
 SHARD_BY=dataset-clamp-exp CPUS=10 PARTITION=medium TIME=1-00:00:00 THROTTLE=80 \
   EXTRA_ARGS="--trials 6 --no-log-messages" \
   PUBSUB_ENV_SETUP='source ~/PubSubPrivacy/.venv/bin/activate' \
@@ -740,14 +740,15 @@ DRY_RUN=1 SHARD_BY=dataset-clamp-exp cluster/submit_coeus.sh   # print plan, sub
 **Two sharding granularities:**
 
 * **`dataset-clamp-exp` (fine, recommended)** — one shard per
-  `dataset × clamp × experiment`, ~138 shards (static clamp). Submitted in
-  **two SLURM phases**: **phase 1** runs the 24 `grid` shards (the §7.5 grid
+  `dataset × clamp × experiment`, ~354 shards (static clamp). Submitted in
+  **two SLURM phases**: **phase 1** runs the 144 `grid` shards (the §7.5 grid
   search split one-per-`(dataset × ε)`, writing `grid_canonical_eps<ε>.json`
   fragments into a shared `<ds>__<clamp>__grid` dir); **phase 2** runs the 114
   experiment shards with `--dependency=afterok` on phase 1, where F/G/H/L
   consume their dataset's merged grid optimum via `--use-grid-config`. The heavy
-  per-level **sweep is split into 8 per-strategy shards per dataset**
-  (`--strategies <s>`) and the **grid into 4 per-ε shards** (`--grid-eps <ε>`)
+  per-level **sweep is split into 8 strategies × 3 sensor-groups per dataset**
+  (`--strategies <s> --sensor-shard i/3`) and the **grid into 24 per-(ε×trial)
+  shards** (`--grid-eps <ε> --grid-trial <t>`, its 6 trials as separate tasks)
   so both long poles spread across nodes — the heavy `energy` dataset fans its
   work across ~23 nodes instead of one straggler.
 * **`dataset-clamp` (coarse, default)** — one self-contained

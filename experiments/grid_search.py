@@ -111,15 +111,22 @@ def main():
     # experiments still point --use-grid-config at grid_canonical.json;
     # _load_grid_config merges every fragment in that directory.
     grid_eps = getattr(args, "grid_eps", None)
-    if grid_eps is not None:
-        eps_values = [grid_eps]
-        canonical = f"grid_canonical_eps{grid_eps}.json"
+    grid_trial = getattr(args, "grid_trial", None)
+    eps_values = [grid_eps] if grid_eps is not None else args.eps_values
+    if grid_trial is not None:
+        # Per-trial shard: write a FULL-grid fragment at this trial's seed; the
+        # merge in _load_grid_config averages MAE across trials and then picks
+        # each strategy's optimum.  One SLURM task per (eps, trial).
+        suffix = f"_eps{grid_eps}" if grid_eps is not None else ""
+        core._run_grid_search_block(
+            args, args._targets, args._clamp_modes, eps_values, args.strategies,
+            trial=grid_trial, full_fragment=f"grid_trial{suffix}_t{grid_trial}.json")
     else:
-        eps_values = args.eps_values
-        canonical = "grid_canonical.json"
-    core._run_grid_search_block(
-        args, args._targets, args._clamp_modes, eps_values, args.strategies,
-        canonical_filename=canonical)
+        canonical = (f"grid_canonical_eps{grid_eps}.json"
+                     if grid_eps is not None else "grid_canonical.json")
+        core._run_grid_search_block(
+            args, args._targets, args._clamp_modes, eps_values, args.strategies,
+            canonical_filename=canonical)
 
 
 if __name__ == "__main__":

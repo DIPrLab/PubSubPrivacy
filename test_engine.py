@@ -80,10 +80,11 @@ def test_window_budget_invariant_pmax_and_count():
         for i in range(len(spent)):
             s = sum(spent[max(0, i - w + 1): i + 1])
             assert s <= eps + tol, f"{strat}: window at {i} spent {s:.6f} > {eps}"
-        # eps_count is tracked separately and composes additively (NOT part of
-        # the w-event budget) — it must be > 0 here since the gate ran.
+        # eps_count is charged INSIDE the window budget (it is part of the
+        # budgets_spent the invariant above checks) — it must be > 0 here since
+        # the gate ran and drew DP counts.
         assert st.eps_count_spent > 0, f"{strat}: eps_count not charged"
-    print("  [ok] invariant holds with P_max cap + eps_count; eps_count tracked separately")
+    print("  [ok] invariant holds with P_max cap + eps_count charged inside eps")
 
 
 def test_deferred_flags_consistent():
@@ -99,20 +100,30 @@ def test_deferred_flags_consistent():
 
 
 def test_pgate_defers_below_P():
-    """A high P_min on a small pool must defer (repeat last release), spend no
-    w-event budget on the gate, but still charge eps_count for the DP count."""
+    """A high P_min on a small pool must defer (repeat last release) and never
+    emit a fresh release.  Under "eps_count inside eps", each gated timestamp
+    spends exactly eps_count (the DP count draw) -- or 0 once the sliding window
+    can no longer afford another count -- and never a publication share, with
+    the w-event window sum always <= eps."""
     np.random.seed(0)
-    cfg = PrivacyConfig(epsilon=1.0, window_size=8, min_publishers=99,
+    eps, w, ec, tol = 1.0, 8, 0.1, 1e-9
+    cfg = PrivacyConfig(epsilon=eps, window_size=w, min_publishers=99,
                         payload_bound=100.0,
                         strategy=BudgetStrategy.P_GATED_UNIFORM,
-                        epsilon_count=0.5)
+                        epsilon_count=ec)
     st = StreamState(config=cfg)
     for t in range(50):
         st.release(50.0 + t, 3)   # pool of 3 always < P_min=99 -> always gated
     assert st.releases == 0, "no release should pass a P_min=99 gate on pool=3"
-    assert all(b == 0.0 for b in st.budgets_spent), "gated taus spend no w-event budget"
+    # Every per-tau spend is either a count draw (eps_count) or nothing -- never
+    # a publication share.
+    assert all(abs(b) < tol or abs(b - ec) < tol for b in st.budgets_spent), \
+        "gated taus spend only eps_count (or 0), never a release share"
+    # The count spend still obeys the w-event window invariant.
+    for i in range(len(st.budgets_spent)):
+        assert sum(st.budgets_spent[max(0, i - w + 1): i + 1]) <= eps + tol
     assert st.eps_count_spent > 0, "the DP count is still paid at the gate"
-    print("  [ok] P-gate defers below P_min: 0 releases, 0 w-event spend, eps_count charged")
+    print("  [ok] P-gate defers below P_min: 0 releases, only eps_count spent, window invariant holds")
 
 
 def test_uniform_scale_formula():

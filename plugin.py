@@ -66,14 +66,6 @@ class TopicBuffer:
             self.start_time = now if now is not None else time.time()
         self.payloads[publisher_id] = value
 
-    def merge_from(self, other: "TopicBuffer"):
-        self.payloads.update(other.payloads)
-        # Inherit the earliest observed start_time; useful when a scope walk
-        # pools buffers whose intervals began at slightly different moments.
-        if other.start_time is not None:
-            if self.start_time is None or other.start_time < self.start_time:
-                self.start_time = other.start_time
-
     def clear(self):
         self.payloads.clear()
         self.extensions = 0
@@ -323,7 +315,8 @@ class PrivacyPlugin:
         merged.start_time = earliest_start
         return merged
 
-    def _scope_walk(self, topic: str, skip_leaf: bool = False
+    def _scope_walk(self, topic: str, skip_leaf: bool = False,
+                    max_probes: int | None = None
                     ) -> tuple[str, TopicBuffer, int]:
         """Walk up the topic tree to the first clamp-compatible ancestor with
         a DP count |P_tau^R(s)| >= P.  Returns (scope, pooled_buffer, n_gate),
@@ -334,7 +327,10 @@ class PrivacyPlugin:
 
         ``skip_leaf`` starts the walk at parent(topic) when the caller has
         already drawn (and charged) a DP count at the leaf scope, so the leaf
-        is not re-probed / re-charged.
+        is not re-probed / re-charged.  ``max_probes`` caps how many ancestor
+        levels may be probed (each spends one eps_count); the caller sets it so
+        the walk's count spend cannot exceed the remaining w-event budget --
+        when it runs out the walk stops at the deepest scope reached so far.
         """
         R = self._payload_range_for(topic)
         # Reference clamp: use the leaf-topic's declared bounds.
@@ -348,6 +344,8 @@ class PrivacyPlugin:
         scopes = self._ancestors(topic)
         if skip_leaf and len(scopes) > 1:
             scopes = scopes[1:]
+        if max_probes is not None:
+            scopes = scopes[:max(0, int(max_probes))]
         last_scope, last_buf, last_n_gate = topic, TopicBuffer(), 0
         for scope in scopes:
             buf = self._clamp_compatible_buffer(scope, ref, R)
@@ -377,50 +375,78 @@ class PrivacyPlugin:
             # would otherwise be silently dropped).  stream.release() is called
             # AFTER the lock since only this timer thread touches stream state.
             extend = False
+            defer_no_budget = False
+            n_count_draws = 0
             with self._lock:
                 buf_leaf = self._buffers[leaf]
                 leaf_n = buf_leaf.num_publishers
+                stream = self._get_or_create_stream(leaf)
 
-                # Paper Sec. 6.3 step 1 / Sec. 6.7: any publisher count released
-                # to drive a decision (the interval-extension check AND the
-                # release-eligibility gate) is DIFFERENTIALLY PRIVATE -- one
-                # eps_count (sensitivity 1) per interval-boundary check.  The
-                # same noisy count drives both the extend and the gate decision
-                # this tick.
-                leaf_n_gate = self._dp_count(leaf_n) if needs_walk else leaf_n
+                # Budget-aware DP counting: each eps_count draw (leaf gate +
+                # every walk probe) takes from the SAME w-event budget eps, so
+                # cap the number of draws this tick to what the window can still
+                # afford (floor(remaining / eps_count)).  This guarantees the
+                # leaf + walk count spend never breaches Sum_{window} <= eps.
+                ec = self.epsilon_count
+                affordable = ((1 << 30) if (not needs_walk or ec <= 0)
+                              else int(stream._budget_remaining() / ec))
+                ec_before = self.eps_count_spent
 
-                # Adaptive interval extension (Sec. 6.7): hold the buffer open
-                # one more Delta_t when the DP leaf count is below P.
-                if (needs_walk and leaf_n_gate < self.min_publishers
-                        and self.k_ext > 0 and buf_leaf.extensions < self.k_ext):
-                    buf_leaf.extensions += 1
-                    extend = True
-                else:
-                    scope, pooled = (leaf, buf_leaf)
-                    # The DP count that the P-gate decision is based on: the
-                    # leaf count by default, or the walk's final scope count if
-                    # we walk up.  This single noisy count is handed to
-                    # stream.release(n_gate=...) so the engine does NOT re-gate
-                    # on the exact pooled count (no second, inconsistent gate).
-                    n_gate_decision = leaf_n_gate
-                    if (needs_walk and leaf_n_gate < self.min_publishers
-                            and self.enable_hierarchy_walk):
-                        # Algorithm 1 walk (charges eps_count per ancestor),
-                        # under the same lock so the pool snapshot is consistent.
-                        scope, pooled, n_gate_decision = self._scope_walk(
-                            leaf, skip_leaf=True)
-                    # P_max sensitivity cap (Sec. 6.5): fold at most P_max
-                    # publishers into the aggregate.
-                    pooled = self._truncate_to_pmax(pooled, self.max_publishers)
-                    aggregate = pooled.mean()
-                    n_tau = pooled.num_publishers
-                    # t_start = start of the buffering interval (Def. 3.1), NOT
-                    # shifted by K_ext extensions.
-                    t_start = (pooled.start_time if pooled.start_time is not None
-                               else time.time())
-                    # Clear the LEAF buffer (ancestor buffers drain on their own
-                    # tick) -- still under the lock, so no message is dropped.
+                if needs_walk and ec > 0 and affordable < 1:
+                    # Window cannot pay for even the leaf count -> defer.
                     self._buffers[leaf].clear()
+                    defer_no_budget = True
+                else:
+                    # Paper Sec. 6.3 step 1 / Sec. 6.7: any publisher count
+                    # released to drive a decision (the interval-extension check
+                    # AND the release-eligibility gate) is DIFFERENTIALLY PRIVATE
+                    # -- one eps_count (sensitivity 1) per probe.  The same noisy
+                    # leaf count drives both the extend and the gate decision.
+                    leaf_n_gate = self._dp_count(leaf_n) if needs_walk else leaf_n
+
+                    # Adaptive interval extension (Sec. 6.7): hold the buffer open
+                    # one more Delta_t when the DP leaf count is below P.
+                    if (needs_walk and leaf_n_gate < self.min_publishers
+                            and self.k_ext > 0 and buf_leaf.extensions < self.k_ext):
+                        buf_leaf.extensions += 1
+                        extend = True
+                    else:
+                        scope, pooled = (leaf, buf_leaf)
+                        # The DP count the P-gate decision is based on: the leaf
+                        # count, or the walk's final scope count if we walk up.
+                        # This single noisy count is handed to release(n_gate=...)
+                        # so the engine does NOT re-gate on the exact pooled count.
+                        n_gate_decision = leaf_n_gate
+                        if (needs_walk and leaf_n_gate < self.min_publishers
+                                and self.enable_hierarchy_walk):
+                            # Algorithm 1 walk (charges eps_count per ancestor),
+                            # capped to the remaining count budget (leaf already
+                            # spent one draw), under the same lock so the pool
+                            # snapshot is consistent.
+                            scope, pooled, n_gate_decision = self._scope_walk(
+                                leaf, skip_leaf=True,
+                                max_probes=(None if ec <= 0 else affordable - 1))
+                        # P_max sensitivity cap (Sec. 6.5): fold at most P_max
+                        # publishers into the aggregate.
+                        pooled = self._truncate_to_pmax(pooled, self.max_publishers)
+                        aggregate = pooled.mean()
+                        n_tau = pooled.num_publishers
+                        # t_start = start of the buffering interval (Def. 3.1),
+                        # NOT shifted by K_ext extensions.
+                        t_start = (pooled.start_time if pooled.start_time is not None
+                                   else time.time())
+                        # Clear the LEAF buffer (ancestor buffers drain on their
+                        # own tick) -- still under the lock, no message dropped.
+                        self._buffers[leaf].clear()
+                # Count of eps_count draws made this tick (leaf + walk probes),
+                # passed to release() so the full count cost is charged in-window.
+                n_count_draws = (round((self.eps_count_spent - ec_before) / ec)
+                                 if ec > 0 else 0)
+            if defer_no_budget:
+                # Record a deferred timestamp (repeat last) without spending eps.
+                self._get_or_create_stream(leaf).release(
+                    0.0, 0, n_gate=0, n_count_draws=0)
+                continue
             if extend:
                 continue  # wait for another Delta_t tick
 
@@ -433,7 +459,8 @@ class PrivacyPlugin:
             stream = self._get_or_create_stream(leaf)
             released = stream.release(
                 aggregate, n_tau,
-                n_gate=(n_gate_decision if needs_walk else None))
+                n_gate=(n_gate_decision if needs_walk else None),
+                n_count_draws=(n_count_draws if needs_walk else 1))
             deferred = stream.last_was_deferred
 
             if released is not None:

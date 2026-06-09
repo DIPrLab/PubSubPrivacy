@@ -24,11 +24,12 @@ from experiments import engine as core
 def _sweep_task(task):
     """One sweep combo (level-subscription, config, trial)."""
     (i, dataset_name, sensor, key, level, scope, P, eps, w, strat,
-     clamp_mode, log_messages, trial) = task
+     clamp_mode, log_messages, trial, eps_count, p_max) = task
     aggregates, pub_counts, B = core._WORKER_STREAMS[key]
     result = core.run_dp_on_stream(
         aggregates, pub_counts, epsilon=eps, window_size=w, min_publishers=P,
-        payload_bound=B, strategy=strat, seed=i)
+        payload_bound=B, strategy=strat, seed=i,
+        epsilon_count=eps_count, max_publishers=p_max)
     m = result["metrics"]
     avg_n = float(np.mean([n for n in pub_counts if n > 0])) if any(pub_counts) else 0.0
     out = {
@@ -39,6 +40,10 @@ def _sweep_task(task):
         "normalized_mae": m["normalized_mae"], "kl_divergence": m["kl_divergence"],
         "kl_global_utility": m["kl_global_utility"], "release_rate": m["release_rate"],
         "deferrals": m["deferrals"], "attribution_advantage": m["attribution_advantage"],
+        # Composed DP cost: eps_count spent on the DP publisher counts (charged
+        # inside the window budget eps); 0 for the Kellaris baselines.
+        "eps_count_spent": m.get("eps_count_spent", 0.0),
+        "dp_count_releases": m.get("dp_count_releases", 0),
         "noise_scale_theoretical": B * w / (max(avg_n, 1.0) * eps),
         "payload_bound": B, "num_timestamps": len(aggregates),
         "avg_publishers": float(np.mean(pub_counts)),
@@ -55,7 +60,8 @@ def _sweep_task(task):
 
 def sweep(dataset_name, streams, s_values, epsilon_values, w_values, strategies,
           workers=1, clamp_mode="static", log_messages=True,
-          messages_csv_path=None, trials=1, per_pubs=None, k_ext=0) -> "pd.DataFrame":
+          messages_csv_path=None, trials=1, per_pubs=None, k_ext=0,
+          epsilon_count=0.0, max_publishers=None) -> "pd.DataFrame":
     """Per-level sweep.  ``per_pubs`` (sensor -> (per_pub, B)) drives the
     subscription levels; if None, falls back to the per-sensor pooled
     ``streams`` (single level = the whole type)."""
@@ -80,7 +86,8 @@ def sweep(dataset_name, streams, s_values, epsilon_values, w_values, strategies,
                 s_values, epsilon_values, w_values, strategies):
             for trial in range(max(1, trials)):
                 tasks.append((i, dataset_name, sensor, key, L, scope, P, eps, w,
-                              strat, clamp_mode, log_messages, trial))
+                              strat, clamp_mode, log_messages, trial,
+                              epsilon_count, max_publishers))
                 i += 1
     rows = core._run_parallel_tasks(
         tasks, _sweep_task, workers=workers,

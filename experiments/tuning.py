@@ -42,30 +42,34 @@ _WORKER_TUNE_CTX: tuple | None = None
 
 
 def _init_tune_worker(agg, cnt, payload_bound, epsilon, w,
-                      utility_weight, latency_weight):
+                      utility_weight, latency_weight,
+                      epsilon_count=0.0, max_publishers=None):
     global _WORKER_TUNE_CTX
     _WORKER_TUNE_CTX = (agg, cnt, payload_bound, epsilon, w,
-                        utility_weight, latency_weight)
+                        utility_weight, latency_weight,
+                        epsilon_count, max_publishers)
 
 
 def _tune_eval_task(task):
     """Brute-force evaluator: (strategy, P, seed) -> row dict."""
     strategy, P, seed = task
-    agg, cnt, B, eps, w, uw, lw = _WORKER_TUNE_CTX
-    return _evaluate_stream(agg, cnt, B, eps, w, P, strategy, uw, lw, seed)
+    agg, cnt, B, eps, w, uw, lw, ec, pmax = _WORKER_TUNE_CTX
+    return _evaluate_stream(agg, cnt, B, eps, w, P, strategy, uw, lw, seed,
+                            epsilon_count=ec, max_publishers=pmax)
 
 
 def _greedy_walk_task(task):
     """One strategy's Algorithm-2 greedy walk, end-to-end in the worker."""
     (strategy, p_max, alpha, I_max, loss_tie_tol, seed,
      n_restarts, restart_rng_seed) = task
-    agg, cnt, B, eps, w, uw, lw = _WORKER_TUNE_CTX
+    agg, cnt, B, eps, w, uw, lw, ec, pmax = _WORKER_TUNE_CTX
     return _greedy_walk_on_stream(
         agg, cnt, B, eps, w, strategy, p_max,
         alpha=alpha, I_max=I_max,
         utility_weight=uw, latency_weight=lw,
         loss_tie_tol=loss_tie_tol, seed=seed,
         n_restarts=n_restarts, restart_rng_seed=restart_rng_seed,
+        epsilon_count=ec, max_publishers=pmax,
     )
 
 
@@ -126,6 +130,7 @@ def _greedy_hillclimb_from(
     P_start: int, utility_weight, latency_weight,
     I_max: int, loss_tie_tol: float, seed: int,
     restart_idx: int, action_prefix: str = "",
+    epsilon_count: float = 0.0, max_publishers=None,
 ) -> tuple[list[dict], dict, int]:
     """One hill-climb trajectory from ``P_start``.  Returns (trajectory rows,
     best evaluated row, evaluation count for this run).
@@ -134,7 +139,8 @@ def _greedy_hillclimb_from(
     trajectory: list[dict] = []
     P = max(1, min(P_start, p_max))
     best = _evaluate_stream(agg, cnt, payload_bound, epsilon, w, P, strategy,
-                            utility_weight, latency_weight, seed)
+                            utility_weight, latency_weight, seed,
+                            epsilon_count=epsilon_count, max_publishers=max_publishers)
     evaluations += 1
     trajectory.append({
         **best, "iter": 0,
@@ -152,7 +158,8 @@ def _greedy_hillclimb_from(
                                   "_cached": True})
                 continue
             r = _evaluate_stream(agg, cnt, payload_bound, epsilon, w, P_nbr, strategy,
-                                 utility_weight, latency_weight, seed)
+                                 utility_weight, latency_weight, seed,
+                            epsilon_count=epsilon_count, max_publishers=max_publishers)
             evaluations += 1
             seen[P_nbr] = r["tuning_loss"]
             neighbors.append({**r, "_cached": False})
@@ -172,7 +179,8 @@ def _greedy_hillclimb_from(
                 best = {k: v for k, v in best_nbr.items() if not k.startswith("_")}
             else:
                 best = _evaluate_stream(agg, cnt, payload_bound, epsilon, w, P, strategy,
-                                        utility_weight, latency_weight, seed)
+                                        utility_weight, latency_weight, seed,
+                            epsilon_count=epsilon_count, max_publishers=max_publishers)
                 evaluations += 1
             trajectory.append({
                 **best, "iter": i,
@@ -194,6 +202,7 @@ def _greedy_walk_on_stream(
     alpha=0.25, I_max=20, utility_weight=1.0, latency_weight=0.2,
     loss_tie_tol: float = 1e-9, seed: int = 77,
     n_restarts: int = 3, restart_rng_seed: int = 12345,
+    epsilon_count: float = 0.0, max_publishers=None,
 ) -> dict:
     """Stream-level Algorithm 2 walk with intelligent multi-start.
 
@@ -221,6 +230,7 @@ def _greedy_walk_on_stream(
             latency_weight=latency_weight, I_max=I_max,
             loss_tie_tol=loss_tie_tol, seed=seed,
             restart_idx=r_idx, action_prefix=prefix,
+            epsilon_count=epsilon_count, max_publishers=max_publishers,
         )
         all_traj.extend(traj)
         total_evals += evals
@@ -304,6 +314,8 @@ def tune_hyperparameters(
     workers: int = 1,
     n_restarts: int = 3,
     restart_rng_seed: int = 12345,
+    epsilon_count: float = 0.0,
+    max_publishers=None,
 ) -> dict:
     """
     Stage 1 of Section 5.7: tune P per strategy using the paper's Algorithm 2
@@ -333,7 +345,8 @@ def tune_hyperparameters(
     p_max = int(p_max)
 
     tune_init_args = (agg, cnt, payload_bound, epsilon, w,
-                      utility_weight, latency_weight)
+                      utility_weight, latency_weight,
+                      epsilon_count, max_publishers)
 
     # Brute-force: one task per (strategy, P).
     brute_tasks = [(strat, P, 77)

@@ -29,6 +29,7 @@ import matplotlib.pyplot as plt
 
 from experiments import _common as C
 from experiments import engine as core
+from data_streams import _stable_hash   # process-stable seed digest (not salted hash())
 # Shared helpers/types kept in core; imported by name so the moved bodies run
 # verbatim.  The worker functions (_dp_named_task / _init_named_streams_worker)
 # stay in core, so ProcessPoolExecutor pickles them by their original
@@ -145,7 +146,7 @@ def figure1_reproduction(
     # Global (Extreme 1) — need noisy_values back for custom KL vs per-metric truth
     for s in sensor_names:
         for trial in range(n_trials):
-            seed = 700_000 + hash(s) % 10000 + trial * 7919
+            seed = 700_000 + _stable_hash(s) + trial * 7919
             tasks.append((idx, ("global",), "uniform", 1,
                           epsilon, w, seed, "noisy"))
             ops.append(("global", s))
@@ -403,7 +404,7 @@ def extreme2_per_publisher(per_pub, payload_bound, sensor_label,
         true_vals, noisy_vals = _apply_dp(
             pub_agg, pub_cnt,
             epsilon=INTRO_EPSILON, w=INTRO_W, min_publishers=1,
-            payload_bound=payload_bound, seed=hash(pub_id) % 10000,
+            payload_bound=payload_bound, seed=_stable_hash(pub_id),
         )
         n = min(300, len(true_vals))
         true_x = [i for i in range(n) if true_vals[i] is not None and true_vals[i] != 0]
@@ -672,7 +673,7 @@ def u_shaped_curve(sensor_streams, per_pub_all, dataset_name, output_dir,
     # Global (Extreme 1) — compare sensor's true vs global-DP noisy
     for s in sensor_names:
         for trial in range(INTRO_N_TRIALS):
-            seed = 5_000_000 + hash(s) % 10000 + trial * 7919
+            seed = 5_000_000 + _stable_hash(s) + trial * 7919
             tasks.append((idx, ("global",), "uniform", 1,
                           INTRO_EPSILON, INTRO_W, seed, "noisy"))
             ops.append(("global", s))

@@ -43,6 +43,8 @@ def experiment_C_vary_epsilon(datasets, clamp_mode, output_dir, args,
                                 combo["strategy"], combo["P"], eps, combo["w"],
                                 clamp_mode, log_messages, "C_vary_epsilon",
                                 trial, 77 + 1000 * trial, L, scope,
+                                getattr(args, "epsilon_count", 0.0),
+                                getattr(args, "max_publishers", None),
                             ))
         rows.extend(core._run_parallel_tasks(
             tasks, core._experiment_single_axis_task, workers=workers,

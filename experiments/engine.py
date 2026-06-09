@@ -99,7 +99,12 @@ def run_dp_on_stream(
         payload_bound=float(payload_bound),
         strategy=BudgetStrategy(strategy),
         epsilon_count=float(epsilon_count),
-        max_publishers=int(max_publishers) if max_publishers else None,
+        # NaN-safe: a "no cap" P_max resolved from the grid optimum arrives as
+        # NaN (pandas/JSON null), and NaN is truthy -- coerce it to None.
+        # ``x == x`` is False only for NaN.
+        max_publishers=(int(max_publishers)
+                        if max_publishers and max_publishers == max_publishers
+                        else None),
     )
     stream = StreamState(config=config)
     for agg, n in zip(aggregates, pub_counts):
@@ -268,7 +273,13 @@ def _plot_dp_task(task):
             [v if v is not None else np.nan for v in nv], dtype=np.float32,
         ),
         "budgets_spent": np.asarray(res["budgets_spent"], dtype=np.float32),
-        "kl_windowed": np.asarray(res["kl_windowed"], dtype=np.float32),
+        # run_dp_on_stream no longer returns the per-window KL array (it was an
+        # O(T) pass consumed by nobody on the hot path); recompute it here only
+        # for the inline-plot path that actually needs the series.
+        "kl_windowed": np.asarray(
+            compute_windowed_kl_divergence(
+                res["true_values"], res["noisy_values"], int(w)),
+            dtype=np.float32),
     }
 
 
@@ -345,7 +356,7 @@ def _aggregate_over_trials(df, group_cols, metric_cols):
 _TRIAL_METRIC_COLS = [
     "normalized_mae", "mae", "rmse", "relative_error",
     "kl_divergence", "kl_global_utility", "release_rate",
-    "attribution_advantage", "avg_n_tau",
+    "attribution_advantage", "avg_n_tau", "eps_count_spent",
 ]
 
 
@@ -658,6 +669,7 @@ def _rebuild_stream_with_dt(
 def _evaluate_stream(
     agg, cnt, payload_bound, epsilon, w, P, strategy,
     utility_weight=1.0, latency_weight=0.2, seed=77,
+    epsilon_count=0.0, max_publishers=None,
 ) -> dict:
     """Stream-level evaluator; caller supplies the (agg, cnt) rebuild once."""
     if len(agg) < w + 2:
@@ -671,6 +683,7 @@ def _evaluate_stream(
     res = run_dp_on_stream(
         agg, cnt, epsilon=epsilon, window_size=w, min_publishers=int(P),
         payload_bound=payload_bound, strategy=strategy, seed=seed,
+        epsilon_count=epsilon_count, max_publishers=max_publishers,
     )
     m = res["metrics"]
     nmae = m["normalized_mae"]; rr = m["release_rate"]
@@ -863,6 +876,24 @@ def _dataset_dirs(output_dir: str, name: str, clamp_mode: str) -> dict:
     return dirs
 
 
+def _shard_sensors(args, sensors):
+    """Round-robin sensor sharding for extra cluster parallelism.
+
+    When ``--sensor-shard 'i/k'`` is set, keep ``sensors[i::k]`` (deterministic
+    over the dataset's fixed sensor order), so a heavy multi-sensor dataset's
+    per-level sweep can run one shard per sensor-group on separate nodes -- the
+    lever for the ~8 h ``energy`` sweep long pole.  Returns all sensors when
+    unset.  Empty groups (a dataset with fewer sensors than k) are simply
+    skipped by the caller.
+    """
+    sh = getattr(args, "_sensor_shard", None)
+    sensors = list(sensors)
+    if not sh:
+        return sensors
+    i, k = sh
+    return [s for idx, s in enumerate(sensors) if idx % k == i]
+
+
 def run_dataset(
     name: str,
     s_values, eps_values, w_values, strategies, output_dir, args,
@@ -905,6 +936,17 @@ def run_dataset(
     if prepared.is_empty:
         logger.error(f"No valid {name} streams after {clamp_mode} clamping"); return {}
     streams, per_pubs, clamp_meta = prepared.streams, prepared.per_pubs, prepared.clamp_meta
+
+    # Optional per-sensor sharding (--sensor-shard i/k): restrict this shard to
+    # its slice of the dataset's sensors so a heavy dataset's sweep spreads
+    # across nodes one sensor-group per task.
+    if getattr(args, "_sensor_shard", None):
+        keep = set(_shard_sensors(args, list(streams.keys())))
+        streams = {s: v for s, v in streams.items() if s in keep}
+        per_pubs = {s: v for s, v in per_pubs.items() if s in keep}
+        if not streams:
+            logger.info(f"  [{name}/{clamp_mode}] sensor shard is empty; skipping")
+            return {}
 
     # Log the clamp decisions so a reader can audit R per sensor.
     logger.info(f"  clamp[{clamp_mode}] R per sensor:")
@@ -972,6 +1014,10 @@ def run_dataset(
             trials=trials,
             per_pubs=per_pubs,          # per-level subscriptions (every topic level)
             k_ext=getattr(args, "k_ext", 0),
+            # n_tau is DP-private: charge eps_count for the gate/calibration count
+            # on the population-aware strategies (Kellaris baselines ignore it).
+            epsilon_count=getattr(args, "epsilon_count", 0.0),
+            max_publishers=getattr(args, "max_publishers", None),
         )
         df["clamp_mode"] = clamp_mode
         df["eps_clip"] = args.eps_clip if clamp_mode == "dp_released" else 0.0
@@ -1037,6 +1083,8 @@ def run_dataset(
             strategies=strategies,
             alpha=args.alpha, I_max=args.I_max,
             workers=workers,
+            epsilon_count=getattr(args, "epsilon_count", 0.0),
+            max_publishers=getattr(args, "max_publishers", None),
         )
         # Stamp each frame with (dataset, sensor, clamp_mode) for cross-agg.
         for key in ("greedy", "brute_force", "gap_summary"):
@@ -1173,8 +1221,11 @@ def _iter_clamped_by_dataset(datasets, clamp_mode, eps_clip, seed, args):
         )
         if prepared is None or not prepared.raw_per_pubs:
             continue
+        keep = set(_shard_sensors(args, list(prepared.streams.keys())))
         entries = []
         for sensor, (agg, cnt, R) in prepared.streams.items():
+            if sensor not in keep:
+                continue
             pp = prepared.per_pubs[sensor][0]
             entries.append((sensor, pp, R, (agg, cnt)))
         if entries:
@@ -1191,12 +1242,13 @@ def _experiment_single_axis_task(task):
     hierarchy this subscription is bound to (so B/C test every level)."""
     (ds_name, sensor, key, strategy, P, eps, w,
      clamp_mode, log_messages, experiment_tag, trial, seed,
-     subscription_level, scope) = task
+     subscription_level, scope, eps_count, p_max) = task
     agg, cnt, R = _WORKER_STREAMS[key]
     res = run_dp_on_stream(
         agg, cnt, epsilon=eps, window_size=w,
         min_publishers=P, payload_bound=R,
         strategy=strategy, seed=seed,
+        epsilon_count=eps_count, max_publishers=p_max,
     )
     m = res["metrics"]
     elig_n = [n for n in cnt if n > 0]
@@ -1569,6 +1621,60 @@ def _write_grid_canonical(output_dir: str, best_records: list[dict],
     return path
 
 
+def _merge_grid_trial_fragments(frag_paths: list[str]) -> dict | None:
+    """Average MAE across per-trial full-grid fragments and pick each
+    (dataset, clamp, strategy, epsilon)'s argmin config.
+
+    Each fragment (one per (epsilon, trial) grid shard) holds every scored
+    config with its single-trial MAE; we group by the full config key, average
+    MAE over the trials, then select the minimum-mean-MAE config per strategy.
+    Returns the same lookup shape as ``_load_grid_config`` so it is a drop-in.
+    """
+    from collections import defaultdict
+    # (dataset, clamp, strategy, eps, P_min, P_max, dt, k_ext) -> [mae, ...]
+    buckets: dict = defaultdict(list)
+    meta: dict = {}
+    n = 0
+    for fp in frag_paths:
+        try:
+            with open(fp) as fh:
+                records = json.load(fh)
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"could not read grid trial fragment {fp}: {exc}")
+            continue
+        n += 1
+        for r in records:
+            mae = r.get("mae")
+            if mae is None or not np.isfinite(mae):
+                continue
+            pmax = r.get("P_max")
+            pmax = None if pmax is None or (isinstance(pmax, float) and np.isnan(pmax)) else int(pmax)
+            r["P_max"] = pmax   # normalize NaN/null -> None so consumers don't int(NaN)
+            key = (r.get("dataset"), r.get("clamp_mode"), r.get("strategy"),
+                   round(float(r.get("epsilon", 0.0)), 4),
+                   int(r.get("P_min")), pmax,
+                   int(r.get("delta_t", 1)), int(r.get("k_ext", 0)))
+            buckets[key].append(float(mae))
+            meta[key] = r
+    if not buckets:
+        return None
+    # Per (dataset, clamp, strategy, eps): the config with the lowest mean MAE.
+    best: dict = {}
+    for key, maes in buckets.items():
+        ds, clamp, strat, eps = key[0], key[1], key[2], key[3]
+        mean_mae = float(np.mean(maes))
+        sel = (ds, clamp, strat, eps)
+        if sel not in best or mean_mae < best[sel][0]:
+            r = dict(meta[key])
+            r["mae"] = mean_mae
+            r["n_trials"] = len(maes)
+            best[sel] = (mean_mae, r)
+    cfg = {sel: rec for sel, (_m, rec) in best.items()}
+    logger.info(f"merged {n} grid trial fragment(s) -> {len(cfg)} canonical "
+                f"entries (MAE averaged over trials)")
+    return cfg
+
+
 def _load_grid_config(path: str | None) -> dict | None:
     """Load the canonical grid config into a lookup dict keyed by
     (dataset, clamp_mode, strategy, round(epsilon, 4)).
@@ -1577,11 +1683,21 @@ def _load_grid_config(path: str | None) -> dict | None:
     phase that was split across nodes per epsilon (each shard writing a
     ``grid_canonical_eps{eps}.json`` fragment) is recombined transparently — the
     downstream experiments still point ``--use-grid-config`` at the single
-    ``grid_canonical.json`` path."""
+    ``grid_canonical.json`` path.
+
+    When the grid was sharded per TRIAL (``grid_trial*.json`` full-grid
+    fragments present), those take precedence: MAE is averaged across the trial
+    fragments per config and each strategy's optimum is then chosen on the
+    seed-averaged MAE (so the §7.5 optimum is robust to single-draw noise)."""
     if not path:
         return None
     import glob
     dirpath = os.path.dirname(path) or "."
+    trial_frags = sorted(glob.glob(os.path.join(dirpath, "grid_trial*.json")))
+    if trial_frags:
+        merged = _merge_grid_trial_fragments(trial_frags)
+        if merged:
+            return merged
     candidates = sorted(glob.glob(os.path.join(dirpath, "grid_canonical*.json")))
     # Honor the exact path too (covers a non-fragmented single-file write).
     if os.path.exists(path) and path not in candidates:
@@ -1898,15 +2014,26 @@ CLAMP_MODES = ["static", "dp_released"]
 
 
 def _run_grid_search_block(args, targets, clamp_modes, eps_values, strategies,
-                           canonical_filename="grid_canonical.json"):
+                           canonical_filename="grid_canonical.json",
+                           trial=None, full_fragment=None):
     """Paper Sec. 7.5 grid search over (P_min x P_max x Delta_t x K_ext) scored
     by MAE, per dataset/clamp/strategy/epsilon.  Writes per-(dataset,eps) grids
-    and the consolidated canonical config.  Returns the canonical config path.
+    and the consolidated canonical config.  Returns the written path.
 
     ``canonical_filename`` is overridden to ``grid_canonical_eps{eps}.json`` by a
     per-epsilon grid shard (``--grid-eps``) so the grid phase can be split across
     nodes; ``_load_grid_config`` merges the fragments back together.
+
+    ``trial`` + ``full_fragment``: when set (the per-trial grid shards), the
+    block scores at the trial's own noise seed and writes the FULL per-config
+    grid (every strategy x P_min x P_max x dt x k_ext, with its MAE) to
+    ``full_fragment`` instead of a pre-selected canonical.  ``_load_grid_config``
+    then averages MAE across the trial fragments per config and picks each
+    strategy's optimum -- so the §7.5 optimum is chosen on seed-averaged MAE and
+    the trials run as independent cluster tasks.
     """
+    # Per-trial shards reseed so the trials are independent noise draws.
+    seed = 77 if trial is None else 77 + 1000 * int(trial)
     p_min_grid = [1, 2, 3, 4, 6]
     p_max_grid = [None, 4, 8, 16]
     dt_grid = [1, 2, 4]
@@ -1922,6 +2049,7 @@ def _run_grid_search_block(args, targets, clamp_modes, eps_values, strategies,
         dt_grid = [1, 2]
         k_ext_grid = [0, 2]
     canonical_records: list[dict] = []
+    full_records: list[dict] = []
     for clamp_mode in clamp_modes:
         for name in targets:
             first_sensor = DATASETS[name]["sensors"][0]
@@ -1936,16 +2064,28 @@ def _run_grid_search_block(args, targets, clamp_modes, eps_values, strategies,
             dirs = _dataset_dirs(args.output_dir, name, clamp_mode)
             grid_dir = os.path.join(dirs["tuning"], "grid_search")
             for eps in eps_values:
-                grid_search_hyperparameters(
-                    pp, B, name, f"{first_sensor}_eps{eps}", grid_dir,
+                tag = f"{first_sensor}_eps{eps}" + (f"_t{trial}" if trial is not None else "")
+                df = grid_search_hyperparameters(
+                    pp, B, name, tag, grid_dir,
                     epsilon=eps, w=8, strategies=strategies,
                     p_min_grid=p_min_grid, p_max_grid=p_max_grid,
                     dt_grid=dt_grid, k_ext_grid=k_ext_grid,
                     epsilon_count=args.epsilon_count,
-                    workers=args.workers,
+                    seed=seed, workers=args.workers,
                 )
-                best_csv = os.path.join(
-                    grid_dir, f"{name}_{first_sensor}_eps{eps}_gridsearch_best.csv")
+                if full_fragment is not None:
+                    # Per-trial mode: keep EVERY scored config (averaged + argmin
+                    # downstream in _load_grid_config across the trial fragments).
+                    if df is not None and not df.empty:
+                        for _i, r in df.iterrows():
+                            rec = r.to_dict()
+                            rec["dataset"] = name
+                            rec["clamp_mode"] = clamp_mode
+                            rec["epsilon"] = eps
+                            rec["trial"] = int(trial)
+                            full_records.append(rec)
+                    continue
+                best_csv = os.path.join(grid_dir, f"{name}_{tag}_gridsearch_best.csv")
                 if os.path.exists(best_csv):
                     bdf = pd.read_csv(best_csv)
                     for _i, r in bdf.iterrows():
@@ -1953,6 +2093,12 @@ def _run_grid_search_block(args, targets, clamp_modes, eps_values, strategies,
                         rec["dataset"] = name
                         rec["clamp_mode"] = clamp_mode
                         canonical_records.append(rec)
+    if full_fragment is not None:
+        path = _grid_canonical_path(args.output_dir, full_fragment)
+        with open(path, "w") as fh:
+            json.dump(full_records, fh)
+        logger.info(f"  wrote per-trial grid fragment ({len(full_records)} configs) -> {path}")
+        return path
     return _write_grid_canonical(args.output_dir, canonical_records,
                                  filename=canonical_filename)
 

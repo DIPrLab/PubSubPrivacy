@@ -42,7 +42,7 @@ def main():
     )
     parser.add_argument("--eps-clip", type=float, default=0.1,
                         help="Option B calibration budget epsilon_clip (Def 3.2)")
-    parser.add_argument("--epsilon-count", type=float, default=0.0,
+    parser.add_argument("--epsilon-count", type=float, default=0.05,
                         help="eps_count: per-step budget spent to release a "
                              "differentially private publisher count |P_tau| "
                              "(sensitivity 1) when gating / walking the topic "

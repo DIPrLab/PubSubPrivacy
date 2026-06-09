@@ -38,7 +38,11 @@ import pandas as pd
 # filename.  Anything matching EXCLUDE_GLOBS is dropped even if it matched.
 PAPER_BUNDLE = {
     "01_grid_search_sec7.5": [
-        "grid_canonical.json", "*_gridsearch.csv", "*_gridsearch_best.csv",
+        "grid_canonical.json", "grid_canonical_eps*.json",
+        # Per-(eps,trial) grid shards write full-grid fragments + per-trial
+        # gridsearch CSVs; the canonical is the trial-averaged argmin merged
+        # from these by _load_grid_config at consume time.
+        "grid_trial*.json", "*_gridsearch.csv", "*_gridsearch_best.csv",
     ],
     "02_main_sweep": [
         "sweep_results.csv", "sweep_results_aggregate.csv",
