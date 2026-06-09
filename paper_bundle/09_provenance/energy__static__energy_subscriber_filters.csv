@@ -1,0 +1,4 @@
+subscriber_filter
+energy/building01/#
+energy/building01/+/power_kw
+energy/building01/CT1/#

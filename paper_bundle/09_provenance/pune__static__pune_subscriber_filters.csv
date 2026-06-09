@@ -1,0 +1,4 @@
+subscriber_filter
+air_quality/pune/#
+air_quality/pune/+/pm10
+air_quality/pune/Hadapsar_Gadital_01/#

@@ -1,0 +1,13 @@
+regime,sensor,kl_divergence,P_our
+Extreme 1 (global average),traffic_speed,0.8100844793347989,4
+Extreme 1 (global average),vehicle_count,0.6466658145148283,4
+Extreme 1 (global average),road_occupancy,0.7578434356073263,4
+Extreme 1 (global average),emission,0.714325858235342,4
+Extreme 2 (per-publisher),traffic_speed,0.9621405891415733,4
+Extreme 2 (per-publisher),vehicle_count,0.9682131548415345,4
+Extreme 2 (per-publisher),road_occupancy,0.9481312761214473,4
+Extreme 2 (per-publisher),emission,0.9647571605118767,4
+Our approach (P=4 topic pool),traffic_speed,0.5801080643663182,4
+Our approach (P=4 topic pool),vehicle_count,0.5961990761482407,4
+Our approach (P=4 topic pool),road_occupancy,0.4954437631369887,4
+Our approach (P=4 topic pool),emission,0.5689754096759804,4

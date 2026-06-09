@@ -1,0 +1,5 @@
+subscriber_filter
+traffic/intersection01/#
+traffic/intersection01/+/+/speed
+traffic/intersection01/radar/#
+traffic/intersection01/+/EVO_RADAR_1/#

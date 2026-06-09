@@ -1,0 +1,13 @@
+regime,sensor,kl_divergence,P_our
+Extreme 1 (global average),heart_rate,0.21152463766544077,4
+Extreme 1 (global average),steps,0.159212758016386,4
+Extreme 1 (global average),temperature,0.21152463766544077,4
+Extreme 1 (global average),calories_burned,0.21152463766544077,4
+Extreme 2 (per-publisher),heart_rate,0.8332990673970858,4
+Extreme 2 (per-publisher),steps,0.8298632120885375,4
+Extreme 2 (per-publisher),temperature,0.8173432548963624,4
+Extreme 2 (per-publisher),calories_burned,0.8669325326343921,4
+Our approach (P=4 topic pool),heart_rate,0.6367390815604193,4
+Our approach (P=4 topic pool),steps,0.5971379079722857,4
+Our approach (P=4 topic pool),temperature,0.6714170680698307,4
+Our approach (P=4 topic pool),calories_burned,0.7183189479724421,4

@@ -1,0 +1,5 @@
+subscriber_filter
+mobility/nyc/#
+mobility/nyc/+/+/traffic_speed
+mobility/nyc/NE/#
+mobility/nyc/+/+/emission

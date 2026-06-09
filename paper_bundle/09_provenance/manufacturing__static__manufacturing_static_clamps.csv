@@ -1,0 +1,6 @@
+sensor,mode,eps_clip,a,b,R,publisher
+temperature,static,0.0,0.0,200.0,200.0,*
+machine_speed,static,0.0,0.0,5000.0,5000.0,*
+quality,static,0.0,0.0,10.0,10.0,*
+vibration,static,0.0,0.0,1.0,1.0,*
+energy,static,0.0,0.0,10.0,10.0,*

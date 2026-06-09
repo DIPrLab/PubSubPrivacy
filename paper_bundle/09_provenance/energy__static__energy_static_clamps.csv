@@ -1,0 +1,4 @@
+sensor,mode,eps_clip,a,b,R,publisher
+power_kw,static,0.0,0.0,50.0,50.0,*
+voltage,static,0.0,180.0,260.0,80.0,*
+current,static,0.0,0.0,100.0,100.0,*

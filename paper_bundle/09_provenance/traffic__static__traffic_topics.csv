@@ -1,0 +1,13 @@
+dataset,publisher_id,sensor,raw_topic,protected_topic
+traffic,EVO_RADAR_1,speed,traffic/intersection01/radar/EVO_RADAR_1/speed,radar/EVO_RADAR_1/speed
+traffic,EVO_RADAR_2,speed,traffic/intersection01/radar/EVO_RADAR_2/speed,radar/EVO_RADAR_2/speed
+traffic,EVO_RADAR_3,speed,traffic/intersection01/radar/EVO_RADAR_3/speed,radar/EVO_RADAR_3/speed
+traffic,EVO_RADAR_4,speed,traffic/intersection01/radar/EVO_RADAR_4/speed,radar/EVO_RADAR_4/speed
+traffic,OS1_LIDAR_1,speed,traffic/intersection01/lidar/OS1_LIDAR_1/speed,lidar/OS1_LIDAR_1/speed
+traffic,OS1_LIDAR_2,speed,traffic/intersection01/lidar/OS1_LIDAR_2/speed,lidar/OS1_LIDAR_2/speed
+traffic,EVO_RADAR_1,object_count,traffic/intersection01/radar/EVO_RADAR_1/object_count,radar/EVO_RADAR_1/object_count
+traffic,EVO_RADAR_2,object_count,traffic/intersection01/radar/EVO_RADAR_2/object_count,radar/EVO_RADAR_2/object_count
+traffic,EVO_RADAR_3,object_count,traffic/intersection01/radar/EVO_RADAR_3/object_count,radar/EVO_RADAR_3/object_count
+traffic,EVO_RADAR_4,object_count,traffic/intersection01/radar/EVO_RADAR_4/object_count,radar/EVO_RADAR_4/object_count
+traffic,OS1_LIDAR_1,object_count,traffic/intersection01/lidar/OS1_LIDAR_1/object_count,lidar/OS1_LIDAR_1/object_count
+traffic,OS1_LIDAR_2,object_count,traffic/intersection01/lidar/OS1_LIDAR_2/object_count,lidar/OS1_LIDAR_2/object_count

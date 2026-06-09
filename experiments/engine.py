@@ -142,9 +142,13 @@ def run_dp_on_stream(
         "noisy_values": stream.noisy_values,
         "budgets_spent": stream.budgets_spent,
         "pub_counts": stream.pub_counts,
-        "kl_windowed": compute_windowed_kl_divergence(
-            stream.true_values, stream.noisy_values, config.window_size
-        ),
+        # NOTE: the per-window KL array is intentionally NOT returned here -- it
+        # was an O(T) stride-1 pass computed on every config and consumed by
+        # nobody (the scalar-metric workers discard the full arrays), so it
+        # roughly doubled run_dp_on_stream's cost on the long streams.  The
+        # window-averaged scalar lives in metrics["kl_global_utility"]; callers
+        # that genuinely need the per-window series can call
+        # compute_windowed_kl_divergence(true_values, noisy_values, w) directly.
     }
 
 

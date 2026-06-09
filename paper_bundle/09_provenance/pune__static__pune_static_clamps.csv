@@ -1,0 +1,6 @@
+sensor,mode,eps_clip,a,b,R,publisher
+pm10,static,0.0,0.0,1000.0,1000.0,*
+pm2,static,0.0,0.0,500.0,500.0,*
+humidity,static,0.0,0.0,100.0,100.0,*
+sound,static,0.0,20.0,140.0,120.0,*
+ozone,static,0.0,0.0,500.0,500.0,*

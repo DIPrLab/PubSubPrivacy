@@ -1,0 +1,8 @@
+dataset,P_scope,P_label,kl_divergence,epsilon,w,N
+mobility,1,per-pub,0.8297999047873624,1.0,6,16
+mobility,2,P=2,0.717237477741878,1.0,6,16
+mobility,3,P=3,0.6734092168395434,1.0,6,16
+mobility,4,P=4,0.7126215381195167,1.0,6,16
+mobility,6,P=6,0.7511302744952346,1.0,6,16
+mobility,8,P=8,,1.0,6,16
+mobility,17,global,0.7200540137361393,1.0,6,16
