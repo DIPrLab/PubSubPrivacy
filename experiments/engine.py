@@ -72,6 +72,28 @@ ALL_STRATEGIES = [
 #  Core DP runner
 # ═════════════════════════════════════════════════════════════════════════
 
+# Run-global split parameter rho_tau for the aggregate stream element
+# (Definition: Aggregate Stream Element).  It is a single constant for a whole
+# run (not a per-task sweep dimension), so the CLI publishes it via the
+# DP_RHO_SPLIT environment variable -- which spawned ProcessPoolExecutor workers
+# inherit -- instead of threading it through every task tuple / worker global.
+# ``set_rho_split`` is called once after arg parsing; ``run_dp_on_stream`` (and
+# the live-broker driver) read it back per call so workers pick up the same rho.
+DP_RHO_SPLIT_ENV = "DP_RHO_SPLIT"
+
+
+def set_rho_split(rho: float) -> None:
+    """Publish the run-global rho_tau so spawned workers inherit it."""
+    os.environ[DP_RHO_SPLIT_ENV] = repr(float(rho))
+
+
+def resolve_rho_split(rho_split: float | None = None) -> float:
+    """Return the rho_tau to use: an explicit override, else DP_RHO_SPLIT, else 0.2."""
+    if rho_split is not None:
+        return float(rho_split)
+    return float(os.environ.get(DP_RHO_SPLIT_ENV, "0.2"))
+
+
 def run_dp_on_stream(
     aggregates: list[float],
     pub_counts: list[int],
@@ -82,14 +104,21 @@ def run_dp_on_stream(
     strategy: str,
     seed: int = 0,
     epsilon_count: float = 0.0,
+    rho_split: float | None = None,
     max_publishers: int | None = None,
+    sums: list[float] | None = None,
 ) -> dict:
     """Run the DP engine on a pre-aggregated stream (offline evaluation).
 
-    ``epsilon_count`` > 0 makes the P-allocation release gate compare a
-    differentially private count |P_tau| (Laplace scale 1/eps_count, paper Sec.
-    6.3 step 1) against P_min instead of the exact count; ``max_publishers``
-    caps the multiplicity that enters the mean sensitivity (P_max, Sec. 6.5).
+    For population-aware strategies (P-gated / n-weighted) the broker releases
+    the aggregate stream element as a sum/count pair (Definition: Aggregate
+    Stream Element): the per-step budget eps_tau = epsilon/window_size is split
+    by ``rho_split`` into the noisy count n~_tau (rho share, Laplace scale
+    1/(rho*eps_tau)) and the noisy sum S~_tau (1-rho share, scale R/((1-rho)*
+    eps_tau)), post-processed into gamma_tau = S~_tau/max(n~_tau, 1).  rho <= 0
+    disables the DP count (exact |P_tau|).  ``epsilon_count`` is deprecated and
+    ignored (superseded by ``rho_split``).  ``max_publishers`` caps the
+    multiplicity that enters the sensitivity (P_max, Sec. 6.5).
     """
     np.random.seed(seed)
     config = PrivacyConfig(
@@ -98,6 +127,7 @@ def run_dp_on_stream(
         min_publishers=int(min_publishers),
         payload_bound=float(payload_bound),
         strategy=BudgetStrategy(strategy),
+        rho_split=resolve_rho_split(rho_split),
         epsilon_count=float(epsilon_count),
         # NaN-safe: a "no cap" P_max resolved from the grid optimum arrives as
         # NaN (pandas/JSON null), and NaN is truthy -- coerce it to None.
@@ -107,8 +137,15 @@ def run_dp_on_stream(
                         else None),
     )
     stream = StreamState(config=config)
-    for agg, n in zip(aggregates, pub_counts):
-        stream.release(agg, n)
+    # The noisy-sum component S~_tau is built from the ACTUAL pooled sum
+    # sum_{p in P_tau} x_{p,tau}, not from aggregate*n.  ``sums`` carries that
+    # real per-timestamp data sum when the caller has it; otherwise we recover it
+    # from the pooled mean and count -- which is exact because the upstream
+    # rebuild emits one value per publisher, so aggregate*n == sum_p x_{p,tau}.
+    if sums is None:
+        sums = [a * n for a, n in zip(aggregates, pub_counts)]
+    for agg, n, s in zip(aggregates, pub_counts, sums):
+        stream.release(agg, n, true_sum=s)
 
     metrics = compute_utility_metrics(stream.true_values, stream.noisy_values)
     metrics["normalized_mae"] = (
@@ -683,7 +720,7 @@ def _evaluate_stream(
     res = run_dp_on_stream(
         agg, cnt, epsilon=epsilon, window_size=w, min_publishers=int(P),
         payload_bound=payload_bound, strategy=strategy, seed=seed,
-        epsilon_count=epsilon_count, max_publishers=max_publishers,
+        rho_split=resolve_rho_split(), max_publishers=max_publishers,
     )
     m = res["metrics"]
     nmae = m["normalized_mae"]; rr = m["release_rate"]
@@ -801,6 +838,41 @@ def level_subscription_streams(dataset_name, sensor, per_pub, k_ext=0):
         for prefix, members in levels[L].items():
             agg, cnt = _adaptive_interval_rebuild(per_pub, 1, k_ext, subset=members)
             out.append((L, prefix, agg, cnt, len(members)))
+    return out
+
+
+def grid_level_streams(dataset_name, sensor, per_pub, clamp_mode, grid_config,
+                       strategy, epsilon, default_k_ext=0, override_pmin=None):
+    """Like ``level_subscription_streams`` but builds each level's stream from the
+    GRID-OPTIMAL hyperparameters for (dataset, clamp, strategy, epsilon).
+
+    The grid search (Sec. 7.5) fixes everything except the two free axes epsilon
+    and w: P_min, P_max, Delta_t (base_dt) and K_ext come from the optimum, so the
+    stream is rebuilt at the grid P_min / K_ext / Delta_t (which shape it via the
+    adaptive-interval pooling), and the release-time P_max / rho are returned for
+    the caller to pass to ``run_dp_on_stream``.  ``override_pmin`` forces P_min to
+    a caller value (the intro figure sweeps every P_min instead of taking the
+    grid's).  Returns ``[(L, scope, agg, cnt, n_pubs, prm)]`` where ``prm`` is the
+    resolved {P_min, P_max, k_ext, delta_t, rho_split} for that (strategy, eps)."""
+    prm = _resolve_params(
+        grid_config, dataset_name, clamp_mode, strategy, epsilon,
+        {"P_min": (override_pmin if override_pmin is not None else 1),
+         "P_max": None, "k_ext": default_k_ext, "delta_t": 1})
+    P = int(override_pmin) if override_pmin is not None else int(prm["P_min"])
+    k_ext = int(prm.get("k_ext", default_k_ext) or 0)
+    base_dt = int(prm.get("delta_t", 1) or 1)
+    # The released stream's P_min is whatever actually shaped it (grid or override).
+    prm = dict(prm); prm["P_min"] = P
+    levels = _topic_level_groups(dataset_name, sensor, list(per_pub.keys()))
+    if not levels:
+        agg, cnt = _adaptive_interval_rebuild(per_pub, P, k_ext, base_dt=base_dt)
+        return [(1, sensor, agg, cnt, len(per_pub), prm)]
+    out = []
+    for L in sorted(levels):
+        for prefix, members in levels[L].items():
+            agg, cnt = _adaptive_interval_rebuild(
+                per_pub, P, k_ext, subset=members, base_dt=base_dt)
+            out.append((L, prefix, agg, cnt, len(members), prm))
     return out
 
 
@@ -1014,10 +1086,10 @@ def run_dataset(
             trials=trials,
             per_pubs=per_pubs,          # per-level subscriptions (every topic level)
             k_ext=getattr(args, "k_ext", 0),
-            # n_tau is DP-private: charge eps_count for the gate/calibration count
-            # on the population-aware strategies (Kellaris baselines ignore it).
-            epsilon_count=getattr(args, "epsilon_count", 0.0),
             max_publishers=getattr(args, "max_publishers", None),
+            # The sweep keeps only eps & w free; P_min/P_max/Delta_t/K_ext/rho
+            # come from the §7.5 grid optimum for each (dataset, strategy, eps).
+            grid_config=getattr(args, "grid_config", None),
         )
         df["clamp_mode"] = clamp_mode
         df["eps_clip"] = args.eps_clip if clamp_mode == "dp_released" else 0.0
@@ -1242,13 +1314,17 @@ def _experiment_single_axis_task(task):
     hierarchy this subscription is bound to (so B/C test every level)."""
     (ds_name, sensor, key, strategy, P, eps, w,
      clamp_mode, log_messages, experiment_tag, trial, seed,
-     subscription_level, scope, eps_count, p_max) = task
+     subscription_level, scope, rho_ds, p_max) = task
     agg, cnt, R = _WORKER_STREAMS[key]
+    # B (vary w) and C (vary eps) keep eps and w free and take every other
+    # hyperparameter from the grid optimum: the stream cached at ``key`` was
+    # already rebuilt with the grid P_min / K_ext / Delta_t, and the release uses
+    # the grid P_min gate, P_max (p_max) and rho (rho_ds) for this (strategy,eps).
     res = run_dp_on_stream(
         agg, cnt, epsilon=eps, window_size=w,
         min_publishers=P, payload_bound=R,
         strategy=strategy, seed=seed,
-        epsilon_count=eps_count, max_publishers=p_max,
+        rho_split=rho_ds, max_publishers=p_max,
     )
     m = res["metrics"]
     elig_n = [n for n in cnt if n > 0]
@@ -1260,7 +1336,7 @@ def _experiment_single_axis_task(task):
     out = {
         "dataset": ds_name, "sensor": sensor,
         "clamp_mode": clamp_mode,
-        "strategy": strategy, "P": P,
+        "strategy": strategy, "P": P, "P_max": p_max, "rho_split": rho_ds,
         "epsilon": eps, "w": w,
         "payload_bound": R,
         "normalized_mae": m["normalized_mae"],
@@ -1431,6 +1507,7 @@ def _drive_plugin_scenario(
         timestamp_interval=delta_t,
         k_ext=k_ext,
         epsilon_count=epsilon_count,
+        rho_split=resolve_rho_split(),
         max_publishers=max_publishers,
         enable_hierarchy_walk=enable_hierarchy_walk,
         sensor_bounds={sensor: (lo, hi)},
@@ -1538,6 +1615,13 @@ def _adaptive_interval_rebuild(
     hyperparameter); k_ext == 0 reduces to the fixed-Delta_t stream.  ``subset``
     restricts the pooled publisher set (used for the leaf/group scopes); None
     pools all.
+
+    Aggregation is ONE value per publisher (x_{p,tau} = the mean of publisher
+    p's readings inside the window), matching the DP model where the pool P_tau
+    contributes one clamped value per publisher.  This keeps the emitted
+    (mean, count) mutually consistent -- mean == (sum_p x_{p,tau}) / |P_tau| --
+    so the pooled sum the DP engine privatizes is exactly mean * count (it is
+    NOT distorted by publishers that emit several readings in a widened window).
     """
     pubs = subset if subset is not None else list(per_pub.keys())
     if not pubs:
@@ -1547,8 +1631,7 @@ def _adaptive_interval_rebuild(
     agg, cnt = [], []
     tau = 0
     while tau < T:
-        vals: list[float] = []
-        active: set[str] = set()
+        pub_readings: dict[str, list[float]] = {}
         end = tau
         ext = 0
         while True:
@@ -1557,14 +1640,15 @@ def _adaptive_interval_rebuild(
                 for p in pubs:
                     v = per_pub[p][slot]
                     if v is not None:
-                        vals.append(v)
-                        active.add(p)
+                        pub_readings.setdefault(p, []).append(v)
             end = block_end
-            if len(active) >= P or ext >= k_ext or end >= T:
+            if len(pub_readings) >= P or ext >= k_ext or end >= T:
                 break
             ext += 1
-        agg.append(float(np.mean(vals)) if vals else 0.0)
-        cnt.append(len(active))
+        # One value per active publisher, then the pooled per-publisher mean.
+        pub_values = [float(np.mean(vs)) for vs in pub_readings.values()]
+        agg.append(float(np.mean(pub_values)) if pub_values else 0.0)
+        cnt.append(len(pub_values))
         tau = end
     return agg, cnt
 
@@ -1613,6 +1697,8 @@ def _write_grid_canonical(output_dir: str, best_records: list[dict],
                       else None),
             "delta_t": int(r.get("delta_t", 1)),
             "k_ext": int(r.get("k_ext", 0)),
+            "rho_split": (float(r["rho_split"]) if r.get("rho_split") is not None
+                          else None),
             "mae": float(r.get("mae")) if r.get("mae") is not None else None,
         })
     with open(path, "w") as fh:
@@ -1650,10 +1736,12 @@ def _merge_grid_trial_fragments(frag_paths: list[str]) -> dict | None:
             pmax = r.get("P_max")
             pmax = None if pmax is None or (isinstance(pmax, float) and np.isnan(pmax)) else int(pmax)
             r["P_max"] = pmax   # normalize NaN/null -> None so consumers don't int(NaN)
+            rho = r.get("rho_split")
             key = (r.get("dataset"), r.get("clamp_mode"), r.get("strategy"),
                    round(float(r.get("epsilon", 0.0)), 4),
                    int(r.get("P_min")), pmax,
-                   int(r.get("delta_t", 1)), int(r.get("k_ext", 0)))
+                   int(r.get("delta_t", 1)), int(r.get("k_ext", 0)),
+                   round(float(rho), 4) if rho is not None else None)
             buckets[key].append(float(mae))
             meta[key] = r
     if not buckets:
@@ -1727,23 +1815,45 @@ def _load_grid_config(path: str | None) -> dict | None:
 
 def _resolve_params(grid_config: dict | None, dataset: str, clamp_mode: str,
                     strategy: str, epsilon: float, defaults: dict) -> dict:
-    """Return {P_min, P_max, k_ext, delta_t} from the canonical grid config for
-    this (dataset, clamp, strategy, epsilon), else the supplied defaults."""
+    """Return {P_min, P_max, k_ext, delta_t, rho_split} from the canonical grid
+    config for this (dataset, clamp, strategy, epsilon), else the supplied
+    defaults.  rho_split always resolves (grid optimum -> default rho) so every
+    downstream experiment runs at the grid-selected split.
+
+    Lookup order, so that EVERY (w, epsilon, strategy) the experiments test maps
+    to a grid optimum (Thesis §7.6: the per-dataset optima are frozen as the
+    canonical config for the downstream experiments):
+      1. exact (dataset, clamp, strategy, epsilon);
+      2. same (dataset, clamp, strategy) at the NEAREST grid epsilon -- so the
+         epsilon-sweep (Exp C) values that lie between/outside the grid's epsilon
+         choices still use that strategy's optimum;
+      3. any (dataset, clamp) entry at the nearest epsilon (strategy-agnostic);
+      4. the supplied defaults."""
     out = dict(defaults)
+    out.setdefault("rho_split", resolve_rho_split())
     if grid_config is None:
         return out
-    rec = grid_config.get(
-        (dataset, clamp_mode, strategy, round(float(epsilon), 4)))
+    eps = round(float(epsilon), 4)
+    rec = grid_config.get((dataset, clamp_mode, strategy, eps))
     if rec is None:
-        # Strategy-agnostic fallback: any entry for this (dataset, clamp, eps).
-        for (d, c, _s, e), r in grid_config.items():
-            if d == dataset and c == clamp_mode and e == round(float(epsilon), 4):
-                rec = r
-                break
+        # Nearest-epsilon for this strategy (the grid is sampled at a few epsilon
+        # choices; the optimum is stable enough that the closest is the right
+        # canonical to reuse for an off-grid epsilon).
+        same_strat = [(e, r) for (d, c, s, e), r in grid_config.items()
+                      if d == dataset and c == clamp_mode and s == strategy]
+        if same_strat:
+            rec = min(same_strat, key=lambda er: abs(er[0] - eps))[1]
+    if rec is None:
+        # Strategy-agnostic: nearest epsilon for any entry of this (dataset, clamp).
+        any_strat = [(e, r) for (d, c, _s, e), r in grid_config.items()
+                     if d == dataset and c == clamp_mode]
+        if any_strat:
+            rec = min(any_strat, key=lambda er: abs(er[0] - eps))[1]
     if rec is None:
         return out
     for k_cfg, k_out in (("P_min", "P_min"), ("P_max", "P_max"),
-                         ("k_ext", "k_ext"), ("delta_t", "delta_t")):
+                         ("k_ext", "k_ext"), ("delta_t", "delta_t"),
+                         ("rho_split", "rho_split")):
         if rec.get(k_cfg) is not None:
             out[k_out] = rec[k_cfg]
     return out
@@ -2038,16 +2148,30 @@ def _run_grid_search_block(args, targets, clamp_modes, eps_values, strategies,
     p_max_grid = [None, 4, 8, 16]
     dt_grid = [1, 2, 4]
     k_ext_grid = [0, 2, 4]
+    # rho_tau candidates for the aggregate stream element (Definition: Aggregate
+    # Stream Element).  6 values anchored at the definition's error-equalizing
+    # sqrt(R)/(5 sqrt(R)) = 0.2, plus a smaller 0.1 (more budget to the sum) and
+    # a span toward sum-starving values: small rho starves the count (noisy
+    # gate), large rho starves the sum (noisy magnitude), so the MAE optimum is
+    # interior.  The selected best rho is written into grid_canonical.json and
+    # consumed by downstream experiments.
+    rho_grid = [0.1, 0.2, 0.4, 0.5, 0.6, 0.8]
     # --quick is meant to validate the whole path fast; the full §7.5 grid is
-    # 5x4x3x3 = 180 combos x strategies x eps (thousands of DP passes per
-    # dataset) and is the slowest shard.  Shrink it under --quick (24 combos)
-    # so the smoke test finishes in ~1 min instead of ~10; the FULL run still
-    # uses the complete grid.
+    # 5x4x3x3x6 = 1080 combos x strategies x eps (thousands of DP passes per
+    # dataset) and is the slowest shard.  Shrink it under --quick so the smoke
+    # test stays ~1 min; the FULL run still uses the complete grid.
     if getattr(args, "quick", False):
         p_min_grid = [1, 3, 6]
         p_max_grid = [None, 8]
         dt_grid = [1, 2]
         k_ext_grid = [0, 2]
+        rho_grid = [0.1, 0.2, 0.5]
+    # Per-rho cluster shard (--grid-rho): restrict this task to one rho candidate
+    # so the rho sweep fans out one SLURM task per rho; the full-grid fragments
+    # are min-merged across rho downstream (see grid_search.main).
+    grid_rho = getattr(args, "grid_rho", None)
+    if grid_rho is not None:
+        rho_grid = [float(grid_rho)]
     canonical_records: list[dict] = []
     full_records: list[dict] = []
     for clamp_mode in clamp_modes:
@@ -2064,13 +2188,21 @@ def _run_grid_search_block(args, targets, clamp_modes, eps_values, strategies,
             dirs = _dataset_dirs(args.output_dir, name, clamp_mode)
             grid_dir = os.path.join(dirs["tuning"], "grid_search")
             for eps in eps_values:
-                tag = f"{first_sensor}_eps{eps}" + (f"_t{trial}" if trial is not None else "")
+                # The per-shard diagnostic CSVs are written into the SHARED grid
+                # dir, so the tag must be unique per (eps, trial, rho) shard --
+                # otherwise concurrent rho shards on different nodes clobber each
+                # other's *_gridsearch.csv.  (The canonical merge uses the
+                # rho-tagged JSON fragments, not these CSVs.)
+                tag = f"{first_sensor}_eps{eps}"
+                if trial is not None:
+                    tag += f"_t{trial}"
+                if grid_rho is not None:
+                    tag += f"_rho{grid_rho}"
                 df = grid_search_hyperparameters(
                     pp, B, name, tag, grid_dir,
                     epsilon=eps, w=8, strategies=strategies,
                     p_min_grid=p_min_grid, p_max_grid=p_max_grid,
-                    dt_grid=dt_grid, k_ext_grid=k_ext_grid,
-                    epsilon_count=args.epsilon_count,
+                    dt_grid=dt_grid, k_ext_grid=k_ext_grid, rho_grid=rho_grid,
                     seed=seed, workers=args.workers,
                 )
                 if full_fragment is not None:

@@ -25,7 +25,7 @@ MODULES = ["M1_pgate", "M2_interval_ext", "M3_walk_up"]
 def _ablation_task(task):
     """One (scope, module, trial) ablation point, run from the worker cache."""
     (key, ds_name, sensor, clamp_mode, scope, module, m_idx,
-     epsilon, w, P_ds, P_max_ds, k_ext_ds, eps_count, strategy,
+     epsilon, w, P_ds, P_max_ds, k_ext_ds, rho_ds, strategy,
      trial, seed_t) = task
     agg, cnt, B = core._WORKER_STREAMS[key]
     if len(agg) < w + 2:
@@ -35,12 +35,12 @@ def _ablation_task(task):
         m = core.run_dp_on_stream(
             agg, cnt, epsilon=epsilon, window_size=w, min_publishers=P_ds,
             payload_bound=B, strategy=strategy, seed=seed_t,
-            epsilon_count=eps_count, max_publishers=P_max_ds)["metrics"]
+            rho_split=rho_ds, max_publishers=P_max_ds)["metrics"]
     return {
         "dataset": ds_name, "sensor": sensor, "clamp_mode": clamp_mode,
         "scope": scope, "module": module, "module_idx": m_idx,
         "epsilon": epsilon, "w": w, "P": P_ds, "P_max": P_max_ds,
-        "k_ext": k_ext_ds, "epsilon_count": eps_count,
+        "k_ext": k_ext_ds, "rho_split": rho_ds,
         "strategy": strategy, "payload_bound": B,
         "trial": trial, "seed": seed_t,
         "normalized_mae": m.get("normalized_mae"), "mae": m.get("mae"),
@@ -98,6 +98,7 @@ def ablation_experiment(
         prm = core._resolve_params(grid_config, ds_name, clamp_mode, strategy,
                                    epsilon, {"P_min": P, "P_max": None, "k_ext": k_ext})
         P_ds, P_max_ds, k_ext_ds = prm["P_min"], prm["P_max"], prm["k_ext"]
+        rho_ds = prm["rho_split"]   # grid-selected split for this (ds, strategy, eps)
         per_pub, B = prepared.per_pubs[sensor]
         for scope in ("leaf", "pooled"):
             streams = _ablation_module_streams(per_pub, P_ds, k_ext_ds, scope)
@@ -108,7 +109,7 @@ def ablation_experiment(
                 for trial in range(max(1, trials)):
                     tasks.append((key, ds_name, sensor, clamp_mode, scope, module,
                                   m_idx, epsilon, w, P_ds, P_max_ds, k_ext_ds,
-                                  epsilon_count, strategy, trial, seed + 1000 * trial))
+                                  rho_ds, strategy, trial, seed + 1000 * trial))
     rows = core._run_parallel_tasks(
         tasks, _ablation_task, workers=workers,
         initializer=core._init_streams_worker, initargs=(streams_by_key,),

@@ -60,12 +60,12 @@ def _range_compatible_fraction(spec, sensors, ref_sensor) -> float:
 def _avg_case_task(task):
     """One (level-subscription, trial) average-case utility measurement."""
     (key, ds_name, sensor, level, scope, frac, depth_h, n_types,
-     epsilon, w, eps_count, strategy, P_ds, P_max_ds, trial, seed_t) = task
+     epsilon, w, rho_ds, strategy, P_ds, P_max_ds, trial, seed_t) = task
     agg, cnt, B = core._WORKER_STREAMS[key]
     m = core.run_dp_on_stream(
         agg, cnt, epsilon=epsilon, window_size=w, min_publishers=P_ds,
         payload_bound=B, strategy=strategy, seed=seed_t,
-        epsilon_count=eps_count, max_publishers=P_max_ds)["metrics"]
+        rho_split=rho_ds, max_publishers=P_max_ds)["metrics"]
     return {
         "dataset": ds_name, "ref_sensor": sensor, "clamp_mode": None,
         "subscription_level": level, "scope": scope,
@@ -78,7 +78,7 @@ def _avg_case_task(task):
         "eps_count_spent": m.get("eps_count_spent", 0.0),
         "dp_count_releases": m.get("dp_count_releases", 0),
         "epsilon": epsilon, "w": w, "P": P_ds, "P_max": P_max_ds,
-        "epsilon_count": eps_count,
+        "rho_split": rho_ds,
     }
 
 
@@ -105,6 +105,7 @@ def average_case_utility_experiment(
         prm = core._resolve_params(grid_config, ds_name, clamp_mode, strategy,
                                    epsilon, {"P_min": P, "P_max": None})
         P_ds, P_max_ds = prm["P_min"], prm["P_max"]
+        rho_ds = prm["rho_split"]   # grid-selected split for this (ds, strategy, eps)
         # Every sensor as the subscription reference, at every topic level.
         for sensor in [s for s in sensors if s in prepared.per_pubs]:
             frac = _range_compatible_fraction(prepared.spec, sensors, sensor)
@@ -115,7 +116,7 @@ def average_case_utility_experiment(
                 streams_by_key[key] = (agg, cnt, B)
                 for trial in range(max(1, trials)):
                     tasks.append((key, ds_name, sensor, L, scope, frac, depth_h,
-                                  len(sensors), epsilon, w, epsilon_count, strategy,
+                                  len(sensors), epsilon, w, rho_ds, strategy,
                                   P_ds, P_max_ds, trial, seed + 1000 * trial))
     rows = core._run_parallel_tasks(
         tasks, _avg_case_task, workers=workers,

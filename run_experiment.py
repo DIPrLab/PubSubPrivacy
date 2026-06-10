@@ -43,11 +43,19 @@ def main():
     parser.add_argument("--eps-clip", type=float, default=0.1,
                         help="Option B calibration budget epsilon_clip (Def 3.2)")
     parser.add_argument("--epsilon-count", type=float, default=0.05,
-                        help="eps_count: per-step budget spent to release a "
-                             "differentially private publisher count |P_tau| "
-                             "(sensitivity 1) when gating / walking the topic "
-                             "hierarchy (paper Sec. 6.3 step 1, Table 3).  0 "
-                             "uses the exact count (Kellaris baselines).")
+                        help="DEPRECATED / ignored: superseded by --rho-split. "
+                             "The DP publisher count is now the rho share of the "
+                             "per-step budget eps_tau.")
+    parser.add_argument("--rho-split", type=float, default=0.2,
+                        help="Split parameter rho_tau in (0,1) for the aggregate "
+                             "stream element (Definition: Aggregate Stream "
+                             "Element).  The broker releases the noisy count "
+                             "n~_tau = |P_tau| + Lap(1/(rho*eps_tau)) and the "
+                             "noisy sum S~_tau = sum_p x~ + Lap(R/((1-rho)*"
+                             "eps_tau)), post-processed into gamma_tau = "
+                             "S~_tau/max(n~_tau,1).  0 disables the DP count "
+                             "(exact |P_tau| / Kellaris baselines).  Default 0.2 "
+                             "(the definition's sqrt(R)/(5 sqrt(R)); min error).")
     parser.add_argument("--max-publishers", type=int, default=None,
                         help="P_max: cap the multiplicity folded into the mean "
                              "so Delta_f = R/n changes by a bounded amount "
@@ -212,7 +220,12 @@ def main():
     )
     args = parser.parse_args()
     args.workers = _default_workers(args.workers)
+    # Publish the run-global rho_tau (aggregate stream element split) so spawned
+    # ProcessPoolExecutor workers inherit it via DP_RHO_SPLIT.
+    set_rho_split(args.rho_split)
     logger.info(f"Using {args.workers} worker process(es) for parallel tasks")
+    logger.info(f"Aggregate stream element split rho_tau = {args.rho_split} "
+                f"(count gets rho*eps_tau, sum gets (1-rho)*eps_tau)")
 
     # When plot generation is disabled, short-circuit savefig so the
     # experiment functions keep writing their CSVs but produce no PNGs.

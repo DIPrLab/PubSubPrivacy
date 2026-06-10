@@ -22,24 +22,24 @@ from experiments import engine as core
 _WORKER_GRID_CTX = None
 
 
-def _init_grid_worker(streams_by_key, payload_bound, epsilon, w, epsilon_count, seed):
+def _init_grid_worker(streams_by_key, payload_bound, epsilon, w, seed):
     global _WORKER_GRID_CTX
-    _WORKER_GRID_CTX = (streams_by_key, payload_bound, epsilon, w, epsilon_count, seed)
+    _WORKER_GRID_CTX = (streams_by_key, payload_bound, epsilon, w, seed)
 
 
 def _grid_eval_task(task):
-    """Score one (strategy, base_dt, k_ext, p_min, p_max) grid cell."""
-    strat, base_dt, k_ext, p_min, p_max = task
-    streams_by_key, B, eps, w, eps_count, seed = _WORKER_GRID_CTX
+    """Score one (strategy, base_dt, k_ext, p_min, p_max, rho) grid cell."""
+    strat, base_dt, k_ext, p_min, p_max, rho = task
+    streams_by_key, B, eps, w, seed = _WORKER_GRID_CTX
     agg, cnt = streams_by_key[(base_dt, k_ext, p_min)]
     m = core.run_dp_on_stream(
         agg, cnt, epsilon=eps, window_size=w, min_publishers=p_min,
         payload_bound=B, strategy=strat, seed=seed,
-        epsilon_count=eps_count, max_publishers=p_max)["metrics"]
+        rho_split=rho, max_publishers=p_max)["metrics"]
     return {
         "strategy": strat, "epsilon": eps, "w": w,
         "P_min": p_min, "P_max": p_max, "delta_t": base_dt, "k_ext": k_ext,
-        "epsilon_count": eps_count,
+        "rho_split": rho,
         "mae": m.get("mae"), "normalized_mae": m.get("normalized_mae"),
         "kl_divergence": m.get("kl_divergence"), "release_rate": m.get("release_rate"),
         "avg_n_tau": float(np.mean(cnt)) if cnt else float("nan"),
@@ -50,11 +50,13 @@ def _grid_eval_task(task):
 def grid_search_hyperparameters(
     per_pub, payload_bound, dataset_name, sensor_name, output_dir, *,
     epsilon, w, strategies, p_min_grid, p_max_grid, dt_grid, k_ext_grid,
-    epsilon_count: float = 0.0, seed: int = 77, workers: int = 1,
+    rho_grid, seed: int = 77, workers: int = 1,
 ) -> "pd.DataFrame":
     """Sec. 7.5 grid search: the (agg,cnt) stream depends only on
-    (base_dt,k_ext,p_min) so it is rebuilt once per such key, and the DP scoring
-    fans out over ``workers``.  Writes the full grid + per-strategy MAE optimum."""
+    (base_dt,k_ext,p_min) -- NOT on rho_split, which only recalibrates the DP
+    noise -- so each stream is rebuilt once per such key and the DP scoring
+    (including the rho sweep) fans out over ``workers``.  Writes the full grid +
+    per-strategy MAE optimum (whose chosen config now carries the best rho)."""
     streams_by_key: dict = {}
     for base_dt in dt_grid:
         for k_ext in k_ext_grid:
@@ -64,20 +66,21 @@ def grid_search_hyperparameters(
                 if len(agg) >= w + 2:
                     streams_by_key[(base_dt, k_ext, p_min)] = (agg, cnt)
     tasks = [
-        (strat, base_dt, k_ext, p_min, p_max)
+        (strat, base_dt, k_ext, p_min, p_max, rho)
         for strat in strategies
         for (base_dt, k_ext, p_min) in streams_by_key
         for p_max in p_max_grid
+        for rho in rho_grid
         if not (p_max is not None and p_max < p_min)
     ]
     if workers and workers > 1 and len(tasks) > 1:
         scored = core._run_parallel_tasks(
             tasks, _grid_eval_task, workers=workers, initializer=_init_grid_worker,
-            initargs=(streams_by_key, payload_bound, epsilon, w, epsilon_count, seed),
+            initargs=(streams_by_key, payload_bound, epsilon, w, seed),
             progress_label=f"  [{dataset_name}/{sensor_name}] grid",
             progress_every=max(20, len(tasks) // 10))
     else:
-        _init_grid_worker(streams_by_key, payload_bound, epsilon, w, epsilon_count, seed)
+        _init_grid_worker(streams_by_key, payload_bound, epsilon, w, seed)
         scored = [_grid_eval_task(t) for t in tasks]
     rows = [{"dataset": dataset_name, "sensor": sensor_name, **r} for r in scored]
     df = pd.DataFrame(rows)
@@ -112,15 +115,29 @@ def main():
     # _load_grid_config merges every fragment in that directory.
     grid_eps = getattr(args, "grid_eps", None)
     grid_trial = getattr(args, "grid_trial", None)
+    grid_rho = getattr(args, "grid_rho", None)
     eps_values = [grid_eps] if grid_eps is not None else args.eps_values
-    if grid_trial is not None:
-        # Per-trial shard: write a FULL-grid fragment at this trial's seed; the
-        # merge in _load_grid_config averages MAE across trials and then picks
-        # each strategy's optimum.  One SLURM task per (eps, trial).
-        suffix = f"_eps{grid_eps}" if grid_eps is not None else ""
+    # Per-rho sharding REQUIRES the full-fragment merge path: per-rho canonicals
+    # share the same (dataset,clamp,strategy,eps) keys, so the canonical-file
+    # merge (_load_grid_config) would take last-wins instead of the cross-rho
+    # MAE minimum.  So whenever --grid-rho is set we force the trial-fragment
+    # path (synthesizing trial 0 if none was given) -- _merge_grid_trial_fragments
+    # then picks the global optimum across all rho.  The cluster always pairs
+    # --grid-rho with --grid-trial, so this only hardens manual single-shard use.
+    if grid_trial is not None or grid_rho is not None:
+        t = grid_trial if grid_trial is not None else 0
+        # Per-trial (and optionally per-eps / per-rho) shard: write a FULL-grid
+        # fragment at this trial's seed; _merge_grid_trial_fragments averages MAE
+        # across trials and picks each (dataset,clamp,strategy,eps)'s global
+        # optimum across ALL fragments -- including across rho shards, since rho
+        # is part of each record and of the merge key.  The filename carries the
+        # eps/rho tags so the shards never overwrite one another.  One SLURM task
+        # per (eps, trial, rho).
+        suffix = (f"_eps{grid_eps}" if grid_eps is not None else "") + \
+                 (f"_rho{grid_rho}" if grid_rho is not None else "")
         core._run_grid_search_block(
             args, args._targets, args._clamp_modes, eps_values, args.strategies,
-            trial=grid_trial, full_fragment=f"grid_trial{suffix}_t{grid_trial}.json")
+            trial=t, full_fragment=f"grid_trial{suffix}_t{t}.json")
     else:
         canonical = (f"grid_canonical_eps{grid_eps}.json"
                      if grid_eps is not None else "grid_canonical.json")

@@ -23,6 +23,9 @@
 #   SWEEP_STRATEGIES  one sweep shard per strategy in fine mode (default: 8)
 #   GRID_EPS          one grid shard per epsilon in fine mode (default: 0.5 1 2 4)
 #   GRID_TRIALS       grid noise-seed trials, each its own task (default: 6)
+#   GRID_RHO          one grid shard per rho_tau candidate, fanned across nodes
+#                     (default: 0.1 0.2 0.4 0.5 0.6 0.8; set to a single value to
+#                      pin rho and skip the rho sweep)
 #   SWEEP_SENSOR_SHARDS  split each sweep strategy across N sensor-groups
 #                        (default: 3; 1 disables -- shortens the energy sweep)
 #   LOG_MESSAGES      1 to re-enable per-release message CSVs (default: 0 = off)
@@ -81,6 +84,12 @@ GRID_EPS="${GRID_EPS:-0.5 1.0 2.0 4.0}"
 # The §7.5 grid runs GRID_TRIALS independent noise seeds, each its own SLURM
 # task; _load_grid_config averages MAE across them before choosing the optimum.
 GRID_TRIALS="${GRID_TRIALS:-6}"
+# rho_tau candidates for the aggregate stream element (Definition: Aggregate
+# Stream Element).  The grid is sharded one SLURM task per rho so the rho sweep
+# fans out across nodes; each task writes a full-grid fragment and
+# _merge_grid_trial_fragments picks the global MAE optimum across all rho.  Set
+# GRID_RHO="0.2" to pin a single rho (no rho sharding / fastest grid).
+GRID_RHO="${GRID_RHO:-0.1 0.2 0.4 0.5 0.6 0.8}"
 # Split each sweep strategy across this many sensor-groups (round-robin) so a
 # heavy multi-sensor dataset (energy has 3 sensors) spreads its long sweep
 # across nodes.  1 = no sensor split.  3 keeps the energy non-gated sweep
@@ -122,8 +131,13 @@ emit() {
   fi
   local M; M="$(_module_of "$exp")"
   if [ -z "$M" ]; then echo "gen_jobs.sh: unknown experiment '$exp'" >&2; exit 2; fi
+  # Every phase-2 experiment consumes the §7.5 grid optimum (P_min, P_max,
+  # Delta_t, K_ext, rho per dataset/strategy/eps; only eps & w stay free).  So
+  # all of them -- not just F/G/H/L -- get --use-grid-config pointing at this
+  # (dataset, clamp) grid dir.  ('grid' itself is phase 1; 'gridfull' runs the
+  # grid in-process via --grid-first and needs no external config.)
   case "$exp" in
-    F|G|H|L)
+    sweep|intro|tuning|extras|A|B|C|D|F|G|H|L)
       extra="$extra --use-grid-config \"$OUT/shards/${ds}__${clamp}__grid/grid_canonical.json\"" ;;
   esac
   echo "PYTHONPATH=\"$REPO\" $PYTHON -m $M --dataset $ds --clamp-mode $clamp" \
@@ -180,15 +194,18 @@ for ds in $DATASETS; do
               fi
             done
           elif [ "$exp" = "grid" ]; then
-            # Split the §7.5 grid into one shard per (epsilon x trial) across
-            # nodes.  All share the ${ds}__${clamp}__grid dir, so the per-trial
-            # full-grid fragments land together; _load_grid_config averages MAE
-            # over the trials and picks each strategy's optimum for the F/G/H/L
-            # consumers.  GRID_TRIALS independent noise seeds, as separate tasks.
+            # Split the §7.5 grid into one shard per (epsilon x trial x rho)
+            # across nodes.  All share the ${ds}__${clamp}__grid dir, so the
+            # full-grid fragments land together; _merge_grid_trial_fragments
+            # averages MAE over the trials and picks each strategy's global
+            # optimum across ALL rho fragments (rho is part of the merge key) for
+            # the F/G/H/L consumers.  |GRID_EPS| x GRID_TRIALS x |GRID_RHO| tasks.
             for geps in $GRID_EPS; do
               for gt in $(seq 0 $((GRID_TRIALS - 1))); do
-                EXTRA_ARGS="$EXTRA_ARGS --grid-eps $geps --grid-trial $gt" \
-                  emit "$ds" "$clamp" grid "${ds}__${clamp}__grid"
+                for grho in $GRID_RHO; do
+                  EXTRA_ARGS="$EXTRA_ARGS --grid-eps $geps --grid-trial $gt --grid-rho $grho" \
+                    emit "$ds" "$clamp" grid "${ds}__${clamp}__grid"
+                done
               done
             done
           else

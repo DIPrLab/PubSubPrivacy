@@ -112,11 +112,52 @@ class PrivacyConfig:
     payload_bound: float  # R
     strategy: BudgetStrategy = BudgetStrategy.UNIFORM
     ba_threshold: float = 0.1
-    # DP count budget (Table 3): charged INSIDE the single w-event budget
-    # epsilon (the per-timestamp count draw takes from the usable epsilon).
+    # Split parameter rho_tau in (0, 1) for the aggregate-stream-element
+    # release (Definition: Aggregate Stream Element).  The per-step budget
+    # eps_tau = epsilon / window_size is split between the two privatized
+    # components the broker releases at tau: the noisy publisher count
+    #   n~_tau = n_tau + Lap(1 / (rho * eps_tau))                 (count: rho share)
+    # and the noisy sum
+    #   S~_tau = sum_p x~_{p,tau} + Lap(Delta_S / ((1 - rho) * eps_tau))  (sum: 1-rho share),
+    # post-processed into gamma_tau = S~_tau / max(n~_tau, 1) for f = mean.
+    # rho is data-independent at release time, so by sequential composition the
+    # element spends exactly eps_tau = (1-rho) eps_tau + rho eps_tau.  The count
+    # share is reserved across the window (see StreamState.release), so the
+    # allocator's pub_eps already equals (1-rho) * eps_tau -- the sum's share.
+    # Default 0.2 = the definition's error-equalizing sqrt(R)/(5 sqrt(R)); it
+    # empirically minimizes released error across datasets (see change notes).
+    rho_split: float = 0.2
+    # DEPRECATED: superseded by ``rho_split``.  Retained so existing callers
+    # that pass ``epsilon_count`` keep constructing; it no longer sets the count
+    # noise scale (that is now rho * eps_tau).  See ``count_epsilon``.
     epsilon_count: float = 0.05
     # P_max sensitivity-binding cap (Sec. 6.5).  None => no upper cap.
     max_publishers: Optional[int] = None
+
+    def step_epsilon(self) -> float:
+        """Per-step budget eps_tau = epsilon / window_size that rho splits."""
+        if self.window_size <= 0:
+            return 0.0
+        return self.epsilon / self.window_size
+
+    def count_epsilon(self) -> float:
+        """Count share rho * eps_tau spent on the noisy publisher count n~_tau.
+
+        The Laplace scale of the count (sensitivity 1) is 1 / count_epsilon() =
+        1 / (rho * eps_tau).  rho <= 0 disables the DP count (exact n_tau).
+        """
+        if self.rho_split <= 0:
+            return 0.0
+        return self.rho_split * self.step_epsilon()
+
+    def sum_sensitivity(self) -> float:
+        """Data-independent sum sensitivity Delta_S = R (one clamped payload).
+
+        Adding/removing one publisher shifts the pooled sum sum_p x~_{p,tau} by
+        at most the clamp range R, so the noisy sum S~_tau uses Delta_S = R --
+        independent of the multiplicity, unlike the mean's Delta_f = R/n_tau.
+        """
+        return self.payload_bound
 
     def effective_n(self, n_tau: int) -> int:
         """Multiplicity actually folded into the mean after the P_max cap.
@@ -146,6 +187,19 @@ class PrivacyConfig:
         if epsilon_tau <= 0 or n_tau <= 0:
             return float("inf")
         return self.sensitivity(n_tau) / epsilon_tau
+
+    def sum_noise_scale(self, sum_epsilon_tau: float) -> float:
+        """Laplace scale for the noisy sum S~_tau = Delta_S / ((1-rho) * eps_tau).
+
+        ``sum_epsilon_tau`` is the (1-rho) share of eps_tau actually allocated
+        to the publication (pub_eps), already net of the reserved count share,
+        so this equals Delta_S / ((1-rho) * eps_tau).  Unlike ``noise_scale``
+        there is no 1/n_tau factor: the sum sensitivity Delta_S = R is
+        data-independent.
+        """
+        if sum_epsilon_tau <= 0:
+            return float("inf")
+        return self.sum_sensitivity() / sum_epsilon_tau
 
 
 @dataclass
@@ -224,27 +278,30 @@ class StreamState:
     # ---- differentially private publisher count (eps_count) -------------
 
     def _dp_count(self, n_tau: int) -> int:
-        """Release |P_tau| under Laplace noise with sensitivity 1 (paper Sec.
-        6.3 step 1; Table 3 eps_count).
+        """Release the noisy publisher count n~_tau = |P_tau| + Lap(1/(rho*eps_tau)).
 
-        The count query has sensitivity 1 (one publisher added/removed), so the
-        Laplace scale is 1 / eps_count.  The noisy count is clamped to >= 0 and
-        rounded to the nearest integer.  When eps_count == 0 the DP count is
+        This is the count component of the aggregate stream element
+        (Definition: Aggregate Stream Element): the count query has sensitivity
+        1 (one publisher added/removed), so the Laplace scale is
+        1 / count_epsilon() = 1 / (rho * eps_tau) -- the rho share of the
+        per-step budget.  The noisy count is clamped to >= 0 and rounded to the
+        nearest integer.  When count_epsilon() == 0 (rho <= 0) the DP count is
         disabled and the exact n_tau is used (Kellaris-style baselines that do
         not gate on a population threshold).
 
         The caller draws this ONCE per timestamp/scope and reuses the returned
-        value for every downstream use of the multiplicity (the P_min gate, the
-        Laplace-scale denominator, and the n-weighted denominator).  Reuse is
-        free by post-processing, and because the exact n_tau is treated as
-        DP-private it never enters the released noise scale -- only this noisy
-        count does.
+        value n~_tau as the released count component AND for every downstream
+        use of the multiplicity (the P_min gate, the released denominator
+        max(n~_tau, 1), and the n-weighted denominator).  Reuse is free by
+        post-processing, and because the exact n_tau is treated as DP-private it
+        never enters the released noise scale -- only this noisy count does.
         """
-        if self.config.epsilon_count <= 0:
+        eps_n = self.config.count_epsilon()
+        if eps_n <= 0:
             return int(n_tau)
-        self.eps_count_spent += self.config.epsilon_count
+        self.eps_count_spent += eps_n
         self.dp_counts += 1
-        noisy = n_tau + float(np.random.laplace(loc=0.0, scale=1.0 / self.config.epsilon_count))
+        noisy = n_tau + float(np.random.laplace(loc=0.0, scale=1.0 / eps_n))
         return max(0, int(round(noisy)))
 
     # ---- private dissimilarity sub-mechanism M_{i,1} --------------------
@@ -446,7 +503,8 @@ class StreamState:
 
     def release(self, aggregate: float, n_tau: int,
                 n_gate: Optional[int] = None,
-                n_count_draws: int = 1) -> Optional[float]:
+                n_count_draws: int = 1,
+                true_sum: Optional[float] = None) -> Optional[float]:
         """
         Process one aggregate stream element with multiplicity n_tau.
 
@@ -454,6 +512,14 @@ class StreamState:
         is enforced here for P-gated / n-weighted strategies: if the gate count
         < P the element is deferred (last release is repeated) and no budget is
         spent.
+
+        ``true_sum`` is the actual pooled sum sum_{p in P_tau} x_{p,tau} that the
+        noisy-sum component S~_tau is built from (Definition: Aggregate Stream
+        Element).  Callers pass the real summed data; when omitted it falls back
+        to ``aggregate * n_tau`` (exact when the upstream aggregates one value
+        per publisher, e.g. the offline rebuild).  ``aggregate`` (the pooled
+        mean) is retained only as that fallback and as the true value the utility
+        metrics compare against -- it is NOT used to scale the released noise.
 
         ``n_gate`` lets the CALLER supply the (already differentially private)
         publisher count that the gate should compare against P_min — used by the
@@ -479,30 +545,31 @@ class StreamState:
         else:
             self._bd_pending_now = 0.0
 
-        # --- DP publisher count (eps_count) + P-allocation gate ----------
+        # --- DP publisher count (rho * eps_tau) + P-allocation gate -------
         # For our population-aware strategies the multiplicity n_tau is
-        # DP-PRIVATE.  We draw ONE noisy count |P_tau| under eps_count
-        # (sensitivity 1, scale 1/eps_count) and REUSE that single value for
-        # everything downstream -- the P_min gate, the Laplace-scale
-        # denominator, and the n-weighted denominator -- so the exact private
-        # n_tau never leaves the broker and reuse is free by post-processing
-        # (paper Sec. 6.3 step 1, Table 3).  eps_count is charged INSIDE the
-        # w-event budget eps: the count draw counts toward the sliding-window
-        # sum, so Sum_{window} (eps_count draws + releases) <= eps and the
-        # count utilizes the same budgeted epsilon as the releases.  Each of the
-        # w timestamps may draw a count, so the value-driven allocators run
-        # against eps_inner = eps - w * eps_count (reserved below).  The Kellaris
-        # baselines (Uniform/Sample/BD/BA) do not gate on a count and keep the
-        # exact n_tau (public in their row-addition model).  A caller that
-        # already drew the count (``n_gate``, the broker path) supplies it
-        # verbatim so the broker's Algorithm-1 decision is the single authority.
+        # DP-PRIVATE.  We draw ONE noisy count n~_tau = |P_tau| + Lap(1/(rho*
+        # eps_tau)) (sensitivity 1, the count component of the aggregate stream
+        # element) and REUSE that single value for everything downstream -- the
+        # P_min gate, the released denominator max(n~_tau, 1), and the
+        # n-weighted denominator -- so the exact private n_tau never leaves the
+        # broker and reuse is free by post-processing.  The count share rho *
+        # eps_tau is charged INSIDE the w-event budget eps: it counts toward the
+        # sliding-window sum, so Sum_{window} (count draws + sum releases) <= eps.
+        # Each of the w timestamps spends rho * eps_tau on its count, so the
+        # value-driven allocators run against eps_inner = eps - w*(rho*eps_tau)
+        # = (1-rho)*eps (reserved below) and their pub_eps is exactly the sum's
+        # (1-rho)*eps_tau share.  The Kellaris baselines (Uniform/Sample/BD/BA)
+        # do not gate on a count and keep the exact n_tau (public in their
+        # row-addition model).  A caller that already drew the count (``n_gate``,
+        # the broker path) supplies it verbatim so the broker's Algorithm-1
+        # decision is the single authority.
         eps_count_tau = 0.0
         population_aware = (is_p_gated(self.config.strategy)
                             or self.config.strategy == BudgetStrategy.N_WEIGHTED)
         if population_aware:
-            ec = self.config.epsilon_count
+            ec = self.config.count_epsilon()  # rho * eps_tau
             # Pre-check: never draw the DP count if the window can't pay for it,
-            # else the eps_count spend would breach the w-event invariant.
+            # else the count spend would breach the w-event invariant.
             if n_gate is None and ec > 0 and self._budget_remaining() < ec:
                 self._record(aggregate, self.last_released, 0.0, n_tau, deferred=True)
                 return self.last_released
@@ -527,18 +594,19 @@ class StreamState:
             self._record(aggregate, self.last_released, eps_count_tau, n_tau, deferred=True)
             return self.last_released
 
-        # P_max cap (Sec. 6.5): fold at most P_max publishers into the mean so
-        # the sensitivity Delta_f = R/n_eff changes by a bounded amount across
-        # stream elements.  For population-aware strategies n_eff is derived
-        # from the DP count n_dp (so the released noise scale reveals nothing
-        # about the exact private count); the n_window used by n-weighted
-        # allocation also stores this DP-count-derived value, keeping its
-        # denominator consistent with the calibrated noise.
+        # Post-P_max effective multiplicity, derived from the DP count n_dp so
+        # nothing here depends on the exact private count.  n_eff feeds the
+        # budget allocator (the n-weighted share and the n_window it records) and
+        # the Kellaris baselines' mean-sensitivity R/n_eff.  It does NOT enter the
+        # population-aware released noise: that sum uses the data-independent
+        # sensitivity Delta_S = R and is divided by the noisy count n_dp below.
         n_eff = self.config.effective_n(n_dp)
 
-        # Reserve the per-window DP-count budget so releases + count draws
-        # together stay under eps: eps_inner = eps - w * eps_count
-        # (eps_count == 0 -> eps_inner == eps).
+        # Reserve the per-window count share so sum releases + count draws
+        # together stay under eps: eps_inner = eps - w*(rho*eps_tau) = (1-rho)*eps.
+        # The allocator then hands back pub_eps = (1-rho)*eps_tau -- exactly the
+        # sum's share -- so S~_tau is calibrated to Delta_S/((1-rho)*eps_tau)
+        # below.  (rho <= 0 -> eps_count_tau == 0 -> eps_inner == eps.)
         self._alloc_eps = max(
             0.0, self.config.epsilon - self.config.window_size * eps_count_tau)
 
@@ -590,10 +658,30 @@ class StreamState:
                          n_eff, deferred=True)
             return self.last_released
 
-        # Sensitivity uses the post-P_max effective multiplicity (n_eff).
-        lam = self.config.noise_scale(pub_eps, n_eff)
-        noise = np.random.laplace(loc=0.0, scale=lam)
-        released = aggregate + noise
+        if population_aware:
+            # Aggregate stream element via the sum/count split (Definition:
+            # Aggregate Stream Element).  The broker drew the noisy count n~_tau
+            # above (scale 1/(rho*eps_tau)) and gated on it (n_dp >= P_min);
+            # here it releases the noisy sum
+            #   S~_tau = (sum_{p in P_tau} x_{p,tau}) + Lap(Delta_S/((1-rho)*eps_tau))
+            # with the data-independent sum sensitivity Delta_S = R and the
+            # (1-rho)*eps_tau = pub_eps share, then post-processes the mean as
+            #   gamma_tau = S~_tau / max(n~_tau, 1)
+            # -- a NOISY SUM over the NOISY COUNT.  pooled_sum is the ACTUAL
+            # summed data passed by the caller (NOT aggregate*n: that reconstructs
+            # the sum from the mean and is only used as a fallback when the caller
+            # cannot supply the real sum).  Dividing the true sum + Laplace noise
+            # by the independent noisy count n_dp is what makes the count noise
+            # propagate into gamma (it does not cancel).
+            pooled_sum = true_sum if true_sum is not None else aggregate * n_tau
+            sum_scale = self.config.sum_noise_scale(pub_eps)  # Delta_S/((1-rho)eps_tau)
+            noisy_sum = pooled_sum + np.random.laplace(loc=0.0, scale=sum_scale)
+            released = noisy_sum / max(n_dp, 1)   # n_dp = the noisy publisher count
+        else:
+            # Kellaris baselines: exact public count, direct noised mean with
+            # sensitivity uses the post-P_max effective multiplicity (n_eff).
+            lam = self.config.noise_scale(pub_eps, n_eff)
+            released = aggregate + np.random.laplace(loc=0.0, scale=lam)
 
         self.last_released = released
         self.last_true_aggregate = aggregate

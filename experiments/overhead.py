@@ -46,7 +46,7 @@ def _level_entries(ds_name, sensor, per_pub, k_ext):
 
 def _overhead_task(task):
     """One (level-subscription, approach, trial) overhead measurement."""
-    (key, approach, ds_name, sensor, level, scope, epsilon, w, eps_count,
+    (key, approach, ds_name, sensor, level, scope, epsilon, w, rho_ds,
      strategy, P_ds, P_max_ds, trial, seed_t) = task
     sub_per_pub, agg, cnt, B = core._WORKER_STREAMS[key]
     extra: dict = {}
@@ -68,7 +68,7 @@ def _overhead_task(task):
         m = core.run_dp_on_stream(agg, cnt, epsilon=epsilon, window_size=w,
                                   min_publishers=P_ds, payload_bound=B,
                                   strategy=strategy, seed=seed_t,
-                                  epsilon_count=eps_count,
+                                  rho_split=rho_ds,
                                   max_publishers=P_max_ds)["metrics"]
         compute_s = time.perf_counter() - t0
         extra = {"strategy": strategy, "P_min": P_ds, "P_max": P_max_ds}
@@ -112,6 +112,7 @@ def overhead_experiment(
         prm = core._resolve_params(grid_config, ds_name, clamp_mode, our_strategy,
                                    epsilon, {"P_min": P, "P_max": None})
         P_ds, P_max_ds = prm["P_min"], prm["P_max"]
+        rho_ds = prm["rho_split"]   # grid-selected split for this (ds, strategy, eps)
         for sensor in [s for s in prepared.spec["sensors"]
                        if s in prepared.per_pubs and s in prepared.streams]:
             per_pub, B = prepared.per_pubs[sensor]
@@ -122,7 +123,7 @@ def overhead_experiment(
                 for approach in approaches:
                     for trial in range(max(1, trials)):
                         tasks.append((key, approach, ds_name, sensor, L, scope,
-                                      epsilon, w, epsilon_count, our_strategy,
+                                      epsilon, w, rho_ds, our_strategy,
                                       P_ds, P_max_ds, trial, seed + 1000 * trial))
     rows = core._run_parallel_tasks(
         tasks, _overhead_task, workers=workers,

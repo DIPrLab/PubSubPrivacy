@@ -61,6 +61,11 @@ class TopicBuffer:
             return 0.0
         return sum(self.payloads.values()) / len(self.payloads)
 
+    def total(self) -> float:
+        """Actual pooled sum sum_{p in P_tau} x_{p,tau} (one value per
+        publisher), i.e. the real data the noisy sum S~_tau is built from."""
+        return float(sum(self.payloads.values()))
+
     def add(self, publisher_id: str, value: float, now: Optional[float] = None):
         if self.start_time is None:
             self.start_time = now if now is not None else time.time()
@@ -100,6 +105,7 @@ class PrivacyPlugin:
         k_ext: int = 0,
         ba_threshold: float = 0.1,
         epsilon_count: float = 0.0,
+        rho_split: float = 0.2,
         max_publishers: int | None = None,
         enable_hierarchy_walk: bool = True,
         sensor_bounds: dict[str, tuple[float, float]] | None = None,
@@ -117,10 +123,15 @@ class PrivacyPlugin:
         self.timestamp_interval = timestamp_interval
         self.k_ext = int(k_ext)
         self.ba_threshold = ba_threshold
-        # eps_count (Table 3): budget spent per hierarchy level to release a
-        # DP publisher count when deciding scope (Algorithm 1 step 3).  P_max
-        # caps the multiplicity folded into each release (Sec. 6.5).
+        # eps_count (Table 3, DEPRECATED): legacy per-level count budget.
+        # Superseded by ``rho_split`` -- the count is now the rho share of the
+        # per-step budget eps_tau = epsilon/window_size (Definition: Aggregate
+        # Stream Element), so every probe spends rho * eps_tau and the noisy
+        # count uses Laplace scale 1/(rho * eps_tau).
         self.epsilon_count = float(epsilon_count)
+        # Split parameter rho_tau in (0, 1): the count's share of eps_tau.  The
+        # sum then gets (1-rho) * eps_tau.  rho <= 0 disables the DP count.
+        self.rho_split = float(rho_split)
         self.max_publishers = int(max_publishers) if max_publishers else None
         # Ablation toggle (paper Sec. 7.8): when False the broker never walks
         # up the topic hierarchy; an under-P scope simply defers.  Lets the
@@ -193,9 +204,13 @@ class PrivacyPlugin:
                 payload_bound=self._payload_range_for(topic),
                 strategy=self.strategy,
                 ba_threshold=self.ba_threshold,
-                # eps_count is charged by the plugin during the scope walk
-                # (Algorithm 1), not inside StreamState, so the per-level
-                # accounting is exact; pass 0 here to avoid double-charging.
+                # The plugin draws the DP counts itself during the scope walk
+                # (Algorithm 1) and hands the engine the count via n_gate, so
+                # the engine never re-draws.  rho_split must match the plugin's
+                # so the engine reserves the same count share (rho * eps_tau)
+                # across the window -- leaving pub_eps = (1-rho)*eps_tau for the
+                # noisy sum S~_tau, per the Aggregate Stream Element definition.
+                rho_split=self.rho_split,
                 epsilon_count=0.0,
                 # P_max truncation is applied to the pooled buffer before the
                 # mean is taken, so the stream sees an already-capped n_tau.
@@ -206,19 +221,32 @@ class PrivacyPlugin:
 
     # ------------------------------------------- DP count (eps_count) ----
 
-    def _dp_count(self, n: int) -> int:
-        """Release a publisher count under Laplace(1/eps_count) noise (paper
-        Sec. 6.3 step 1 / Algorithm 1 step 3, sensitivity 1).
+    def _count_epsilon(self) -> float:
+        """Count share rho * eps_tau = rho * (epsilon / window_size).
 
-        Charges one eps_count unit and returns max(0, round(n + noise)).  When
-        eps_count == 0 the exact count is used (no charge), so the Kellaris
-        baselines and a 'free count' configuration both behave sensibly.
+        Each probed publisher count (Algorithm 1 step 3) spends this much, and
+        the noisy count uses Laplace scale 1 / (rho * eps_tau).  rho <= 0
+        disables the DP count (exact count, no charge).
         """
-        if self.epsilon_count <= 0:
+        if self.rho_split <= 0 or self.window_size <= 0:
+            return 0.0
+        return self.rho_split * (self.epsilon / self.window_size)
+
+    def _dp_count(self, n: int) -> int:
+        """Release a publisher count n~ = n + Lap(1/(rho*eps_tau)) (sensitivity 1).
+
+        This is the count component of the aggregate stream element
+        (Definition: Aggregate Stream Element).  Charges one count share
+        rho * eps_tau and returns max(0, round(n + noise)).  When the count
+        share is 0 (rho <= 0) the exact count is used (no charge), so the
+        Kellaris baselines and a 'free count' configuration both behave sensibly.
+        """
+        eps_n = self._count_epsilon()
+        if eps_n <= 0:
             return int(n)
-        self.eps_count_spent += self.epsilon_count
+        self.eps_count_spent += eps_n
         self.eps_count_releases += 1
-        noisy = n + float(np.random.laplace(loc=0.0, scale=1.0 / self.epsilon_count))
+        noisy = n + float(np.random.laplace(loc=0.0, scale=1.0 / eps_n))
         return max(0, int(round(noisy)))
 
     @staticmethod
@@ -382,12 +410,13 @@ class PrivacyPlugin:
                 leaf_n = buf_leaf.num_publishers
                 stream = self._get_or_create_stream(leaf)
 
-                # Budget-aware DP counting: each eps_count draw (leaf gate +
-                # every walk probe) takes from the SAME w-event budget eps, so
-                # cap the number of draws this tick to what the window can still
-                # afford (floor(remaining / eps_count)).  This guarantees the
-                # leaf + walk count spend never breaches Sum_{window} <= eps.
-                ec = self.epsilon_count
+                # Budget-aware DP counting: each count draw (leaf gate + every
+                # walk probe) spends rho * eps_tau from the SAME w-event budget
+                # eps, so cap the number of draws this tick to what the window
+                # can still afford (floor(remaining / (rho*eps_tau))).  This
+                # guarantees the leaf + walk count spend never breaches
+                # Sum_{window} <= eps.
+                ec = self._count_epsilon()
                 affordable = ((1 << 30) if (not needs_walk or ec <= 0)
                               else int(stream._budget_remaining() / ec))
                 ec_before = self.eps_count_spent
@@ -431,6 +460,7 @@ class PrivacyPlugin:
                         pooled = self._truncate_to_pmax(pooled, self.max_publishers)
                         aggregate = pooled.mean()
                         n_tau = pooled.num_publishers
+                        pooled_sum = pooled.total()   # actual sum_p x_{p,tau}
                         # t_start = start of the buffering interval (Def. 3.1),
                         # NOT shifted by K_ext extensions.
                         t_start = (pooled.start_time if pooled.start_time is not None
@@ -460,7 +490,8 @@ class PrivacyPlugin:
             released = stream.release(
                 aggregate, n_tau,
                 n_gate=(n_gate_decision if needs_walk else None),
-                n_count_draws=(n_count_draws if needs_walk else 1))
+                n_count_draws=(n_count_draws if needs_walk else 1),
+                true_sum=pooled_sum)   # actual pooled sum, not aggregate*n
             deferred = stream.last_was_deferred
 
             if released is not None:

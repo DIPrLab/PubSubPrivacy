@@ -57,7 +57,6 @@ def experiment_A_greedy_vs_brute(datasets, clamp_mode, output_dir, args,
                                  fixed_combos=None, strategies=None) -> "pd.DataFrame":
     epsilon, w = 1.0, 8
     strategy = "p_gated_uniform"
-    eps_count = getattr(args, "epsilon_count", 0.0) or 0.5
     seed = 77
     trials = max(1, getattr(args, "trials", 1))
     grid_config = getattr(args, "grid_config", None)
@@ -74,6 +73,12 @@ def experiment_A_greedy_vs_brute(datasets, clamp_mode, output_dir, args,
                                        epsilon, {"P_min": getattr(args, "ablation_P", 3),
                                                  "P_max": None})
             P_ds, P_max_ds = prm["P_min"], prm["P_max"]
+            # Grid-selected split for this (ds, strategy, eps).  Each probed count
+            # spends the rho share of the per-step budget, rho * eps_tau =
+            # rho * eps/w, with Laplace scale 1/(rho*eps_tau) (Definition:
+            # Aggregate Stream Element) -- the same calibration the engine uses.
+            rho_ds = prm["rho_split"]
+            count_eps = rho_ds * (epsilon / w)
             leaf_pub, chain = _leaf_chain(ds_name, sensor, per_pub,
                                           k_ext=getattr(args, "k_ext", 0))
             if not chain:
@@ -91,8 +96,8 @@ def experiment_A_greedy_vs_brute(datasets, clamp_mode, output_dir, args,
                 for (L, scope, agg, cnt, npub) in chain:
                     greedy_probed += 1
                     avg_active = float(np.mean(cnt)) if cnt else 0.0
-                    dp_count = (max(0.0, avg_active + rng.laplace(scale=1.0 / eps_count))
-                                if eps_count > 0 else avg_active)
+                    dp_count = (max(0.0, avg_active + rng.laplace(scale=1.0 / count_eps))
+                                if count_eps > 0 else avg_active)
                     if dp_count >= P_ds or L == 1:
                         greedy = (L, scope, agg, cnt, npub)
                         break
@@ -100,8 +105,8 @@ def experiment_A_greedy_vs_brute(datasets, clamp_mode, output_dir, args,
                 gm = core.run_dp_on_stream(
                     gagg, gcnt, epsilon=epsilon, window_size=w, min_publishers=P_ds,
                     payload_bound=B, strategy=strategy, seed=seed_t,
-                    epsilon_count=eps_count, max_publishers=P_max_ds)["metrics"]
-                greedy_eps_count = greedy_probed * eps_count
+                    rho_split=rho_ds, max_publishers=P_max_ds)["metrics"]
+                greedy_eps_count = greedy_probed * count_eps
 
                 # BRUTE: evaluate every rewrite depth, pick best NMAE.
                 best = None
@@ -109,18 +114,18 @@ def experiment_A_greedy_vs_brute(datasets, clamp_mode, output_dir, args,
                     m = core.run_dp_on_stream(
                         agg, cnt, epsilon=epsilon, window_size=w, min_publishers=P_ds,
                         payload_bound=B, strategy=strategy, seed=seed_t,
-                        epsilon_count=eps_count, max_publishers=P_max_ds)["metrics"]
+                        rho_split=rho_ds, max_publishers=P_max_ds)["metrics"]
                     nm = m.get("normalized_mae")
                     if best is None or (nm is not None and np.isfinite(nm)
                                         and nm < best[2]):
                         best = (L, scope, nm if nm is not None else float("inf"),
                                 m.get("release_rate"))
-                brute_eps_count = len(chain) * eps_count
+                brute_eps_count = len(chain) * count_eps
 
                 rows.append({
                     "dataset": ds_name, "sensor": sensor, "clamp_mode": clamp_mode,
                     "leaf_publisher": str(leaf_pub), "P_min": P_ds, "P_max": P_max_ds,
-                    "epsilon": epsilon, "w": w, "epsilon_count": eps_count,
+                    "epsilon": epsilon, "w": w, "rho_split": rho_ds,
                     "n_levels": len(chain), "trial": trial, "seed": seed_t,
                     # greedy walk-up (Algorithm 1)
                     "greedy_level": gL, "greedy_scope": gscope,

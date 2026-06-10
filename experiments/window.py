@@ -25,28 +25,32 @@ def experiment_B_vary_w(datasets, clamp_mode, output_dir, args,
     log_messages = getattr(args, "log_messages", True)
     trials = max(1, getattr(args, "trials", 1))
     k_ext = getattr(args, "k_ext", 0)
+    grid_config = getattr(args, "grid_config", None)
     rows = []
-    # Test EVERY point of the PerCom topic hierarchy: for each (dataset, sensor)
-    # iterate every subscription level/subtree (core.level_subscription_streams),
-    # then sweep w x combo x trial.  All tasks fan out over the worker pool.
+    # Only w stays free; P_min, P_max, Delta_t, K_ext and rho come from the §7.5
+    # grid optimum for each (dataset, strategy, eps).  The combos' fixed P is
+    # therefore dropped -- distinct (strategy, eps) pairs drive the grid lookup --
+    # and each level's stream is rebuilt at the grid P_min/K_ext/Delta_t.  Test
+    # EVERY point of the PerCom topic hierarchy; all tasks fan out over the pool.
+    combos = sorted({(c["strategy"], c["epsilon"]) for c in fixed_combos})
     for ds_name, entries in core._iter_clamped_by_dataset(
             datasets, clamp_mode, args.eps_clip, args.seed, args):
         tasks, streams_by_key = [], {}
         for sensor, per_pub, R, _ in entries:
-            for (L, scope, agg, cnt, _np) in core.level_subscription_streams(
-                    ds_name, sensor, per_pub, k_ext=k_ext):
-                key = f"{sensor}|{L}|{scope}"
-                streams_by_key[key] = (agg, cnt, R)  # shipped to workers ONCE
-                for combo in fixed_combos:
+            for (strategy, eps) in combos:
+                for (L, scope, agg, cnt, _np, prm) in core.grid_level_streams(
+                        ds_name, sensor, per_pub, clamp_mode, grid_config,
+                        strategy, eps, default_k_ext=k_ext):
+                    key = f"{sensor}|{L}|{scope}|{strategy}|{eps}"
+                    streams_by_key[key] = (agg, cnt, R)  # shipped to workers ONCE
                     for w in w_values:
                         for trial in range(trials):
                             tasks.append((
                                 ds_name, sensor, key,
-                                combo["strategy"], combo["P"], combo["epsilon"], w,
+                                strategy, prm["P_min"], eps, w,
                                 clamp_mode, log_messages, "B_vary_w",
                                 trial, 77 + 1000 * trial, L, scope,
-                                getattr(args, "epsilon_count", 0.0),
-                                getattr(args, "max_publishers", None),
+                                prm["rho_split"], prm["P_max"],
                             ))
         rows.extend(core._run_parallel_tasks(
             tasks, core._experiment_single_axis_task, workers=workers,

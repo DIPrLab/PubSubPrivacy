@@ -25,27 +25,38 @@ def experiment_C_vary_epsilon(datasets, clamp_mode, output_dir, args,
     log_messages = getattr(args, "log_messages", True)
     trials = max(1, getattr(args, "trials", 1))
     k_ext = getattr(args, "k_ext", 0)
+    grid_config = getattr(args, "grid_config", None)
     rows = []
+    # Only eps stays free (swept); w comes from the combos; P_min, P_max,
+    # Delta_t, K_ext and rho come from the §7.5 grid optimum for each
+    # (dataset, strategy, eps).  The combos' fixed P is dropped, so they reduce
+    # to (strategy, w) pairs and each level's stream is rebuilt at the grid
+    # P_min/K_ext/Delta_t for that (strategy, eps).
+    from collections import defaultdict
+    ws_by_strat: dict = defaultdict(list)
+    for c in fixed_combos:
+        ws_by_strat[c["strategy"]].append(c["w"])
     # Test EVERY point of the PerCom topic hierarchy per (dataset, sensor).
     for ds_name, entries in core._iter_clamped_by_dataset(
             datasets, clamp_mode, args.eps_clip, args.seed, args):
         tasks, streams_by_key = [], {}
         for sensor, per_pub, R, _ in entries:
-            for (L, scope, agg, cnt, _np) in core.level_subscription_streams(
-                    ds_name, sensor, per_pub, k_ext=k_ext):
-                key = f"{sensor}|{L}|{scope}"
-                streams_by_key[key] = (agg, cnt, R)  # shipped to workers ONCE
-                for combo in fixed_combos:
-                    for eps in eps_values:
-                        for trial in range(trials):
-                            tasks.append((
-                                ds_name, sensor, key,
-                                combo["strategy"], combo["P"], eps, combo["w"],
-                                clamp_mode, log_messages, "C_vary_epsilon",
-                                trial, 77 + 1000 * trial, L, scope,
-                                getattr(args, "epsilon_count", 0.0),
-                                getattr(args, "max_publishers", None),
-                            ))
+            for strategy, w_list in ws_by_strat.items():
+                for eps in eps_values:
+                    for (L, scope, agg, cnt, _np, prm) in core.grid_level_streams(
+                            ds_name, sensor, per_pub, clamp_mode, grid_config,
+                            strategy, eps, default_k_ext=k_ext):
+                        key = f"{sensor}|{L}|{scope}|{strategy}|{eps}"
+                        streams_by_key[key] = (agg, cnt, R)  # shipped ONCE
+                        for w in w_list:
+                            for trial in range(trials):
+                                tasks.append((
+                                    ds_name, sensor, key,
+                                    strategy, prm["P_min"], eps, w,
+                                    clamp_mode, log_messages, "C_vary_epsilon",
+                                    trial, 77 + 1000 * trial, L, scope,
+                                    prm["rho_split"], prm["P_max"],
+                                ))
         rows.extend(core._run_parallel_tasks(
             tasks, core._experiment_single_axis_task, workers=workers,
             initializer=core._init_streams_worker, initargs=(streams_by_key,),

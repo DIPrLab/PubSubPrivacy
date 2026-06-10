@@ -101,24 +101,25 @@ def test_deferred_flags_consistent():
 
 def test_pgate_defers_below_P():
     """A high P_min on a small pool must defer (repeat last release) and never
-    emit a fresh release.  Under "eps_count inside eps", each gated timestamp
-    spends exactly eps_count (the DP count draw) -- or 0 once the sliding window
+    emit a fresh release.  Each gated timestamp spends exactly the count share
+    rho * eps_tau (the noisy-count draw n~_tau) -- or 0 once the sliding window
     can no longer afford another count -- and never a publication share, with
     the w-event window sum always <= eps."""
     np.random.seed(0)
-    eps, w, ec, tol = 1.0, 8, 0.1, 1e-9
+    eps, w, tol = 1.0, 8, 1e-9
     cfg = PrivacyConfig(epsilon=eps, window_size=w, min_publishers=99,
                         payload_bound=100.0,
                         strategy=BudgetStrategy.P_GATED_UNIFORM,
-                        epsilon_count=ec)
+                        rho_split=0.5)
+    ec = cfg.count_epsilon()   # rho * eps_tau = 0.5 * (1.0 / 8)
     st = StreamState(config=cfg)
     for t in range(50):
         st.release(50.0 + t, 3)   # pool of 3 always < P_min=99 -> always gated
     assert st.releases == 0, "no release should pass a P_min=99 gate on pool=3"
-    # Every per-tau spend is either a count draw (eps_count) or nothing -- never
-    # a publication share.
+    # Every per-tau spend is either a count draw (rho*eps_tau) or nothing --
+    # never a publication share.
     assert all(abs(b) < tol or abs(b - ec) < tol for b in st.budgets_spent), \
-        "gated taus spend only eps_count (or 0), never a release share"
+        "gated taus spend only the count share (or 0), never a release share"
     # The count spend still obeys the w-event window invariant.
     for i in range(len(st.budgets_spent)):
         assert sum(st.budgets_spent[max(0, i - w + 1): i + 1]) <= eps + tol

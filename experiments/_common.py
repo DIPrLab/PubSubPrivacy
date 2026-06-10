@@ -50,7 +50,17 @@ def make_parser(description: str) -> argparse.ArgumentParser:
                    help="Independent noise-seed repetitions per config "
                         "(per-trial rows + mean/std aggregate).")
     p.add_argument("--epsilon-count", type=float, default=0.05,
-                   help="eps_count for the DP publisher count (Sec. 6.3 step 1).")
+                   help="DEPRECATED / ignored: the DP publisher count is now the "
+                        "rho share of the per-step budget (see --rho-split).")
+    p.add_argument("--rho-split", type=float, default=0.2,
+                   help="Split parameter rho_tau in (0,1) for the aggregate "
+                        "stream element (Definition: Aggregate Stream Element): "
+                        "the noisy count n~_tau gets rho*eps_tau (scale "
+                        "1/(rho*eps_tau)), the noisy sum S~_tau gets "
+                        "(1-rho)*eps_tau (scale R/((1-rho)*eps_tau)), and "
+                        "gamma_tau = S~_tau/max(n~_tau,1).  0 disables the DP "
+                        "count (exact |P_tau| / Kellaris baselines).  Default 0.2 "
+                        "(the definition's sqrt(R)/(5 sqrt(R)); min error).")
     p.add_argument("--max-publishers", type=int, default=None,
                    help="P_max sensitivity-binding cap (Sec. 6.5).")
     p.add_argument("--ablation-P", type=int, default=3,
@@ -74,6 +84,13 @@ def make_parser(description: str) -> argparse.ArgumentParser:
                         "write a grid_canonical_eps<eps>.json fragment, so the "
                         "grid phase can be split across nodes per epsilon "
                         "(experiments.grid_search only).")
+    p.add_argument("--grid-rho", type=float, default=None,
+                   help="Restrict the §7.5 grid search to this single rho_tau "
+                        "candidate, so the rho sweep can be split across nodes "
+                        "(one shard per rho).  Used with --grid-trial: each shard "
+                        "writes a full-grid fragment and _merge_grid_trial_fragments "
+                        "picks the global per-(dataset,clamp,strategy,eps) MAE "
+                        "optimum across all rho fragments (experiments.grid_search).")
     p.add_argument("--sensor-shard", default=None,
                    help="Round-robin sensor sharding 'i/k': process only "
                         "sensors[i::k] of each dataset, so a heavy dataset's "
@@ -98,6 +115,9 @@ def resolve(args) -> argparse.Namespace:
     """Fill every attribute the core functions read via getattr, and derive the
     target dataset / clamp-mode lists and the parameter grids."""
     args.workers = core._default_workers(args.workers)
+    # Publish the run-global rho_tau so spawned workers (which call
+    # run_dp_on_stream) inherit the same split via DP_RHO_SPLIT.
+    core.set_rho_split(getattr(args, "rho_split", 0.2))
     args.skip_extras = False
     args.tune_only = False
     args.grid_search = False

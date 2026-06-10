@@ -36,12 +36,12 @@ def _init_level_streams_worker(streams_by_id):
 
 
 def _level_sub_task(task):
-    sid, epsilon, w, P, strategy, eps_count, p_max, trial, seed, meta = task
+    sid, epsilon, w, P, strategy, rho_ds, p_max, trial, seed, meta = task
     agg, cnt, B = _WORKER_LEVEL_STREAMS[sid]
     res = core.run_dp_on_stream(
         agg, cnt, epsilon=epsilon, window_size=w, min_publishers=P,
         payload_bound=B, strategy=strategy, seed=seed,
-        epsilon_count=eps_count, max_publishers=p_max,
+        rho_split=rho_ds, max_publishers=p_max,
     )
     m = res["metrics"]
     return {
@@ -78,6 +78,7 @@ def subscription_levels_experiment(
             prm = core._resolve_params(grid_config, ds, clamp_mode, strategy,
                                        epsilon, {"P_min": P_default, "P_max": None})
             P_ds, P_max_ds = prm["P_min"], prm["P_max"]
+            rho_ds = prm["rho_split"]   # grid-selected split for this (ds, strategy, eps)
             for (L, scope, agg, cnt, npub) in core.level_subscription_streams(
                     ds, sensor, per_pub, k_ext=k_ext):
                 if len(agg) < w + 2:
@@ -88,11 +89,11 @@ def subscription_levels_experiment(
                     "stream_id": sid, "dataset": ds, "sensor": sensor,
                     "clamp_mode": clamp_mode, "subscription_level": L,
                     "scope": scope, "n_pubs": npub, "payload_bound": B,
-                    "P_min": P_ds, "P_max": P_max_ds,
+                    "P_min": P_ds, "P_max": P_max_ds, "rho_split": rho_ds,
                 })
     tasks = [
         (m["stream_id"], epsilon, w, m["P_min"], strategy,
-         getattr(args, "epsilon_count", 0.0), m["P_max"],
+         m["rho_split"], m["P_max"],
          trial, seed + 1000 * trial, m)
         for m in metas for trial in range(max(1, trials))
     ]
