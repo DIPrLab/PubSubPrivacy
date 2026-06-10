@@ -1,9 +1,0 @@
-dataset,sensor,strategy,epsilon,w,P_min,P_max,delta_t,k_ext,epsilon_count,mae,normalized_mae,kl_divergence,release_rate,avg_n_tau,n_logical_timestamps
-manufacturing,temperature_eps0.5,uniform,0.5,8,1,,1,0,0.0,300.2970333236514,1.5014851666182571,0.8052097194013691,1.0,10.0,1000
-manufacturing,temperature_eps0.5,sample,0.5,8,1,,4,0,0.0,32.52218471054851,0.16261092355274254,0.8960828117444055,0.128,10.0,250
-manufacturing,temperature_eps0.5,budget_distribution,0.5,8,1,,4,0,0.0,452.1167398300858,2.260583699150429,0.6176878652344598,0.62,10.0,250
-manufacturing,temperature_eps0.5,budget_absorption,0.5,8,1,,2,0,0.0,390.1246301820375,1.9506231509101875,0.8188704687974528,0.512,10.0,500
-manufacturing,temperature_eps0.5,p_gated_uniform,0.5,8,1,,1,0,0.0,300.2970333236514,1.5014851666182571,0.8052097194013691,1.0,10.0,1000
-manufacturing,temperature_eps0.5,p_gated_sample,0.5,8,1,,4,0,0.0,32.52218471054851,0.16261092355274254,0.8960828117444055,0.128,10.0,250
-manufacturing,temperature_eps0.5,p_gated_ba,0.5,8,1,,2,0,0.0,390.1246301820375,1.9506231509101875,0.8188704687974528,0.512,10.0,500
-manufacturing,temperature_eps0.5,n_weighted,0.5,8,1,,1,0,0.0,300.2970333236514,1.5014851666182571,0.8052097194013691,1.0,10.0,1000
