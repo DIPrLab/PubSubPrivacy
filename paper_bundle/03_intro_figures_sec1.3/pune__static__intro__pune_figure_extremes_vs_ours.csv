@@ -9,8 +9,8 @@ Extreme 2 (per-publisher),pm2,0.9095090976975772,4
 Extreme 2 (per-publisher),humidity,0.9224528971328013,4
 Extreme 2 (per-publisher),sound,0.9207279370508717,4
 Extreme 2 (per-publisher),ozone,0.9197126869658504,4
-Our approach (P=4 topic pool),pm10,0.5158076648225284,4
-Our approach (P=4 topic pool),pm2,0.5148755547949626,4
-Our approach (P=4 topic pool),humidity,0.3767024331010921,4
-Our approach (P=4 topic pool),sound,0.5220302389853438,4
-Our approach (P=4 topic pool),ozone,0.543278959626192,4
+Our approach (P=4 topic pool),pm10,0.20867339130093968,4
+Our approach (P=4 topic pool),pm2,0.21740223040926726,4
+Our approach (P=4 topic pool),humidity,0.30682768004980654,4
+Our approach (P=4 topic pool),sound,0.23171962996564738,4
+Our approach (P=4 topic pool),ozone,0.19463471050693942,4

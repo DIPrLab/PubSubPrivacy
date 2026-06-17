@@ -5,6 +5,6 @@ Extreme 1 (global average),current,2.722339548862336,4
 Extreme 2 (per-publisher),power_kw,0.9615925198117369,4
 Extreme 2 (per-publisher),voltage,0.8577160586333797,4
 Extreme 2 (per-publisher),current,1.100264267325853,4
-Our approach (P=4 topic pool),power_kw,0.599425216042961,4
-Our approach (P=4 topic pool),voltage,0.510200995981236,4
-Our approach (P=4 topic pool),current,0.4786831696964722,4
+Our approach (P=4 topic pool),power_kw,0.16280079186363036,4
+Our approach (P=4 topic pool),voltage,1.1873235596656548,4
+Our approach (P=4 topic pool),current,0.1513202668740789,4
