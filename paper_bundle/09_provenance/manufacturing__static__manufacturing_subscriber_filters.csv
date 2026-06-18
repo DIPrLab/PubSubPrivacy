@@ -1,0 +1,6 @@
+subscriber_filter
+factory/line1/#
+factory/line1/+/+/vibration
+factory/line1/processing/#
+factory/line1/+/machine01/#
+factory/line1/+/+/quality

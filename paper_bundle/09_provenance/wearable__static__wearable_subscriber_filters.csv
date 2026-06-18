@@ -1,0 +1,6 @@
+subscriber_filter
+health/#
+health/+/+/heart_rate
+health/hospital01/#
+health/+/Device_5/#
+health/+/+/steps

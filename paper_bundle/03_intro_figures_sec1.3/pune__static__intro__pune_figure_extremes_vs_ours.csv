@@ -1,0 +1,16 @@
+regime,sensor,kl_divergence,P_our
+Extreme 1 (global average),pm10,0.5446810032572814,4
+Extreme 1 (global average),pm2,0.5656920797987424,4
+Extreme 1 (global average),humidity,0.43918507613057045,4
+Extreme 1 (global average),sound,0.5867771680861986,4
+Extreme 1 (global average),ozone,0.5686732825542763,4
+Extreme 2 (per-publisher),pm10,0.9093431043576692,4
+Extreme 2 (per-publisher),pm2,0.9095090976975772,4
+Extreme 2 (per-publisher),humidity,0.9224528971328013,4
+Extreme 2 (per-publisher),sound,0.9207279370508717,4
+Extreme 2 (per-publisher),ozone,0.9197126869658504,4
+Our approach (P=4 topic pool),pm10,0.20867339130093968,4
+Our approach (P=4 topic pool),pm2,0.21740223040926726,4
+Our approach (P=4 topic pool),humidity,0.30682768004980654,4
+Our approach (P=4 topic pool),sound,0.23171962996564738,4
+Our approach (P=4 topic pool),ozone,0.19463471050693942,4

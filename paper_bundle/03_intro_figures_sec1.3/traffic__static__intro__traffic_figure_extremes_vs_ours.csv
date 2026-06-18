@@ -1,0 +1,7 @@
+regime,sensor,kl_divergence,P_our
+Extreme 1 (global average),speed,0.6288594875091671,4
+Extreme 1 (global average),object_count,0.5166605161992901,4
+Extreme 2 (per-publisher),speed,0.8755999047044369,4
+Extreme 2 (per-publisher),object_count,0.8572179268770749,4
+Our approach (P=4 topic pool),speed,0.33908232007946765,4
+Our approach (P=4 topic pool),object_count,0.29066463152054234,4

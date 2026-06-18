@@ -1,0 +1,63 @@
+# ============================================================
+# PubSubPrivacy Configuration
+# Clamped w-event DP with P-allocation (paper Sections 3-5)
+# ============================================================
+
+broker:
+  host: "localhost"
+  port: 1883
+  raw_prefix: "factory/raw"
+  protected_prefix: "factory/protected"
+
+# DP parameters (Section 3.1): operator-fixed; enter the privacy analysis.
+# Changing any of them changes the epsilon guarantee.
+privacy:
+  epsilon: 1.0              # sliding-window privacy budget
+  window_size: 10           # w = number of timestamps in the sliding window
+  # eps_count: budget spent to release a differentially private publisher count
+  # |P_tau| (sensitivity 1) when gating / walking the hierarchy (Sec. 6.3 step 1,
+  # Table 3). Composes additively with epsilon. 0 = exact count.
+  epsilon_count: 0.0
+
+# Scheduling hyperparameters (Section 3.1): shape utility / latency only;
+# do NOT enter the DP calculation and can be tuned against a held-out trace.
+scheduling:
+  # Publisher threshold P_min for the P-allocation release gate (Section 5.3).
+  # Bounds attribution advantage at 1/P_min; does NOT appear in noise scale.
+  min_publishers: 3
+  # P_max: caps the multiplicity folded into the mean so Delta_f = R/n changes
+  # by a bounded amount across stream elements (Sec. 6.5). null = no cap.
+  max_publishers: null
+  # Budget-allocation strategy. Choices:
+  #   uniform, sample, budget_distribution, budget_absorption,
+  #   p_gated_uniform, p_gated_sample, p_gated_bd, p_gated_ba, n_weighted
+  budget_strategy: "p_gated_ba"
+  # BA similarity threshold theta (as a fraction of R).
+  ba_threshold: 0.1
+  # Base timestamp interval Delta_t in seconds (Definition 3.1).
+  timestamp_interval: 5.0
+  # K_ext: max number of Delta_t extensions when n_tau < P; T_max = K_ext * Delta_t.
+  k_ext: 2
+
+# Parameter sweep for the offline experimental evaluation (all real-world).
+experiment:
+  duration: 120
+  # Publisher-threshold grid (paper calls this P).
+  p_values: [1, 2, 4, 6]
+  epsilon_values: [0.5, 1.0, 2.0, 4.0]
+  w_values: [4, 8, 10, 12]
+  # All strategies exercised by run_experiment.py.
+  strategies:
+    - "uniform"
+    - "sample"
+    - "budget_distribution"
+    - "budget_absorption"
+    - "p_gated_ba"
+    - "n_weighted"
+  # Section 5.7 two-stage tuning.
+  tuning:
+    p_grid: [1, 2, 3, 4, 6, 8]
+    dt_multiplier_grid: [1, 2, 3, 4, 6]
+    utility_weight: 1.0
+    latency_weight: 0.2
+    strategy: "p_gated_ba"

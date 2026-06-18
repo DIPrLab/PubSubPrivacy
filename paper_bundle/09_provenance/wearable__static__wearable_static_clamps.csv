@@ -1,0 +1,5 @@
+sensor,mode,eps_clip,a,b,R,publisher
+heart_rate,static,0.0,30.0,220.0,190.0,*
+steps,static,0.0,0.0,5000.0,5000.0,*
+temperature,static,0.0,15.0,45.0,30.0,*
+calories_burned,static,0.0,0.0,50.0,50.0,*

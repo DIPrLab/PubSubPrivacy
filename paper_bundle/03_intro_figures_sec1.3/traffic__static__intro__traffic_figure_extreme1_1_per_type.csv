@@ -1,0 +1,11 @@
+dataset,sensor_type,payload_bound,n_publishers,epsilon,w,subscription_level,is_type_root,is_leaf,n_subscriptions_at_level,avg_pubs_per_subscription,kl_vs_type_release,nmae_vs_type_release,n_trials
+traffic,speed,50.0,6,1.0,8,1,True,False,1,6.0,0.6927189260130733,1.3923652949917398,20
+traffic,speed,50.0,6,1.0,8,2,False,False,1,6.0,0.6927189260130733,1.3923652949917398,20
+traffic,speed,50.0,6,1.0,8,3,False,False,2,3.0,0.7556049197478647,1.3705427668323578,20
+traffic,speed,50.0,6,1.0,8,4,False,False,6,1.0,0.766414586765404,1.3647630940161042,20
+traffic,speed,50.0,6,1.0,8,5,False,True,6,1.0,0.766414586765404,1.3647630940161042,20
+traffic,object_count,50.0,6,1.0,8,1,True,False,1,6.0,0.6276658646915259,1.3923652949917398,20
+traffic,object_count,50.0,6,1.0,8,2,False,False,1,6.0,0.6276658646915259,1.3923652949917398,20
+traffic,object_count,50.0,6,1.0,8,3,False,False,2,3.0,0.6330815844594451,1.3710697258142654,20
+traffic,object_count,50.0,6,1.0,8,4,False,False,6,1.0,0.632660444506475,1.3695857483383516,20
+traffic,object_count,50.0,6,1.0,8,5,False,True,6,1.0,0.632660444506475,1.3695857483383516,20
