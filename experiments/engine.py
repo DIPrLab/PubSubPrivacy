@@ -57,6 +57,7 @@ ALL_STRATEGIES = [
     "budget_absorption",
     "p_gated_uniform",
     "p_gated_sample",
+    "p_gated_bd",
     "p_gated_ba",
     "n_weighted",
 ]
@@ -1262,6 +1263,8 @@ EXPERIMENT_FIXED_COMBOS_B = [
     {"P": 4, "epsilon": 1.0, "strategy": "uniform"},
     {"P": 2, "epsilon": 1.0, "strategy": "p_gated_ba"},
     {"P": 4, "epsilon": 1.0, "strategy": "p_gated_ba"},
+    {"P": 2, "epsilon": 1.0, "strategy": "p_gated_bd"},
+    {"P": 4, "epsilon": 1.0, "strategy": "p_gated_bd"},
     {"P": 2, "epsilon": 2.0, "strategy": "n_weighted"},
 ]
 EXPERIMENT_B_W_VALUES = [4, 6, 8, 10, 12, 16]
@@ -1272,6 +1275,8 @@ EXPERIMENT_FIXED_COMBOS_C = [
     {"P": 4, "w": 8, "strategy": "uniform"},
     {"P": 2, "w": 8, "strategy": "p_gated_ba"},
     {"P": 4, "w": 8, "strategy": "p_gated_ba"},
+    {"P": 2, "w": 8, "strategy": "p_gated_bd"},
+    {"P": 4, "w": 8, "strategy": "p_gated_bd"},
     {"P": 2, "w": 8, "strategy": "n_weighted"},
 ]
 EXPERIMENT_C_EPS_VALUES = [0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0]

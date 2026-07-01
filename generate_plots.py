@@ -141,7 +141,8 @@ def plot_sweep(sweep_dir: str, dataset_name: str):
         sd = sub[sub["sensor"] == sensor]
         strats = sorted(sd["strategy"].unique())
         vals = [sd[sd["strategy"] == s]["mae"].mean() for s in strats]
-        ax.bar(strats, vals, color=palette[:len(strats)], alpha=0.85)
+        colors = [palette[i % len(palette)] for i in range(len(strats))]
+        ax.bar(strats, vals, color=colors, alpha=0.85)
         ax.set(ylabel="MAE", title=sensor)
         ax.tick_params(axis="x", rotation=30, labelsize=7)
         ax.grid(True, alpha=0.3, axis="y")

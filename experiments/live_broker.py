@@ -506,7 +506,7 @@ def _experiment_E_run(
     lo, hi = prepared.spec["static_clamps"][sensor]
     B = float(hi - lo)
 
-    strategies = ["uniform", "p_gated_ba", "n_weighted"]
+    strategies = ["uniform", "p_gated_ba", "p_gated_bd", "n_weighted"]
     epsilons = [0.5, 1.0, 2.0]
     w = 8
     P = 2
