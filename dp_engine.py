@@ -1,16 +1,16 @@
 """
-Core differential privacy engine for clamped w-event DP with P-allocation.
+Core differential privacy engine for PAWS (clamped w-event DP for pub/sub).
 
-Implements the paper:
-  - Clamped aggregate stream (Definition 3.3): e_tau = mean(tilde{x}_{p,tau} | p in P_tau)
-  - Per-element sensitivity Delta_f = R / n_tau for the default mean (Table 2).
+Implements the paper (section numbers refer to the current draft):
+  - Clamped aggregate stream (paper Sec. 4): e_tau = mean(tilde{x}_{p,tau} | p in P_tau)
+  - Per-element sensitivity Delta_f = R / n_tau for the default mean (the Kellaris baselines).
     IMPORTANT: sensitivity is keyed on the *observed* publisher count n_tau
     (held fixed across DP neighbors), NOT on the scheduling threshold P.
     Using Delta_f = R/P would make the guarantee contingent on a lower bound
     on a data-dependent quantity and is therefore NOT a valid DP construction
-    (see paper Section 4.3).
+    (see paper Sec. 4).
   - Sliding-window budget constraint: sum_{j=tau-w+1}^{tau} eps_j <= eps.
-  - Budget-allocation strategies from Kellaris et al. (Section 5.2):
+  - Budget-allocation strategies from Kellaris et al. (paper Sec. 3.3):
       Uniform, Sample, Budget Distribution (BD), Budget Absorption (BA).
   - BD and BA follow Kellaris et al. Section 4: each tau runs a private
     dissimilarity sub-mechanism M_{i,1} (spending eps/(2w), Laplace scale
@@ -20,17 +20,29 @@ Implements the paper:
   - BA additionally nullifies the alpha timestamps following a release that
     absorbed alpha prior skipped budgets (Kellaris et al. Figure 4 lines 5-6)
     so the sliding-window constraint holds by construction, not by truncation.
-  - P-allocation (Section 5.3): a population-aware release gate that requires
-    n_tau >= P to spend budget; otherwise the element is deferred (last
-    release repeated).  Composes with any inner strategy.
-  - n-weighted P-allocation (Section 6.4, new contribution):
+  - P_min gate (paper Sec. 3.3, Fig. 4): a population-aware release gate that requires
+    n_tau >= P to spend budget; otherwise the element is deferred and the
+    previous output is repeated.  ``PrivacyConfig.repeat_on_defer=False``
+    (used by the ablation) delivers nothing instead, so utility there is
+    measured on fresh releases with coverage reported separately
+    (``release_utility``).  Composes with any inner strategy.
+  - Cached hierarchy-walk counts (``walk_population_counts``): walking up the
+    topic tree adds a noisy count of only the DELTA (publishers new at that
+    level) to the cached count of the level below.  Every delta is a fresh DP
+    count, so each probed level is charged one count share (Algorithm 1:
+    m probed levels cost m * eps_count).
+  - Adaptive interval (``PredictiveInterval``, timestamp widening, paper Sec. 4.1): each
+    interval's width is fixed up front from a discounted average of the noisy
+    counts already released, aiming at 1.5 * P_min publishers (Eq. 3) -- free by
+    post-processing.  ``MonotoneAboveThreshold`` is an alternative stopping
+    rule (Sparse Vector) that closes as soon as P_min is met.
+  - Budget weighting (``n_weighted``; paper Sec. 5, Eq. 8):
         eps_tau = eps * (1/n_tau) / sum_{j=tau-w+1}^tau (1/n_j),
     i.e. eps_tau is INVERSELY proportional to n_tau, so dense-pool timestamps
     receive a SMALLER budget share (more noise) and the released Laplace scale
     is equalized across the window (lambda_tau = R*sum_j(1/n_j)/eps, independent
     of n_tau), offsetting the 1/n_tau mean-sensitivity term.  See
-    _alloc_n_weighted and AUDIT.md (A3) for why the paper's printed Eq. (5)
-    denominator `sum_j n_j` is a typo for `sum_j (1/n_j)`.
+    _alloc_n_weighted.
 """
 
 from __future__ import annotations
@@ -54,7 +66,7 @@ class BudgetStrategy(Enum):
     P_GATED_SAMPLE = "p_gated_sample"
     P_GATED_BD = "p_gated_bd"
     P_GATED_BA = "p_gated_ba"
-    # n-weighted P-allocation (paper Section 5.4): couples eps_tau to n_tau.
+    # n-weighted P-allocation (budget weighting, paper Sec. 5): couples eps_tau to n_tau.
     N_WEIGHTED = "n_weighted"
 
 
@@ -83,8 +95,7 @@ class PrivacyConfig:
         payload_bound : global clamp range R = sup_p (b_p - a_p)
         epsilon_count : eps_count, the per-step budget spent to release a
                         differentially private publisher count |P_tau| with
-                        sensitivity 1 (paper Sec. 6.3 step 1, Sec. 6.5 step 3,
-                        Table 3).  n_tau is DP-private: ONE noisy count is drawn
+                        sensitivity 1 (paper Sec. 4 and Algorithm 1).  n_tau is DP-private: ONE noisy count is drawn
                         per timestamp/scope and reused for the P_min gate, the
                         Laplace-scale denominator, and the n-weighted
                         denominator (reuse is free by post-processing), so the
@@ -102,7 +113,7 @@ class PrivacyConfig:
         max_publishers     : P_max, caps the multiplicity that enters the mean
                              sensitivity so Delta_f = R / n_tau can change by at
                              most over [P_min, P_max] across stream elements
-                             (paper Sec. 6.5; None disables the cap).
+                             (an implementation knob not described in the paper; None disables the cap).
         strategy           : budget-allocation strategy (see BudgetStrategy)
         ba_threshold       : BA similarity threshold theta, as a fraction of R
     """
@@ -131,8 +142,30 @@ class PrivacyConfig:
     # that pass ``epsilon_count`` keep constructing; it no longer sets the count
     # noise scale (that is now rho * eps_tau).  See ``count_epsilon``.
     epsilon_count: float = 0.05
-    # P_max sensitivity-binding cap (Sec. 6.5).  None => no upper cap.
+    # P_max cap (implementation knob, not described in the paper).  None => no upper cap.
     max_publishers: Optional[int] = None
+    # A deferred/skipped timestamp re-emits the last release (Kellaris et al.;
+    # the paper's "defer and repeat the previous output").  The ablation turns
+    # this off so a module that rarely releases is not credited with stale
+    # repeats; there a deferral delivers nothing and shows up in coverage.
+    repeat_on_defer: bool = True
+    # Denominator of the released mean (population-aware strategies): the
+    # average of the last ``count_smoothing`` noisy counts released at the same
+    # scope (0 = the window length w), clipped to [1, n_cap].  Averaging reuses
+    # counts already released (post-processing, no budget) and cuts the count
+    # noise variance ~w-fold; the clip to the publicly known number of
+    # publishers under the scope stops a large positive draw from collapsing
+    # the released mean toward 0.  1 = a single fresh count (the original).
+    count_smoothing: int = 0
+    # Public center of the clamp interval, (a + b) / 2.  When set, the broker
+    # privatizes the centered sum sum_p (x_p - center) and releases
+    # center + S~ / n~ (paper Sec. 4), so any residual error in the noisy
+    # count pulls the estimate toward the middle of the declared range rather
+    # than toward 0.  Centering does NOT change the sensitivity: neighbours
+    # (Definition 3.1) change one publisher's payload anywhere in the clamp
+    # range, which moves the centered sum by up to R.  None keeps the
+    # uncentered sum.
+    center: Optional[float] = None
 
     def step_epsilon(self) -> float:
         """Per-step budget eps_tau = epsilon / window_size that rho splits."""
@@ -153,9 +186,13 @@ class PrivacyConfig:
     def sum_sensitivity(self) -> float:
         """Data-independent sum sensitivity Delta_S = R (one clamped payload).
 
-        Adding/removing one publisher shifts the pooled sum sum_p x~_{p,tau} by
-        at most the clamp range R, so the noisy sum S~_tau uses Delta_S = R --
-        independent of the multiplicity, unlike the mean's Delta_f = R/n_tau.
+        Neighbouring databases (Definition 3.1) hold the same publishers and
+        differ in one clamped payload, which can move anywhere in the clamp
+        range, so the pooled sum shifts by at most R and the noisy sum S~_tau
+        uses Delta_S = R (paper Sec. 4) -- independent of the multiplicity,
+        unlike the mean's Delta_f = R/n_tau.  Centering the payloads on the
+        clamp midpoint keeps each in [-R/2, R/2] but a substitution still
+        moves the sum by up to R, so the sensitivity stays R.
         """
         return self.payload_bound
 
@@ -163,7 +200,7 @@ class PrivacyConfig:
         """Multiplicity actually folded into the mean after the P_max cap.
 
         When n_tau > P_max the broker aggregates only the first P_max
-        publishers and discards the rest (paper Sec. 6.5), so both the mean
+        publishers and discards the rest (implementation knob), so both the mean
         and its sensitivity are computed at min(n_tau, P_max).  This bounds the
         per-element sensitivity change for f = mean to the [P_min, P_max] band.
         """
@@ -172,7 +209,7 @@ class PrivacyConfig:
         return int(n_tau)
 
     def sensitivity(self, n_tau: int) -> float:
-        """Delta_f = R / n_tau for the default mean aggregation (Table 2).
+        """Delta_f = R / n_tau for the default mean aggregation (the Kellaris baselines).
 
         n_tau is the post-P_max effective multiplicity; callers pass the value
         returned by ``effective_n``.  Called only when n_tau > 0 (gate /
@@ -231,7 +268,7 @@ class StreamState:
     # without relying on numerical-equality heuristics.
     last_was_deferred: bool = False
     # Running total of eps_count spent on differentially private publisher
-    # counts (paper Sec. 6.3 step 1).  Tracked separately from the w-event
+    # counts (paper Algorithm 1).  Tracked separately from the w-event
     # budget, exactly as eps_clip is, and reported as composed DP cost.
     eps_count_spent: float = 0.0
     dp_counts: int = 0   # number of timestamps that paid eps_count
@@ -246,6 +283,8 @@ class StreamState:
     deferred_flags: list = field(default_factory=list)
     deferrals: int = 0     # count of P-gate deferrals
     releases: int = 0      # count of actual Laplace releases
+    # Recent noisy counts per release scope, for the smoothed denominator.
+    count_history: dict = field(default_factory=dict)
 
     def __post_init__(self):
         # Budget/n windows store the past entries that share the current w-event
@@ -253,7 +292,7 @@ class StreamState:
         # maxlen=w here would carry one already-expired slot and over-subtract
         # from the remaining budget / inflate the n-weighted denominator
         # (still sound, just wastes utility and drifts from the paper's
-        # exact formula in Sec. 5.4 eq. 5).
+        # exact formula, paper Eq. 8).
         past_window = max(0, self.config.window_size - 1)
         self.budget_window = deque(maxlen=past_window)
         self.n_window = deque(maxlen=past_window)
@@ -274,6 +313,42 @@ class StreamState:
 
     def _budget_remaining(self) -> float:
         return self.config.epsilon - self._budget_spent_in_window()
+
+    def affordable_count_units(self) -> int:
+        """How many count shares (rho * eps_tau each) the sliding window can
+        still pay for at this timestamp.  Callers that draw counts outside
+        ``release`` (the broker's stopping rule and hierarchy walk) must stay
+        within this so the count spend never breaches the w-event budget."""
+        ec = self.config.count_epsilon()
+        if ec <= 0:
+            return 1 << 30
+        return int(self._budget_remaining() / ec + 1e-9)
+
+    def _deferred_output(self) -> Optional[float]:
+        """What a deferred/skipped timestamp delivers: the last release, or
+        nothing when ``repeat_on_defer`` is off (the ablation)."""
+        return self.last_released if self.config.repeat_on_defer else None
+
+    # ---- smoothed, clipped denominator ----------------------------------
+
+    def _push_count(self, key, noisy_count: float) -> None:
+        """Remember a noisy count released at scope ``key``."""
+        k = self.config.count_smoothing or self.config.window_size
+        hist = self.count_history.get(key)
+        if hist is None or hist.maxlen != max(1, k):
+            hist = deque(hist or (), maxlen=max(1, k))
+            self.count_history[key] = hist
+        hist.append(float(noisy_count))
+
+    def _denominator(self, key, current: float, n_cap: Optional[int]) -> float:
+        """Average of the recent noisy counts at ``key`` (the current one
+        included), clipped to [1, n_cap].  Post-processing of released counts."""
+        hist = self.count_history.get(key)
+        vals = list(hist) if hist else [float(current)]
+        den = float(np.mean(vals))
+        if n_cap is not None and n_cap > 0:
+            den = min(den, float(n_cap))
+        return max(den, 1.0)
 
     # ---- differentially private publisher count (eps_count) -------------
 
@@ -435,7 +510,7 @@ class StreamState:
         return eps_dissim, pub_share, False
 
     def _alloc_n_weighted(self, n_tau: int) -> tuple[float, float, bool]:
-        """n-weighted P-allocation (paper Section 6.4, Eq. 5).
+        """Budget weighting (``n_weighted``; paper Sec. 5, Eq. 8).
 
           eps^nom_tau = eps * (1/n_tau) / sum_{j=tau-w+1}^{tau} (1/n_j).
 
@@ -446,17 +521,15 @@ class StreamState:
         sensitivity is Delta_f = R/n_tau, this exactly offsets the 1/n_tau
         sensitivity term and equalizes the released Laplace scale across the
         window:  lambda_tau = (R/n_tau)/eps^nom_tau = R * sum_j(1/n_j) / eps,
-        independent of n_tau (paper Sec. 6.4).
+        independent of n_tau (paper Sec. 5).
 
-        NOTE: the paper's printed Eq. (5) denominator reads ``sum_j n_j`` but
-        that is inconsistent with both the stated "inversely proportional"
-        property and the "shares sum to eps" claim; the only reading that
-        satisfies both is the inverse-weight sum ``sum_j (1/n_j)`` used here.
-        See AUDIT.md for the derivation.
+        ``n_tau`` here is the smoothed, clipped noisy count (the same one the
+        released mean divides by; see ``release``), so the 1/n weights are not
+        driven by a single noisy draw.
 
         During warm-up (fewer than w eligible timestamps observed) we fall
         back to the Uniform share eps/w, as recommended in the paper.  The
-        clipping step of Eq. (6) is applied downstream in ``release`` via the
+        clipping step of Eq. 9 is applied downstream in ``release`` via the
         sliding-window budget cap.
         """
         if len(self.n_window) < self.n_window.maxlen:
@@ -504,14 +577,18 @@ class StreamState:
     def release(self, aggregate: float, n_tau: int,
                 n_gate: Optional[int] = None,
                 n_count_draws: int = 1,
-                true_sum: Optional[float] = None) -> Optional[float]:
+                true_sum: Optional[float] = None,
+                count_key=None,
+                n_cap: Optional[int] = None) -> Optional[float]:
         """
         Process one aggregate stream element with multiplicity n_tau.
 
-        Returns the delivered (noisy or repeated) value.  The P-allocation gate
-        is enforced here for P-gated / n-weighted strategies: if the gate count
-        < P the element is deferred (last release is repeated) and no budget is
-        spent.
+        Returns the delivered value: a fresh noisy release, or for a deferred
+        or skipped element the previous release (None when ``repeat_on_defer``
+        is off).  The
+        P-allocation gate is enforced here for P-gated / n-weighted strategies:
+        if the gate count < P the element is deferred and only the count share
+        already drawn is charged.
 
         ``true_sum`` is the actual pooled sum sum_{p in P_tau} x_{p,tau} that the
         noisy-sum component S~_tau is built from (Definition: Aggregate Stream
@@ -528,11 +605,17 @@ class StreamState:
         exact pooled count (that would be a second, inconsistent gate).  When
         ``n_gate`` is None (the offline path) the engine draws its own DP count
         from ``epsilon_count`` as before, so the gate is single-sourced either
-        way.  ``n_count_draws`` is how many eps_count draws the caller made for
-        THIS element (offline: 1; broker walk: leaf + one per probed ancestor),
-        so the full per-timestamp count cost ``n_count_draws * eps_count`` is
-        charged inside the window budget eps — the caller must ensure the window
-        can afford it (the plugin pre-checks before each probe).
+        way.  ``n_count_draws`` is how many count SHARES (rho * eps_tau each)
+        the caller spent for THIS element -- offline: 1; broker: the stopping
+        rule's share (if it waited) + the walk's (1 with cached delta counts,
+        else one per probed level) -- so the full per-timestamp count cost is
+        charged inside the window budget eps.  The caller must ensure the window
+        can afford it (``affordable_count_units``).
+
+        ``count_key`` names the scope the count was taken at (e.g. the walk
+        level) so the smoothed denominator only averages counts of the same
+        scope; ``n_cap`` is the public number of publishers registered under
+        that scope, the upper clip of the denominator.
         """
         self.current_tau += 1
 
@@ -571,8 +654,9 @@ class StreamState:
             # Pre-check: never draw the DP count if the window can't pay for it,
             # else the count spend would breach the w-event invariant.
             if n_gate is None and ec > 0 and self._budget_remaining() < ec:
-                self._record(aggregate, self.last_released, 0.0, n_tau, deferred=True)
-                return self.last_released
+                out = self._deferred_output()
+                self._record(aggregate, out, 0.0, n_tau, deferred=True)
+                return out
             n_dp = self._dp_count(n_tau) if n_gate is None else int(n_gate)
             # Offline draws ONE count here; the broker may have drawn several
             # (leaf + one per probed ancestor) -- or zero, if its budget-aware
@@ -581,18 +665,24 @@ class StreamState:
             # window budget.
             n_draws = 1 if n_gate is None else max(0, int(n_count_draws))
             eps_count_tau = ec * n_draws if ec > 0 else 0.0
+            if n_gate is None or n_draws > 0:
+                # A count was released for this scope: keep it for the
+                # smoothed denominator (post-processing, whatever the gate says).
+                self._push_count(count_key, n_dp)
             if n_dp < self.config.min_publishers:
                 # Deferred -- the count draw already spent eps_count, so it still
                 # consumes window budget.
-                self._record(aggregate, self.last_released, eps_count_tau, n_tau, deferred=True)
-                return self.last_released
+                out = self._deferred_output()
+                self._record(aggregate, out, eps_count_tau, n_tau, deferred=True)
+                return out
         else:
             n_dp = n_tau
 
         # Must have at least one (effective) publisher for the mean to be defined.
         if n_dp <= 0:
-            self._record(aggregate, self.last_released, eps_count_tau, n_tau, deferred=True)
-            return self.last_released
+            out = self._deferred_output()
+            self._record(aggregate, out, eps_count_tau, n_tau, deferred=True)
+            return out
 
         # Post-P_max effective multiplicity, derived from the DP count n_dp so
         # nothing here depends on the exact private count.  n_eff feeds the
@@ -601,6 +691,15 @@ class StreamState:
         # population-aware released noise: that sum uses the data-independent
         # sensitivity Delta_S = R and is divided by the noisy count n_dp below.
         n_eff = self.config.effective_n(n_dp)
+        if population_aware:
+            # The multiplicity the allocator weights by (n-weighted P-allocation,
+            # Eq. 8) is the same smoothed, clipped count the released mean
+            # divides by -- not one raw noisy draw, whose noise at small
+            # budgets swamps n_tau and would make the 1/n shares erratic.
+            # Post-processing of released counts; no budget.
+            n_eff = self._denominator(count_key, n_dp, n_cap)
+            if self.config.max_publishers is not None:
+                n_eff = min(n_eff, float(self.config.max_publishers))
 
         # Reserve the per-window count share so sum releases + count draws
         # together stay under eps: eps_inner = eps - w*(rho*eps_tau) = (1-rho)*eps.
@@ -609,6 +708,22 @@ class StreamState:
         # below.  (rho <= 0 -> eps_count_tau == 0 -> eps_inner == eps.)
         self._alloc_eps = max(
             0.0, self.config.epsilon - self.config.window_size * eps_count_tau)
+        left_in_window = self._budget_remaining() - eps_count_tau
+        if self._alloc_eps <= 0 or left_in_window <= 0:
+            # This timestamp's count shares (e.g. a walk that re-counted many
+            # levels) leave nothing for the publication: defer, charging the
+            # counts already drawn.
+            out = self._deferred_output()
+            self._record(aggregate, out, eps_count_tau, n_tau, deferred=True)
+            return out
+        # BD/BA spend their private-dissimilarity share _alloc_eps/(2w) before
+        # the cap below can trim anything, so keep that share within what the
+        # window still holds.  Only binds when count shares have eaten most of
+        # the window; otherwise _alloc_eps is unchanged.  The per-step share
+        # the release floor below is measured against is taken first.
+        nominal_step = self._alloc_eps / self.config.window_size
+        self._alloc_eps = min(self._alloc_eps,
+                              2 * self.config.window_size * left_in_window)
 
         # Snapshot the BA absorb/nullify counters BEFORE allocation so that, if
         # the defensive sliding-window cap below turns a planned BA *release*
@@ -641,11 +756,20 @@ class StreamState:
 
         # Floor on pub_eps: releasing with a near-zero share would give a
         # Laplace scale that explodes numerically.  Treat anything below
-        # 1e-6 * (eps / w) as a skip (equivalent to the window being full).
-        min_pub_eps = 1e-6 * (self._alloc_eps / self.config.window_size)
+        # 1e-6 of this timestamp's nominal per-step share as a skip, and also
+        # skip when the window cap has trimmed the publication below 10% of
+        # that share: such a release is >= 10x noisier than a normal one and
+        # carries no usable signal, so delivering nothing serves the subscriber
+        # better.  (Either way only less budget is spent; privacy unaffected.)
+        min_pub_eps = 1e-6 * nominal_step
+        if capped and pub_eps < 0.1 * nominal_step:
+            pub_eps = 0.0
+            total_eps = dissim_eps
         if skip or pub_eps <= min_pub_eps:
             # No publication at this tau; record dissim cost (may be 0 for
-            # strategies without M_{i,1}) and repeat the last release.
+            # strategies without M_{i,1}) and repeat the last release (or
+            # deliver nothing when repeat_on_defer is off).  last_released is
+            # left untouched: BD/BA still compare against it (o_l).
             if capped and not skip:
                 # The defensive cap (not the sub-mechanism) converted a planned
                 # release into a skip; restore the BA counters so the saved
@@ -654,9 +778,10 @@ class StreamState:
                 # invariant is unaffected.
                 self.ba_nullify_remaining = _ba_null_before
                 self.ba_skipped_since_last_pub = _ba_skipped_before
-            self._record(aggregate, self.last_released, eps_count_tau + total_eps,
+            out = self._deferred_output()
+            self._record(aggregate, out, eps_count_tau + total_eps,
                          n_eff, deferred=True)
-            return self.last_released
+            return out
 
         if population_aware:
             # Aggregate stream element via the sum/count split (Definition:
@@ -674,9 +799,16 @@ class StreamState:
             # by the independent noisy count n_dp is what makes the count noise
             # propagate into gamma (it does not cancel).
             pooled_sum = true_sum if true_sum is not None else aggregate * n_tau
+            center = self.config.center
+            if center is not None:
+                # Centered sum sum_p (x_p - c): same sensitivity R (see
+                # sum_sensitivity); count error now pulls toward c, not 0.
+                pooled_sum -= center * n_tau
             sum_scale = self.config.sum_noise_scale(pub_eps)  # Delta_S/((1-rho)eps_tau)
             noisy_sum = pooled_sum + np.random.laplace(loc=0.0, scale=sum_scale)
-            released = noisy_sum / max(n_dp, 1)   # n_dp = the noisy publisher count
+            # Denominator: the smoothed, clipped noisy count (post-processing).
+            den = self._denominator(count_key, n_dp, n_cap)
+            released = (center or 0.0) + noisy_sum / den
         else:
             # Kellaris baselines: exact public count, direct noised mean with
             # sensitivity uses the post-P_max effective multiplicity (n_eff).
@@ -708,8 +840,312 @@ class StreamState:
 
 
 # ═════════════════════════════════════════════════════════════════════════
+#  Population counting for the broker: cached walk + adaptive-interval stop
+# ═════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class WalkResult:
+    """Outcome of one hierarchy walk (Algorithm 1, optionally with cached counts).
+
+    level  : index into the walk's scope list (0 = subscribed scope)
+    noisy  : the DP publisher count at ``level`` (rounded, >= 0) -- the gate
+             count and the released denominator
+    units  : count shares (rho * eps_tau each) the walk charged, one per
+             probed level (plus the leaf count unless the caller paid it)
+    draws  : Laplace draws made
+    met    : True iff ``noisy >= min_publishers``
+    leaf   : the DP count at the subscribed scope (level 0), unrounded -- the
+             observation the predictive interval sizing learns from (NaN when
+             no count was drawn)
+    """
+    level: int
+    noisy: int
+    units: int
+    draws: int
+    met: bool
+    leaf: float = float("nan")
+
+
+def walk_population_counts(
+    count_at,
+    n_levels: int,
+    min_publishers: int,
+    count_epsilon: float,
+    *,
+    cache: bool = True,
+    leaf_noisy: Optional[float] = None,
+    max_units: Optional[int] = None,
+    same_as_below=None,
+) -> WalkResult:
+    """Walk up the topic hierarchy until a DP publisher count reaches P_min.
+
+    ``count_at(k)`` is the exact number of range-compatible active publishers
+    at the k-th scope of the walk (0 = subscribed scope, n_levels-1 = root);
+    scopes are nested so the counts are non-decreasing.  It is called lazily,
+    only for the levels actually probed.
+
+    cache=True (count caching): the noisy count at level k is the cached noisy
+    count of level k-1 plus a noisy count of only the DELTA -- the publishers
+    that join at level k:
+
+        n~_k = n~_{k-1} + (n_k - n_{k-1}) + Lap(1 / count_epsilon).
+
+    Each delta count is a fresh DP count, so every probed level is charged one
+    count share, exactly as in Algorithm 1 (a walk probing m levels costs
+    m * count_epsilon, capped at ``max_units``).  Caching changes the
+    estimator, not the cost: the publishers already counted below are not
+    re-counted, only the new ones are added.
+
+    cache=False counts the whole ancestor pool afresh at every level, one
+    share each (capped at ``max_units``).
+
+    ``leaf_noisy`` reuses a level-0 count the caller already drew and charged
+    over the same interval (the reactive extension check), so it is neither
+    redrawn nor charged again.  ``same_as_below(k)`` is True when scope k has
+    the same publicly known publisher set as scope k-1 (a single-child level of
+    the tree); its count is identical, so it is skipped with no noise and no
+    charge.  count_epsilon <= 0 walks on exact counts (no privacy, no charge).
+    """
+    if n_levels <= 0:
+        return WalkResult(0, 0, 0, 0, False)
+
+    def _rounded(x: float) -> int:
+        return max(0, int(round(x)))
+
+    if count_epsilon <= 0:
+        n = 0
+        leaf = float(count_at(0))
+        for k in range(n_levels):
+            n = int(count_at(k))
+            if n >= min_publishers:
+                return WalkResult(k, n, 0, 0, True, leaf)
+        return WalkResult(n_levels - 1, n, 0, 0, False, leaf)
+
+    scale = 1.0 / count_epsilon
+    units = draws = 0
+    if leaf_noisy is None:
+        if max_units is not None and max_units < 1:
+            return WalkResult(0, 0, 0, 0, False)
+        noisy = count_at(0) + float(np.random.laplace(0.0, scale))
+        units = draws = 1
+    else:
+        noisy = float(leaf_noisy)
+    leaf = noisy
+    if _rounded(noisy) >= min_publishers:
+        return WalkResult(0, _rounded(noisy), units, draws, True, leaf)
+
+    level = 0
+    prev_exact = None     # exact count of the last level actually counted
+    for k in range(1, n_levels):
+        if same_as_below is not None and same_as_below(k):
+            level = k
+            continue
+        if max_units is not None and units >= max_units:
+            break
+        if cache:
+            if prev_exact is None:
+                prev_exact = int(count_at(0))
+            exact = int(count_at(k))
+            noisy += (exact - prev_exact) + float(np.random.laplace(0.0, scale))
+            prev_exact = exact
+            units += 1                      # every probed level is charged
+            draws += 1
+        else:
+            noisy = count_at(k) + float(np.random.laplace(0.0, scale))
+            units += 1
+            draws += 1
+        level = k
+        if _rounded(noisy) >= min_publishers:
+            return WalkResult(k, _rounded(noisy), units, draws, True, leaf)
+    return WalkResult(level, _rounded(noisy), units, draws, False, leaf)
+
+
+class PredictiveInterval:
+    """Predictive timestamp-interval sizing (paper Sec. 4.1, Eqs. 2-3).
+
+    Each interval's width is fixed UP FRONT from counts the broker has already
+    released, so sizing makes no count query of its own.  Every past interval
+    contributes one observation of the rate at which distinct publishers
+    arrive at the subscribed scope, max(n~, 1) / Delta t (its noisy count
+    normalized by the width that produced it), and the broker tracks the
+    geometrically discounted average
+
+        lambda_tau = max(n~_{tau-1}, 1) / (Delta t_{tau-1} * w)
+                     + (1 - 1/w) * lambda_{tau-1}                       (2)
+
+    seeded so that the first interval has the base width Delta t.  The next
+    width aims at 1.5 * P_min publishers, balancing latency (overshoot)
+    against wasted budget on deferrals and walks (undershoot):
+
+        Delta t_tau = clip(3 P_min / (2 lambda_tau), Delta t, T_max)    (3)
+
+    with T_max = K_ext * Delta t.  ``p_max`` is accepted for the call
+    signature but does not enter the target.
+    Widths are in whatever time unit ``base`` uses (seconds in the broker, raw
+    slots offline).  Delta t_tau depends only on released counts and public
+    constants, so by post-processing it consumes no privacy budget.
+    """
+
+    def __init__(self, base: float, k_ext: int, p_min: int,
+                 p_max: Optional[int], w: int):
+        self.base = float(base)
+        self.t_max = max(1, int(k_ext)) * self.base
+        self.p_aim = 1.5 * float(p_min)           # Eq. 3: target 1.5 * P_min
+        self.w = max(1, int(w))
+        self.rate = self.p_aim / self.base        # seed: Delta t_1 = Delta t
+
+    def width(self) -> float:
+        """Delta t_tau for the interval about to open (Eq. 3)."""
+        if self.rate <= 0:
+            return self.t_max
+        return min(max(self.p_aim / self.rate, self.base), self.t_max)
+
+    def observe(self, noisy_count: float, width: float) -> None:
+        """Fold in the noisy count an interval of ``width`` released (Eq. 2)."""
+        if width <= 0 or noisy_count is None or not np.isfinite(noisy_count):
+            return
+        obs = max(int(round(noisy_count)), 1) / width
+        self.rate = obs / self.w + (1.0 - 1.0 / self.w) * self.rate
+
+
+class MonotoneAboveThreshold:
+    """Sparse Vector stopping rule for the adaptive interval (Sec. 4.1).
+
+    The broker holds an interval open past Delta_t only until the buffered
+    publisher count reaches P_min.  Testing that condition at every check with
+    a fresh noisy count would cost one count share per check.  AboveThreshold
+    answers an unbounded sequence of "below?" checks and halts at the first
+    "above", paying only for that single positive answer.
+
+    The buffered count only grows while an interval stays open, and adding a
+    publisher can only raise every query in the sequence, so the queries are
+    monotone in the sense of Lyu, Su & Li (VLDB 2017).  With one positive
+    answer (c = 1) and sensitivity 1 the threshold takes Lap(1/eps1) and each
+    query Lap(1/eps2), with eps1 = eps2 = epsilon/2 (their optimal monotone
+    split), for a total cost of ``epsilon`` -- one count share.
+    """
+
+    def __init__(self, threshold: float, epsilon: float):
+        if epsilon <= 0:
+            raise ValueError("AboveThreshold needs a positive budget")
+        self.epsilon = float(epsilon)
+        self._query_scale = 2.0 / self.epsilon
+        self.noisy_threshold = float(threshold) + float(
+            np.random.laplace(0.0, 2.0 / self.epsilon))
+        self.queries = 0
+        self.halted = False
+
+    def test(self, count: float) -> bool:
+        """True = threshold reached (stop waiting); the instance then halts."""
+        if self.halted:
+            raise RuntimeError("AboveThreshold already answered 'above'")
+        self.queries += 1
+        above = count + float(np.random.laplace(0.0, self._query_scale)) \
+            >= self.noisy_threshold
+        self.halted = above
+        return above
+
+
+# ═════════════════════════════════════════════════════════════════════════
 #  Utility metrics
 # ═════════════════════════════════════════════════════════════════════════
+
+def release_utility(
+    true_values: list,
+    released_values: list,
+    payload_bound: float,
+    prior: Optional[float] = None,
+) -> dict:
+    """Subscriber utility of a delivered stream.
+
+    A timestamp is scored when its target (``true_values[i]``) exists, i.e.
+    the subscribed scope had data, and counts as delivered when
+    ``released_values[i]`` is not None -- a fresh release, or a repeat of the
+    previous one when the engine repeats on deferral.  Returned keys:
+
+      nmae           mean |released - true| / R over scored timestamps that
+                     received a value
+      mae            the same, unnormalized
+      coverage       fraction of scored timestamps that received a release
+      nmae_penalized NMAE with every undelivered scored timestamp counted as
+                     error 1.0 -- the paper's "no usable signal" level:
+                     coverage * nmae + (1 - coverage)
+      nmae_clip_penalized
+                     the same, but each delivered value is first clipped to
+                     the public clamp interval [prior - R/2, prior + R/2]
+                     (free subscriber-side post-processing), so its error is
+                     at most 1.0 and an undelivered timestamp (error 1.0) can
+                     never score better than a delivery.  NaN without
+                     ``prior``.
+      skill          1 - MAE / MAE of the best constant predictor (the median
+                     truth), on the delivered timestamps: > 0 only if the
+                     stream tells the subscriber more than a fixed number
+      skill_penalized / rel_mae_penalized
+                     the same over every scored timestamp, an undelivered one
+                     costing the constant's error; rel_mae_penalized = 1 -
+                     skill_penalized is the grid-search objective
+      corr           Pearson correlation of delivered and true values
+      skill_prior    1 - MAE / MAE of the data-independent constant ``prior``
+                     (the clamp midpoint): does the stream carry the level a
+                     subscriber could not know without it?  skill compares
+                     against the true median, an oracle constant, and asks
+                     whether the stream tracks the changes.
+      n_scored / n_fresh
+    """
+    scored = [(t, r) for t, r in zip(true_values, released_values)
+              if t is not None and np.isfinite(t)]
+    fresh = [(t, r) for t, r in scored if r is not None and np.isfinite(r)]
+    n_scored, n_fresh = len(scored), len(fresh)
+    nan = float("nan")
+    empty = {"nmae": nan, "mae": nan, "coverage": nan, "nmae_penalized": nan,
+             "nmae_clip_penalized": nan,
+             "skill": nan, "skill_penalized": nan, "corr": nan, "skill_prior": nan,
+             "rel_mae_penalized": nan, "n_scored": 0, "n_fresh": 0}
+    if n_scored == 0:
+        return empty
+    truth_all = np.array([t for t, _ in scored])
+    # Skill is measured against the best constant predictor for MAE, the
+    # median of the true values: a stream that is no more informative than a
+    # fixed number -- e.g. one shrunk toward 0 -- scores skill <= 0.
+    const = float(np.median(truth_all))
+    mae_const_all = float(np.mean(np.abs(truth_all - const)))
+    coverage = n_fresh / n_scored
+    if n_fresh == 0:
+        return {**empty, "coverage": 0.0, "nmae_penalized": 1.0,
+                "nmae_clip_penalized": 1.0 if prior is not None else nan,
+                "skill_penalized": 0.0, "rel_mae_penalized": 1.0,
+                "n_scored": n_scored, "n_fresh": 0}
+    t_f = np.array([t for t, _ in fresh])
+    r_f = np.array([r for _, r in fresh])
+    err = np.abs(r_f - t_f)
+    mae = float(np.mean(err))
+    nmae = mae / payload_bound if payload_bound > 0 else nan
+    mae_const_f = float(np.mean(np.abs(t_f - const)))
+    skill = 1.0 - mae / mae_const_f if mae_const_f > 0 else nan
+    # Penalized: an undelivered timestamp costs what the constant predictor
+    # costs there (no information beyond the constant).
+    miss = np.array([abs(t - const) for t, r in scored
+                     if r is None or not np.isfinite(r)])
+    pen_err = (err.sum() + miss.sum()) / n_scored
+    rel_pen = pen_err / mae_const_all if mae_const_all > 0 else nan
+    corr = (float(np.corrcoef(t_f, r_f)[0, 1])
+            if n_fresh > 2 and np.std(t_f) > 0 and np.std(r_f) > 0 else nan)
+    skill_prior = nan
+    nmae_clip_pen = nan
+    if prior is not None:
+        mae_prior = float(np.mean(np.abs(t_f - float(prior))))
+        skill_prior = 1.0 - mae / mae_prior if mae_prior > 0 else nan
+        if payload_bound > 0:
+            lo, hi = float(prior) - payload_bound / 2.0, float(prior) + payload_bound / 2.0
+            clip_err = np.minimum(np.abs(np.clip(r_f, lo, hi) - t_f) / payload_bound, 1.0)
+            nmae_clip_pen = float((clip_err.sum() + (n_scored - n_fresh)) / n_scored)
+    return {"nmae": nmae, "mae": mae, "coverage": coverage,
+            "nmae_penalized": coverage * nmae + (1.0 - coverage),
+            "nmae_clip_penalized": nmae_clip_pen,
+            "skill": skill, "skill_penalized": 1.0 - rel_pen if rel_pen == rel_pen else nan,
+            "rel_mae_penalized": rel_pen, "corr": corr, "skill_prior": skill_prior,
+            "n_scored": n_scored, "n_fresh": n_fresh}
+
 
 def compute_utility_metrics(
     true_values: list[float],
@@ -745,8 +1181,13 @@ def compute_kl_divergence(
     true_values: list[float],
     noisy_values: list[float],
     num_bins: int | None = None,
+    value_range: tuple[float, float] | None = None,
 ) -> float:
-    """D_KL(P || Q) with Jeffreys smoothing (alpha=0.5)."""
+    """D_KL(P || Q) with Jeffreys smoothing (alpha=0.5).
+
+    Bins span the pooled data's range, or ``value_range`` when given (e.g. the
+    public clamp interval, so the binning is data-independent and comparable
+    across calls); values outside it fall into the edge bins."""
     true_clean = np.array([v for v in true_values if v is not None and np.isfinite(v)])
     noisy_clean = np.array([v for v in noisy_values if v is not None and np.isfinite(v)])
 
@@ -756,8 +1197,14 @@ def compute_kl_divergence(
     if num_bins is None:
         num_bins = _adaptive_bin_count(min(len(true_clean), len(noisy_clean)))
 
-    all_vals = np.concatenate([true_clean, noisy_clean])
-    bin_edges = np.linspace(all_vals.min(), all_vals.max(), num_bins + 1)
+    if value_range is not None and value_range[1] > value_range[0]:
+        lo, hi = float(value_range[0]), float(value_range[1])
+        true_clean = np.clip(true_clean, lo, hi)
+        noisy_clean = np.clip(noisy_clean, lo, hi)
+        bin_edges = np.linspace(lo, hi, num_bins + 1)
+    else:
+        all_vals = np.concatenate([true_clean, noisy_clean])
+        bin_edges = np.linspace(all_vals.min(), all_vals.max(), num_bins + 1)
 
     p_counts, _ = np.histogram(true_clean, bins=bin_edges)
     q_counts, _ = np.histogram(noisy_clean, bins=bin_edges)
@@ -778,13 +1225,13 @@ def compute_windowed_kl_divergence(
     num_bins: int | None = None,
     stride: int = 1,
 ) -> list[float]:
-    """Per-window KL divergence U_tau (paper Section 5.8)."""
+    """Per-window KL divergence U_tau (legacy metric; not in the current paper)."""
     kl_per_window = []
     n = len(true_values)
 
     for tau in range(window_size, n + 1, stride):
         # U_tau is defined over the w-event window of exactly `window_size`
-        # logical timestamps (paper Sec. 6.10).  Use that window verbatim;
+        # logical timestamps.  Use that window verbatim;
         # compute_kl_divergence already returns NaN when a window has too few
         # finite samples for a stable histogram, so no fixed-size override is
         # needed (and a fixed override would silently report a different window
@@ -802,7 +1249,7 @@ def compute_global_utility(
     window_size: int,
     num_bins: int | None = None,
 ) -> float:
-    """U_global (paper Section 5.8): mean of per-window KL divergences."""
+    """U_global (legacy metric): mean of per-window KL divergences."""
     kl_windows = compute_windowed_kl_divergence(
         true_values, noisy_values, window_size, num_bins
     )
@@ -817,7 +1264,7 @@ def compute_global_utility(
 # ═════════════════════════════════════════════════════════════════════════
 
 def attribution_advantage(pub_counts: list[int], deferred_mask: list[bool]) -> float:
-    """Mean 1/n_tau over released timestamps (paper Section 5.2)."""
+    """Mean 1/n_tau over released timestamps."""
     advs = [1.0 / n for n, d in zip(pub_counts, deferred_mask)
             if not d and n and n > 0]
     if not advs:

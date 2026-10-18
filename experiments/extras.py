@@ -58,20 +58,22 @@ def _k_ext_task(task):
     per_pub = _WORKER_PER_PUB
     T = len(next(iter(per_pub.values())))
     merged_agg, merged_cnt, merged_wait = [], [], []
-    pending_vals, pending_pubs, pending_waits = [], set(), 0
+    pending, pending_waits = {}, 0          # publisher -> latest reading
     for tau in range(T):
         for p, series in per_pub.items():
             v = series[tau]
             if v is not None:
-                pending_vals.append(v)
-                pending_pubs.add(p)
+                pending[p] = v
+        pending_pubs = set(pending)
+        pending_vals = list(pending.values())
         pending_waits += 1
         if len(pending_pubs) >= P or pending_waits > k_ext:
             merged_agg.append(float(np.mean(pending_vals)) if pending_vals else 0.0)
             merged_cnt.append(len(pending_pubs))
             merged_wait.append(pending_waits)
-            pending_vals, pending_pubs, pending_waits = [], set(), 0
-    if pending_vals:
+            pending, pending_waits = {}, 0
+    if pending:
+        pending_pubs, pending_vals = set(pending), list(pending.values())
         merged_agg.append(float(np.mean(pending_vals)))
         merged_cnt.append(len(pending_pubs))
         merged_wait.append(pending_waits)

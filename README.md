@@ -1,51 +1,241 @@
 # PubSubPrivacy
 
-**Clamped w-event Differential Privacy with P-allocation for MQTT Publish-Subscribe Systems**
+**PAWS: Differentially Private Aggregation for IoT Publish/Subscribe Streams**
 
-Reference implementation of the paper *Privacy in Publish Subscribe Systems*
-(Olinger and Pappachan, 2026). Extends the w-event DP framework of Kellaris
-et al. (2014) to the pub/sub setting with:
+Reference implementation of the paper *PAWS: Differentially Private
+Aggregation for IoT Publish/Subscribe Streams* (under submission). PAWS
+realizes w-event differential privacy (Kellaris et al., 2014) for aggregate
+(mean) queries on MQTT publish/subscribe streams, as a broker-side plugin. Its
+components, with the paper section each implements:
 
-  * **Clamped aggregate streams** (Section 3.3): each release is the mean of
-    the clamped payloads of the publishers active during the interval.
-  * **Per-element sensitivity `Δf = R / n_τ`** (Section 4.3) — keyed on the
-    observed multiplicity, not on the scheduling threshold P, so the ε
-    guarantee never depends on a private payload value.
-  * **P-allocation** (Section 5.3), a population-aware budget-allocation
-    strategy family joining Kellaris et al.'s Uniform, Sample, BD, and BA.
-  * **n-weighted P-allocation** (Section 6.4) — distributes ε across a window
-    **inversely** proportional to `n_τ`: `ε_τ = ε·(1/n_τ) / Σ_j(1/n_j)`. Because
-    the mean sensitivity is `R/n_τ`, this *equalizes* the released Laplace scale
-    across the window (`λ_τ = R·Σ_j(1/n_j)/ε`, independent of `n_τ`) so a few
-    dense-pool timestamps don't dominate the window budget. (The paper's printed
-    Eq. 5 denominator `Σ_j n_j` is a typo for `Σ_j(1/n_j)` — the inverse-weight
-    form is the only reading consistent with both "inversely proportional" and
-    "shares sum to ε"; see `dp_engine._alloc_n_weighted`.)
-  * **Clamp-compatible topic-hierarchy walk** (Algorithm 1), operating on a
-    normative MQTT topic tree per dataset (e.g. `energy/building01/{circuit}/{metric}`,
-    `factory/line1/{machine}/{sensor}`, `health/clinic01/{device}/{metric}`).
-  * **Dynamic timestamp-interval extension** up to `T_max = K_ext · Δt`
-    (Section 5.6).
-  * **Two-stage hyperparameter tuning** (Section 5.7): Algorithm 2 greedy
-    hill-climb over the publisher threshold `P`, now with **intelligent
-    random-restart multi-start**. The first restart always seeds at the
-    paper's `P_0 = ⌈1/α⌉` identity-protection seed; the remaining seeds are
-    drawn from quantiles of the observed `n_τ` distribution so the hill-climb
-    explores the pool-density regimes the stream actually exhibits instead of
-    always starting at the same point. Paired with a naive full-brute-force
-    enumeration of every `P ∈ [1, max n_τ]` per strategy so the **empirical
-    gap** between greedy and optimal is measurable directly.
-  * **Comprehensive per-release message logging** — every DP run writes the
-    `(true_aggregate, noisy_value, n_τ, ε_τ, λ_τ, deferred, ...)` pair for
-    every logical timestamp to `messages/*.csv`, so the full input/output
-    trail (original message and its noisy delivery) is auditable offline.
-  * **Decoupled plotting** — `run_experiment.py` writes CSVs only (no inline
-    PNGs by default); `generate_plots.py` reads those CSVs post-hoc and
-    renders every figure. Use `--generate-plots` on `run_experiment.py` to
-    restore the inline behavior.
+  * **Aggregate stream construction** (paper §3–§4): messages are bucketed
+    into logical timestamps of width Δt, each payload is clamped to its
+    publisher's declared range, and each release is a noisy centered sum
+    (Laplace scale `R/((1−ρ)ε_τ)`, sensitivity `R` under Definition 3.1)
+    divided by a noisy publisher count (scale `1/(ρ ε_τ)`), released only when
+    at least `P_min` publishers contribute (the **P_min gate**).
+  * **Timestamp widening** (§4.1, Eqs. 2–3): the interval is sized up front
+    from the discounted arrival rate of past noisy counts, aiming at
+    `1.5·P_min` publishers, capped at `K_ext·Δt`. Pure post-processing.
+  * **Subscription rewriting** (§4.2, Definition 4.1, Algorithm 1): when the
+    subscribed scope still has fewer than `P_min` publishers, the release
+    walks up the topic tree to the nearest ancestor whose **range-compatible**
+    pool meets the threshold.
+  * **Budget weighting** (§5, Eqs. 8–9, Algorithm 2; `n_weighted` in the
+    code): the window budget is split in inverse proportion to each
+    timestamp's noisy publisher count, `ε_τ = ε·(1/n_τ)/Σ_j(1/n_j)`, clipped
+    to the remaining window budget.
+  * **Evaluation** (§6): utility vs. ε, w and subscription depth, downstream
+    forecasting, induced wait and broker overhead, and the incremental
+    ablation, on six real IoT datasets (see "Section 6 experiments" below).
+
+### Code ↔ paper terminology
+
+| Paper | Code / CLI |
+|---|---|
+| Budget weighting (publisher weighted) | `n_weighted` (`--our-strategy n_weighted`) |
+| P_min gate | `P_min`, the `p_gated_*` strategies |
+| PAWS Sample | `p_gated_sample` |
+| Timestamp widening | adaptive interval, `--wait-policy predictive`, `K_ext` |
+| Subscription rewriting | hierarchy walk / walk-up, `walk=True` |
+| Global w-event DP baseline | `wevent` |
+| Per-publisher (local) DP baseline | `ldp` |
+| Count split ρ | `rho_split`, `--rho-split` |
+
+**Implementation details beyond the paper text** (all preserve the
+guarantee): the walk-up adds a noisy count of only the publishers new at each
+level to the cached count below, each charged one count share as in
+Algorithm 1 (`--no-count-cache` counts the whole ancestor pool afresh at each
+level instead); the released mean divides by the average of the last `w` noisy
+counts at the same scope, clipped to `[1, N]` (post-processing); and an
+optional `P_max` cap truncates very large pools.
+
+Experiments A–L, `intro`, `tuning` and `sweep` (and their section references
+further down this README) come from earlier drafts of the paper and are kept
+for reference; the current paper's evaluation is the "Section 6 experiments"
+set (U, M, K, J, F and the grid).
 
 The experimental pipeline runs end-to-end on **six real-world public
 datasets** — no synthetic data anywhere.
+
+## Mechanism and evaluation updates (SIGMOD 2027 revision)
+
+| Change | Where | What it does |
+|--------|-------|--------------|
+| **Cached counts on the hierarchy walk** | `dp_engine.walk_population_counts`, `plugin._walk` | Walking up adds a noisy count of only the *delta* (publishers new at that level) to the cached count below: `ñ_k = ñ_{k-1} + (n_k − n_{k-1}) + Lap(1/(ρε_τ))`. Each delta is a fresh DP count, so every probed level is charged one count share, as in Algorithm 1 (m probed levels cost m·ε_count); caching avoids re-counting the publishers already counted below. Levels whose (public) publisher set equals the one below are skipped with no draw and no charge. `--no-count-cache` counts the whole ancestor pool afresh at each level instead. |
+| **Timestamp widening / predictive Δt (paper §4.1)** | `dp_engine.PredictiveInterval`, `plugin._predictive_wait` | Each interval's width is fixed up front from the discounted arrival rate of past noisy counts, `λ̂_τ = max(ñ_{τ−1},1)/(Δt_{τ−1}·w) + (1−1/w)·λ̂_{τ−1}` (seeded so `Δt_1 = Δt`), as `Δt_τ = clip(1.5·P_min/λ̂_τ, Δt, K_ext·Δt)` (paper Eqs. 2–3). Sizing is post-processing and costs no budget. An interval whose closing count misses P_min gets at most one corrective Δt extension when the window can pay for the recount, then walks, then defers. Alternatives: `--wait-policy early_stop` (Sparse Vector rule that closes as soon as P_min is met, one count share per interval), `reactive` (the original whole-Δt extension, one count per check), `none`. |
+| **Grid search for ρ** | `experiments/grid_search.py` | The §7.5 grid sweeps ρ ∈ {0.05 … 0.8} jointly with P_min, P_max, Δt, K_ext over the full pipeline at one subscription per depth, selecting on the coverage-penalized NMAE; `*_rho_profile.csv` gives the best objective at each ρ. |
+| **No repeated outputs in the ablation** | `experiments/ablation.py`, `PrivacyConfig.repeat_on_defer` | Everywhere else a deferred timestamp repeats the previous output, as in the paper. The ablation turns this off (`repeat_on_defer=False`): a deferral delivers nothing, so a module that rarely releases is not credited with stale repeats. |
+| **Utility metric** | `dp_engine.release_utility` | NMAE of the delivered values against the subscribed scope's true aggregate, plus `coverage` and `nmae_penalized = coverage·NMAE + (1 − coverage)` (an undelivered timestamp counts as the paper's no-signal error 1.0). Timestamps with no active publisher have no true aggregate and are not scored. In the ablation the delivered values are fresh releases only. |
+| **Unbiased release estimator** | `dp_engine.StreamState.release`, `PrivacyConfig.center` / `count_smoothing` | The released mean was a noisy sum divided by a fresh noisy count; with the small ρ the grid chose, large count draws collapsed outputs toward 0 (10/12 run: correlation with the truth ≈ 0, outputs 13–25% of the true mean). Now: (1) the sum is centered on the public clamp midpoint c, privatizing Σ(x−c) with sensitivity R (a substitution neighbour can move one centered payload across the whole range) and releasing c + S̃/ñ, so count error pulls toward the middle of the range, not 0; (2) ñ is the average of the last w noisy counts at the same scope (post-processing, no budget; variance ÷ w); (3) ñ is clipped to [1, N], N = publishers registered under the scope (public). The budget-weighting allocator (ours, Eq. 8) weights by this same smoothed count rather than one raw noisy draw. |
+| **Skill metric** | `dp_engine.release_utility` | `skill = 1 − MAE / MAE(best constant)`, the constant being the median truth, plus `corr` (released vs true). A stream no more informative than a fixed number scores ≤ 0. `skill_prior` compares against the data-independent clamp midpoint instead (does the stream carry the level?), while `skill` asks whether it tracks the changes. The grid selects on `rel_mae_penalized = 1 − skill_penalized` (undelivered = the constant's error). |
+| **Full-pipeline simulator** | `experiments/pipeline.py` | Replays the raw per-publisher trace through the broker's decisions (stopping rule, cached walk, P_max, the engine's budget accounting) per subscription, with LDP / w-event / no-privacy baselines on the same intervals. The older offline experiments decided interval extension on the exact count and never walked the tree. |
+
+Accounting fixes made along the way: the plugin's interval-extension counts are
+now charged to the stream's window (they were drawn but dropped), and BD/BA's
+dissimilarity share can no longer push a window over ε when count shares have
+used most of it (`test_pipeline.py` covers both).
+
+### Section 6 experiments
+
+| Exp. | Module | Measures |
+|------|--------|----------|
+| U | `experiments/utility.py` | NMAE / coverage of PAWS vs **local DP** and **w-event DP** on all 6 datasets, at every subscription depth, over ε ∈ {0.5, 1, 2, 4, 6, 8} (`--sweep epsilon`) and w ∈ {4, 8, 12, 16, 20, 24} (`--sweep window`), scored by skill against the best constant predictor as well as NMAE. |
+| M | `experiments/ml_utility.py` | Downstream ML on the received stream: Ridge next-value forecast (NMAE) and logistic threshold classification (balanced accuracy, F1), vs no privacy / LDP / w-event. |
+| J | `experiments/latency.py` | Broker latency: per-message ingest and per-release work (in-process) for forward-only, w-event and PAWS variants; `--live` adds publish→delivery latency through a real MQTT broker. |
+| K | `experiments/induced_wait.py` | Extra wait induced by the adaptive interval (Δt units and seconds; mean / p95 / max) for the predictive, early-stop and reactive policies over K_ext, with the utility it buys and `walk_kl`, the semantic shift of the walk-ups that waiting avoids: D_KL(P ‖ Q) between the subscribed scope's readings (P) and the walked-up pool's readings (Q) over every fresh release that walked, binned on the public clamp interval (NaN when nothing walked). Every Section 7 simulation reports it. |
+| F | `experiments/ablation.py` | Three cumulative components — M1 P-gate, M2 + predictive adaptive interval, M3 + cached walk-up — at every depth, on fresh releases only (no repeated outputs). |
+
+```bash
+python -m experiments.grid_search  --dataset all              # writes grid_canonical.json first
+python -m experiments.utility      --dataset all --sweep both --trials 6
+python -m experiments.ml_utility   --dataset all --trials 6
+python -m experiments.latency      --dataset all --trials 3 --live
+python -m experiments.induced_wait --dataset all --trials 6
+python -m experiments.ablation     --dataset all --trials 6
+PAPER_RESULTS=results python make_paper_figures.py           # exp_U_*, exp_M_*, exp_J/K/F figures
+```
+
+`--our-strategy` picks the budget strategy used for PAWS (default
+`n_weighted`, the paper's n-weighted P-allocation; e.g. `p_gated_uniform`), `--eps-values` / `--w-values` override
+the sweeps. On the cluster these run as phase-2 shards `U M K J F`
+(`cluster/gen_jobs.sh`) consuming the phase-1 grid.
+
+### Section 6 tables (10/13 cluster run)
+
+Reference tables for the paper's Section 6, from the 10/13 run
+(`results_combined_1013/`, grid trials in `paper_bundle_1013/shards/*__static__grid/`):
+static clamp, 6 noise seeds per configuration.
+
+> The runs behind them calibrated
+> PAWS's centered sum to sensitivity R/2; under the paper's neighbouring
+> relation (Definition 3.1) the sensitivity is R, which the code now uses.
+> PAWS's sum noise in these tables is therefore half what the stated ε
+> requires, and they also predate the 1.5·P_min interval target (Eq. 3) and
+> the per-level charging of cached walk-up counts (Algorithm 1).
+> Re-run the grid and the Section 6 experiments before relying on them.
+
+**Datasets.** All six are real, public IoT feeds. |P| is the number of
+distinct publishers and Subs. the number of wildcard subscriber bindings a
+realistic domain subscriber registers. For energy, traffic, wearable and pune
+the publisher is a genuine per-row entity; for mobility and manufacturing it is
+synthesized from structure in the source (a 4×4 latitude/longitude grid of
+virtual sensors, and minute-of-interval sub-publishers of a single machine).
+
+| Dataset | Source | \|P\| | Subs. | Sensors evaluated |
+|---|---|---:|---:|---|
+| energy | IEEE Data Descriptions, 2025 | 12 | 3 | power (kW), voltage, current |
+| traffic | IEEE Data Descriptions, 2025 | 4–8 | 4 | speed, object count |
+| wearable | Kaggle, 2024 | 10 | 5 | heart rate, steps, temperature, calories |
+| pune | Kaggle, 2023 | 10 | 3 | PM10, PM2.5, humidity, sound, ozone |
+| mobility | Kaggle, 2024 | 16 | 4 | speed, vehicle count, occupancy, emission |
+| manufacturing | Kaggle, 2024 | 10 | 5 | temperature, speed, vibration, quality |
+
+**Constructed topic hierarchies.** h is the number of levels; braces are the
+per-dataset entities populating each level.
+
+| Dataset | h | Topic hierarchy |
+|---|---:|---|
+| energy | 4 | `energy/building01/{CT}/{metric}` |
+| traffic | 5 | `traffic/intersection01/{kind}/{id}/{metric}` |
+| wearable | 4 | `health/{hospital}/{device}/{metric}` |
+| pune | 4 | `air_quality/pune/{station}/{pollutant}` |
+| mobility | 5 | `mobility/nyc/{quadrant}/{cell}/{metric}` |
+| manufacturing | 5 | `factory/line1/{station}/{machine}/{sensor}` |
+
+**Grid-optimal parameters for ours (n-weighted).** Recomputed from the
+per-trial grid JSONs (the grid's selection score, coverage-penalized MAE
+relative to the best constant predictor, averaged over seeds). P_min\* = 6 and P_max\* = ∞
+throughout, except energy (P_max\* = 8 at ε ≥ 4). Δt is the multiplier on each
+dataset's base slot.
+
+| Dataset | ε=1: Δt | K_ext | ρ | ε=4: Δt | K_ext | ρ | ε=8: Δt | K_ext | ρ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| energy | 4 | 0 | .05 | 4 | 0 | .05 | 4 | 4 | .20 |
+| traffic | 1 | 0 | .05 | 1 | 0 | .05 | 1 | 0 | .20 |
+| wearable | 1 | 0 | .05 | 4 | 0 | .05 | 1 | 0 | .40 |
+| pune | 4 | 0 | .05 | 4 | 0 | .05 | 4 | 4 | .50 |
+| mobility | 1 | 0 | .05 | 1 | 0 | .05 | 4 | 0 | .30 |
+| manufacturing | 4 | 0 | .05 | 4 | 0 | .05 | 2 | 0 | .30 |
+
+**Skill against the range midpoint at the type-root subscription** (> 0: more
+informative than the declared clamp range). PG-S = PAWS P-gated Sample; best
+per row and budget in bold.
+
+| Dataset | ε=4: ours | PG-S | w-event | LDP | ε=8: ours | PG-S | w-event | LDP |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| energy | −0.03 | **0.72** | 0.03 | −2.26 | 0.56 | **0.81** | 0.52 | −0.63 |
+| traffic | −0.03 | **0.42** | −0.79 | −3.74 | 0.29 | **0.32** | 0.10 | −1.37 |
+| wearable | 0.40 | **0.62** | −1.22 | −2.53 | 0.50 | **0.58** | −0.00 | −0.96 |
+| pune | 0.39 | **0.74** | −0.25 | −2.75 | 0.39 | **0.78** | 0.38 | −0.87 |
+| mobility | 0.08 | **0.35** | −1.90 | −5.95 | **0.45** | 0.43 | 0.32 | −1.58 |
+| manufacturing | 0.52 | **0.88** | 0.15 | −1.96 | 0.67 | **0.91** | 0.58 | −0.46 |
+
+**NMAE of every budget strategy** at ε = 4, w = 8, each at its own grid
+optimum. Best per column in bold.
+
+*Type-root subscription:*
+
+| Group | Strategy | energy | traffic | wearable | pune | mobility | manuf. |
+|---|---|---:|---:|---:|---:|---:|---:|
+| PAWS | n-weighted (ours) | .201 | .196 | .142 | .140 | .131 | .116 |
+| PAWS | P-gated Uniform | .198 | .195 | .142 | .139 | .132 | .114 |
+| PAWS | P-gated Sample | .072 | .105 | .087 | .064 | .090 | .031 |
+| PAWS | P-gated BA | .199 | .231 | .144 | .237 | .134 | .111 |
+| PAWS | P-gated BD | .183 | .274 | .185 | .288 | .146 | .149 |
+| Kellaris | Uniform | .261 | .343 | .466 | .258 | .166 | .199 |
+| Kellaris | Sample | **.036** | **.103** | **.079** | **.046** | **.057** | **.027** |
+| Kellaris | BD | .349 | .498 | .677 | .362 | .228 | .280 |
+| Kellaris | BA | .273 | .426 | .568 | .282 | .172 | .209 |
+| Baseline | w-event DP | .261 | .343 | .524 | .258 | .405 | .203 |
+| Baseline | local DP | .783 | .908 | .834 | .781 | .970 | .705 |
+
+*All subscription levels:*
+
+| Group | Strategy | energy | traffic | wearable | pune | mobility | manuf. |
+|---|---|---:|---:|---:|---:|---:|---:|
+| PAWS | n-weighted (ours) | .827 | .669 | .696 | .757 | .711 | .694 |
+| PAWS | P-gated Uniform | .811 | .658 | .682 | .725 | .692 | .684 |
+| PAWS | P-gated Sample | **.197** | **.152** | **.183** | **.173** | **.201** | **.088** |
+| PAWS | P-gated BA | .842 | .758 | .922 | .648 | .740 | .727 |
+| PAWS | P-gated BD | .945 | .848 | 1.095 | .750 | .862 | .871 |
+| Kellaris | Uniform | 1.871 | 1.629 | 1.815 | 1.834 | 1.797 | 1.675 |
+| Kellaris | Sample | .236 | .229 | .259 | .235 | .286 | .216 |
+| Kellaris | BD | 2.823 | 2.477 | 2.592 | 2.773 | 2.545 | 2.518 |
+| Kellaris | BA | 2.249 | 2.045 | 2.284 | 2.215 | 2.305 | 2.043 |
+| Baseline | w-event DP | 1.871 | 1.629 | 1.775 | 1.834 | 1.876 | 1.704 |
+| Baseline | local DP | 1.912 | 1.768 | 1.874 | 1.882 | 1.931 | 1.824 |
+
+**Walk-up semantic shift** (Experiment K re-run with `walk_kl`, ours, ε = 1,
+w = 8, 6 seeds, all subscription levels; `results_K_walkkl/`). Walk KL is
+D_KL(P ‖ Q) in nats between the subscribed scope's readings and the walked-up
+pool's readings, over releases that walked; walk rate is the share of releases
+that walked. The re-run reproduces the 10/13 K numbers exactly otherwise.
+
+| Dataset | No waiting: KL | walk rate | Predictive K_ext=4: KL | walk rate | Reactive K_ext=4: KL | walk rate |
+|---|---:|---:|---:|---:|---:|---:|
+| energy | 0.079 | 0.20 | 0.149 | 0.08 | 0.198 | 0.008 |
+| traffic | 0.105 | 0.25 | 0.107 | 0.10 | 0.136 | 0.014 |
+| wearable | 0.066 | 0.27 | 0.124 | 0.12 | 0.200 | 0.028 |
+| pune | 0.208 | 0.20 | 0.208 | 0.08 | 0.297 | 0.008 |
+| mobility | 0.046 | 0.28 | 0.068 | 0.11 | 0.175 | 0.013 |
+| manufacturing | 0.041 | 0.26 | 0.090 | 0.10 | 0.192 | 0.019 |
+
+**Broker cost per dataset** (Experiment J, in-process; median over sensors and
+6 trials). PAWS runs ours (n-weighted); "no cache" recomputes per-level walk
+counts and "no wait" disables the adaptive interval.
+
+| Metric | Configuration | energy | traffic | wearable | pune | mobility | manuf. |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Broker CPU per Δt tick (ms) | forward only | 0.07 | 0.06 | 0.07 | 0.08 | 0.05 | 0.08 |
+| | w-event DP | 0.43 | 0.27 | 0.44 | 0.45 | 0.57 | 0.47 |
+| | PAWS (ours) | 0.95 | 0.57 | 0.97 | 0.92 | 1.54 | 1.01 |
+| | PAWS, no cache | 0.97 | 0.58 | 0.97 | 0.92 | 1.56 | 1.02 |
+| | PAWS, no wait | 1.28 | 0.79 | 1.37 | 16.89 | 2.16 | 1.41 |
+| Ingest per message (µs) | forward only | 8.6 | 9.4 | 8.3 | 9.7 | 9.3 | 8.2 |
+| | PAWS (ours) | 8.8 | 9.3 | 8.5 | 9.8 | 10.1 | 8.4 |
+| Interval close, p95 (ms) | w-event DP | 0.05 | 0.04 | 0.05 | 0.05 | 0.05 | 0.05 |
+| | PAWS (ours) | 0.16 | 0.16 | 0.16 | 0.17 | 0.17 | 0.17 |
 
 ## Architecture
 
@@ -58,12 +248,14 @@ Publishers (IoT sensors)
        v
   PrivacyPlugin (broker middleware)
     - Clamps each payload to [a_p, b_p]                          (Def. 3.2)
-    - Buffers messages per logical timestamp (interval Δt)        (Def. 3.1)
-    - Adaptive extension up to K_ext · Δt if n_τ < P              (Sec. 5.6)
-    - Clamp-compatible hierarchy walk when n_τ still < P          (Alg. 1)
-    - Computes clamped mean aggregate e_τ                         (Def. 3.3)
-    - Releases  ê_τ = e_τ + Lap(R / (n_τ · ε_τ))                  (Thm. 5.1)
-    - Enforces sliding window budget  Σ ε_j ≤ ε                   (Eq. 4)
+    - Buffers messages per logical timestamp (interval Δt)        (Def. 5.1)
+    - Sizes each interval up front, clip(P_aim/λ̂, Δt, K_ext·Δt),
+      from past noisy counts (free); ≤ 1 corrective extension    (Sec. 5.1.1)
+    - Clamp-compatible hierarchy walk on cached delta counts
+      when the DP count is still < P_min                          (Alg. 1)
+    - Releases noisy sum / noisy count  S̃_τ / max(ñ_τ, 1)         (Def. 5.3)
+    - Charges every count share inside the window  Σ ε_j ≤ ε      (Def. 2.3)
+    - Repeats the previous output on a deferred timestamp
        |
        v
   [protected MQTT topics]
@@ -86,13 +278,15 @@ and cluster-shardable:
 | `message_logger.py` | Per-release message serialization → append-friendly CSV rows. Built only when message logging is on; **all metrics are computed without it**, so `--no-log-messages` (the cluster default) avoids the per-release buffer that otherwise OOMs the largest dataset. |
 | **`experiments/engine.py`** | **The shared core library.** The DP runners (`run_dp_on_stream`, `run_ldp_on_per_pub`), the `ProcessPoolExecutor` pool + worker-global stream caches, the topic-hierarchy / per-level subscription primitives (`_topic_level_groups`, `level_subscription_streams`), dataset/grid resolution (`_resolve_params`, grid-canonical I/O), the stubbed-MQTT plugin driver, plotting, trial aggregation, and the per-dataset / cross-dataset orchestration (`run_dataset`, `run_single_axis_experiments`, `_run_grid_search_block`). Every module imports it as `core`. |
 | **`experiments/<name>.py`** | One module per paper experiment, each runnable as `python -m experiments.<name>`: `sweep`, `grid_search`, `intro` (Extreme 1 / 1.1 / 2, U-shape, Figure 1), `tuning`, `extras` (n-weighted spotlight, collusion, K_ext §7.10), `greedy_vs_brute` (A), `window` (B), `epsilon` (C), `plugin_path` (D), `ablation` (F), `overhead` (G), `average_case` (H), `subscription_levels` (L). `_common.py` provides the shared CLI/arg resolution. |
-| **`experiments/live_broker.py`** | Experiment E: live MQTT broker end-to-end (embedded broker + real paho publishers/subscribers through the plugin). Kept out of the offline engine because it needs a running broker. |
+| **`experiments/live_broker.py`** | Experiment E: live MQTT broker end-to-end (auto-started Mosquitto by default, or embedded amqtt with `--broker-impl amqtt`, + real paho publishers/subscribers through the plugin). Kept out of the offline engine because it needs a running broker. |
 | `run_experiment.py` | **Thin CLI wrapper** over `experiments/engine.py` — builds the argument parser and dispatches into the engine + experiment modules. Carries no functional code itself. |
 | `generate_plots.py` | Post-hoc plot generator. Reads the CSVs (including the per-trial `*_aggregate.csv` files) and renders the full PNG catalogue. Run after the experiments, or pass `--generate-plots` for the inline workflow. |
-| `cluster/` | Cluster launchers: `gen_jobs.sh` (emits one shard per `dataset×clamp×experiment`), `submit_coeus.sh` (SLURM two-phase array), `run_cluster.sh` (GNU parallel), `aggregate.py` (merge shards + build the `paper_bundle/`), and the SLURM `.sbatch` files. See `cluster/COEUS_RUNBOOK.md`. |
+| `cluster/` | Cluster launchers: `gen_jobs.sh` (emits one shard per `dataset×clamp×experiment`), `submit_slurm.sh` (SLURM two-phase array), `run_cluster.sh` (GNU parallel), `aggregate.py` (merge shards + build the `paper_bundle/`), and the SLURM `.sbatch` files. See `cluster/SLURM_RUNBOOK.md`. |
+| `experiments/pipeline.py` | Offline full-pipeline simulator used by the Section 7 experiments (U/M/K/F and the grid): stopping rule, cached walk, P_max, budget accounting, and the LDP / w-event / no-privacy baselines. `experiments/_section7.py` is their shared driver. |
+| `test_pipeline.py` | Cached-walk charging, predictive interval sizing, the stopping rule, repeat-on-defer (off in the ablation), the utility metric, and the window invariant through the simulator (every strategy × wait × walk × cache) and the plugin. |
 | `test_engine.py` / `test_extremes.py` | DP correctness tests (w-event budget invariant for all strategies, single-sourced gate, BA cap-rollback) and the intro extremes (LDP scale, Extreme 1.1 per-level, Extreme 1/2 figures). |
 
-## Parameter taxonomy (paper §3.1)
+## Parameter taxonomy (paper §3.2)
 
 ### DP parameters (enter the privacy analysis)
 
@@ -674,7 +868,7 @@ making the utility-vs-aggregation-depth curve explicit. CSV:
 `--experiment FGH` runs F/G/H; `--experiment full` and `ABCDFGH` include them
 alongside A/B/C/D. F/G/H/L consume the §7.5 grid optimum via `--use-grid-config`.
 
-### §7.5 grid search fixes the params for every other experiment
+### The grid search (paper §6.1) fixes the params for every other experiment
 
 ```bash
 # Run the Section 7.5 grid search (P_min x P_max x Δt x K_ext, scored by MAE)
@@ -722,19 +916,18 @@ SHARD_BY=dataset-clamp-exp JOBS=32 cluster/run_cluster.sh   # finest shards
 DRY_RUN=1 cluster/run_cluster.sh               # print the plan, run nothing
 ```
 
-**PSU Research Computing (Coeus) SLURM job array** — Coeus uses SLURM and
-[recommends job arrays](https://sites.google.com/pdx.edu/research-computing/faqs/coeus-hpc-faqs/slurm-parallelism)
-for exactly this "same computation on different data" pattern (GNU parallel is
-not installed there, so the array indexes the same joblist directly):
+**SLURM job array** — job arrays are the standard SLURM pattern for exactly
+this "same computation on different data" workload (no GNU parallel needed:
+the array indexes the same joblist directly):
 
 ```bash
-# From the repo root on Coeus (activate a Python >= 3.10 env first).
+# From the repo root on the cluster (activate a Python >= 3.10 env first).
 # Maximally-parallel fine mode (recommended): ~354 shards, static clamp.
 SHARD_BY=dataset-clamp-exp CPUS=10 PARTITION=medium TIME=1-00:00:00 THROTTLE=80 \
   EXTRA_ARGS="--trials 6 --no-log-messages" \
   PUBSUB_ENV_SETUP='source ~/PubSubPrivacy/.venv/bin/activate' \
-  cluster/submit_coeus.sh
-DRY_RUN=1 SHARD_BY=dataset-clamp-exp cluster/submit_coeus.sh   # print plan, submit nothing
+  cluster/submit_slurm.sh
+DRY_RUN=1 SHARD_BY=dataset-clamp-exp cluster/submit_slurm.sh   # print plan, submit nothing
 ```
 
 **Two sharding granularities:**
@@ -757,8 +950,8 @@ DRY_RUN=1 SHARD_BY=dataset-clamp-exp cluster/submit_coeus.sh   # print plan, sub
   consumes the grid-optimal params — all of §7 per shard, capped at 6 nodes.
 
 See [`cluster/README.md`](cluster/README.md) for every knob, and
-[`cluster/COEUS_RUNBOOK.md`](cluster/COEUS_RUNBOOK.md) for the **step-by-step
-PSU Coeus runbook** (env setup → submit → monitor → **copy results back** →
+[`cluster/SLURM_RUNBOOK.md`](cluster/SLURM_RUNBOOK.md) for the **step-by-step
+SLURM runbook** (env setup → submit → monitor → **copy results back** →
 figures).
 
 ### Copying cluster results back to your machine
@@ -771,20 +964,20 @@ Run these **from your local machine**:
 
 ```bash
 # RECOMMENDED: just the curated paper results (small, single download):
-scp -r jacoboli@login1.coeus.rc.pdx.edu:~/PubSubPrivacy/results_cluster/paper_bundle \
+scp -r <user>@<cluster-login>:~/PubSubPrivacy/results_cluster/paper_bundle \
        ./paper_bundle
 
 # The full merged tree (one CSV per artifact, all datasets — larger):
-scp -r jacoboli@login1.coeus.rc.pdx.edu:~/PubSubPrivacy/results_cluster/combined \
+scp -r <user>@<cluster-login>:~/PubSubPrivacy/results_cluster/combined \
        ./results_cluster_combined
 
 # Everything (combined + paper_bundle + every per-shard dir + joblists + logs):
-scp -r jacoboli@login1.coeus.rc.pdx.edu:~/PubSubPrivacy/results_cluster \
+scp -r <user>@<cluster-login>:~/PubSubPrivacy/results_cluster \
        ./results_cluster
 
 # rsync is better for large/resumable transfers (skips unchanged files):
 rsync -avz --progress \
-  jacoboli@login1.coeus.rc.pdx.edu:~/PubSubPrivacy/results_cluster/paper_bundle/ \
+  <user>@<cluster-login>:~/PubSubPrivacy/results_cluster/paper_bundle/ \
   ./paper_bundle/
 
 # Render figures locally from the full tree if you didn't pass PLOTS=1:
@@ -875,8 +1068,13 @@ python generate_plots.py --output-dir results_test
 ### Experiment E: what it actually tests
 
 Experiment E exercises the broker-side plugin end-to-end against a real
-MQTT broker (default: embedded `amqtt` if nothing is listening on
-`--broker-host:--broker-port`).  Per dataset, per
+MQTT broker. If nothing is listening on `--broker-host:--broker-port`, it
+starts a local **Eclipse Mosquitto** process (the default, `--broker-impl
+mosquitto`; the binary is taken from `$MOSQUITTO_BIN`, then `PATH`, then the
+installer's default location) or, with `--broker-impl amqtt`, the embedded
+pure-Python `amqtt` broker (`pip install amqtt`). An already-running broker is
+always reused as-is. Mosquitto is not a pip package: install it from
+https://mosquitto.org/download/ before running Experiment E or `latency --live`.  Per dataset, per
 `(strategy × epsilon × scenario)` config, it spins up:
 
 * a `PrivacyPlugin` running the full DP pipeline,

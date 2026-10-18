@@ -43,6 +43,16 @@ PAPER_BUNDLE = {
         # gridsearch CSVs; the canonical is the trial-averaged argmin merged
         # from these by _load_grid_config at consume time.
         "grid_trial*.json", "*_gridsearch.csv", "*_gridsearch_best.csv",
+        # Best grid objective reached at each rho (the rho-selection curve).
+        "*_rho_profile.csv",
+    ],
+    # Section 7 experiments on the full-pipeline simulator: utility vs LDP and
+    # w-event DP (epsilon / window / depth), downstream ML, induced wait,
+    # broker latency, and the three-component ablation.
+    "10_section7_experiments": [
+        "experiment_U_*.csv", "experiment_M_ml*.csv",
+        "experiment_K_induced_wait*.csv", "experiment_J_latency*.csv",
+        "experiment_F_ablation_summary.csv", "experiment_F_ablation_by_level.csv",
     ],
     "02_main_sweep": [
         "sweep_results.csv", "sweep_results_aggregate.csv",
@@ -194,6 +204,19 @@ def aggregate(shards_dir: str, out_dir: str, plots: bool,
         n_concat += 1
     print(f"Aggregated CSVs -> {out_dir}  "
           f"({len(by_relpath)} artifacts, {n_concat} concatenated across shards)")
+
+    # The Section 7 experiments are sharded by sensor group (and by epsilon /
+    # window / wait policy), so each shard's aggregate / summary / by-level CSV
+    # covers only its slice.  Rebuild them from the merged per-trial rows.
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if repo not in sys.path:
+        sys.path.insert(0, repo)
+    try:
+        from experiments import _section7 as S7
+        n_rebuilt = S7.rebuild_summaries(out_dir)
+        print(f"Rebuilt {n_rebuilt} Section 7 summary set(s) from merged per-trial rows")
+    except Exception as exc:  # pragma: no cover - keep the merge usable
+        print(f"  WARN: could not rebuild Section 7 summaries: {exc}", file=sys.stderr)
 
     # Also copy non-CSV artifacts (clamp manifests, topic CSVs already covered;
     # PNGs are regenerated below if --plots).

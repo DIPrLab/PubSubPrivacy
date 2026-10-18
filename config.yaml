@@ -36,16 +36,28 @@ scheduling:
   ba_threshold: 0.1
   # Base timestamp interval Delta_t in seconds (Definition 3.1).
   timestamp_interval: 5.0
-  # K_ext: max number of Delta_t extensions when n_tau < P; T_max = K_ext * Delta_t.
+  # K_ext: predictive intervals are capped at T_max = K_ext * Delta_t
+  # (early_stop / reactive at (1 + K_ext) * Delta_t).
   k_ext: 2
+  # Adaptive interval: predictive (paper Sec. 5.1.1: width fixed up front as
+  # clip(P_aim / lambda, Delta_t, T_max) from past noisy counts, one corrective
+  # extension), early_stop (close as soon as P_min is met; Sparse Vector rule),
+  # reactive (whole-Delta_t extension, one count per check) or none.
+  wait_policy: "predictive"
+  # Sub-Delta_t checks per Delta_t for predictive / early_stop.
+  wait_resolution: 4
+  # Cached delta counts on the hierarchy walk (one count share per walk).
+  count_cache: true
+  # rho: share of each timestamp's budget spent on population counts.
+  rho_split: 0.2
 
 # Parameter sweep for the offline experimental evaluation (all real-world).
 experiment:
   duration: 120
   # Publisher-threshold grid (paper calls this P).
   p_values: [1, 2, 4, 6]
-  epsilon_values: [0.5, 1.0, 2.0, 4.0]
-  w_values: [4, 8, 10, 12]
+  epsilon_values: [0.5, 1.0, 2.0, 4.0, 6.0, 8.0]
+  w_values: [4, 8, 12, 16, 20, 24]
   # All strategies exercised by run_experiment.py.
   strategies:
     - "uniform"

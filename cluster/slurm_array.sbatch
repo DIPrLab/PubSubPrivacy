@@ -1,22 +1,22 @@
 #!/bin/bash
 # ============================================================================
-# coeus_array.sbatch -- run the experiment shards as a SLURM JOB ARRAY on PSU
-# Research Computing's Coeus cluster (https://sites.google.com/pdx.edu/research-computing).
+# slurm_array.sbatch -- run the experiment shards as a SLURM JOB ARRAY on an
+# HPC cluster.
 #
-# Coeus uses SLURM and explicitly recommends job arrays for "the same
+# SLURM job arrays are the standard pattern for "the same
 # calculation on different data" -- which is exactly our sharded experiments.
-# GNU parallel is NOT installed on Coeus, so on the cluster we use a job array
+# GNU parallel is often not installed on HPC clusters, so we use a job array
 # instead: each array task runs ONE shard line from the joblist that
 # gen_jobs.sh produced; intra-shard parallelism uses --cpus-per-task cores via
 # run_experiment.py --workers.  (GNU parallel remains the local / SSH option;
 # see run_cluster.sh.)
 #
-# Do not sbatch this directly -- use submit_coeus.sh, which generates the
+# Do not sbatch this directly -- use submit_slurm.sh, which generates the
 # joblist, sizes --array, and chains the aggregation job.  The directives below
-# are overridable on the submit_coeus.sh command line / environment.
+# are overridable on the submit_slurm.sh command line / environment.
 # ============================================================================
 #SBATCH --job-name=pubsubdp
-#SBATCH --partition=medium            # Coeus default partition (7-day limit)
+#SBATCH --partition=medium            # default partition (adjust per cluster)
 #SBATCH --nodes=1                     # one node per shard (shards are independent)
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8             # intra-shard --workers; raise for big sweeps
@@ -27,7 +27,7 @@
 set -euo pipefail
 
 # --- environment ------------------------------------------------------------
-# Coeus uses Linux environment modules.  The stock Python is old
+# The cluster uses Linux environment modules.  The stock Python is old
 # (Python/gcc/3.7.5) but this codebase needs >= 3.10 (PEP 604 'int | None' and
 # 'dict[str, ...]' syntax), so prefer a user venv/conda with a modern Python.
 # Set PUBSUB_ENV_SETUP to whatever activates yours; the default tries a venv at
