@@ -57,7 +57,16 @@ def experiment_D_plugin_path(
                 released = [r for r in log if not r["deferred"] and r["released_value"] is not None]
                 deferred = [r for r in log if r["deferred"]]
                 walkups = [r for r in log if r["walk_up"]]
-                p_violations = sum(1 for r in released if r["n_tau"] < result["plugin_P"])
+                # The gate decides on the DP count, so a fresh release must
+                # carry a gate count >= P_min; anything else is a real gate
+                # bug.  The exact pool can still be below P_min -- the noisy
+                # count let it through -- which is expected under DP and is
+                # reported separately as a measure of count noise.
+                p_violations = sum(1 for r in released
+                                   if r.get("n_gate") is not None
+                                   and r["n_gate"] < result["plugin_P"])
+                below_p_exact = sum(1 for r in released
+                                    if r["n_tau"] < result["plugin_P"])
                 published_t = [m["t_start"] for m in mock.published]
                 monotonic = all(published_t[i+1] >= published_t[i]
                                 for i in range(len(published_t) - 1))
@@ -69,10 +78,17 @@ def experiment_D_plugin_path(
                     cnt = [e["n_active"] for e in tau_log]
                     lo, hi = prepared.spec["static_clamps"][sensor]
                     B = float(hi - lo)
+                    # Same mechanism as the plugin (its strategy, P_min and
+                    # rho): with one leaf and no waiting the plugin draws the
+                    # same Laplace variables in the same order as the offline
+                    # engine, so the releases must match to float precision.
                     offline = core.run_dp_on_stream(
                         agg, cnt, epsilon=epsilon, window_size=w,
                         min_publishers=result["plugin_P"], payload_bound=B,
-                        strategy="uniform", seed=seed_t)
+                        strategy=plugin.strategy.value, seed=seed_t,
+                        rho_split=plugin.rho_split,
+                        center=plugin._center_for(f"{sensor}"),
+                        n_cap=len(per_pub))
                     offline_by_tau = {i: v for i, v in enumerate(offline["noisy_values"])
                                       if v is not None}
                     diffs = [abs(r["released_value"] - offline_by_tau[r["tau"] - 1])
@@ -89,6 +105,7 @@ def experiment_D_plugin_path(
                             "leaf_topic": r["leaf_topic"], "release_scope": r["release_scope"],
                             "true_aggregate": r["true_aggregate"],
                             "released_value": r["released_value"], "n_tau": r["n_tau"],
+                            "n_gate": r.get("n_gate"),
                             "walk_up": r["walk_up"], "deferred": r["deferred"],
                         })
                 summary_rows.append({
@@ -103,6 +120,7 @@ def experiment_D_plugin_path(
                     "t_start_spacing_mean": float(np.mean(spacings)) if spacings else float("nan"),
                     "t_start_spacing_std": float(np.std(spacings)) if spacings else float("nan"),
                     "p_gate_violations": p_violations,
+                    "releases_below_P_exact": below_p_exact,
                     "max_abs_diff_vs_offline": max_diff_offline,
                     "num_published": len(mock.published),
                 })
@@ -119,7 +137,8 @@ def experiment_D_plugin_path(
         core._aggregate_over_trials(
             df_sum, ["dataset", "scenario", "sensor", "clamp_mode", "plugin_P"],
             ["release_rate", "walkup_rate", "num_releases", "num_walkups",
-             "num_deferrals", "p_gate_violations", "max_abs_diff_vs_offline"],
+             "num_deferrals", "p_gate_violations", "releases_below_P_exact",
+             "max_abs_diff_vs_offline"],
         ).to_csv(os.path.join(exp_dir, "experiment_D_plugin_summary_aggregate.csv"),
                  index=False)
     core.logger.info(f"  Experiment D wrote {len(df_rel)} release rows, "

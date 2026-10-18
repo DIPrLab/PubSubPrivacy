@@ -680,15 +680,23 @@ def plot_experiment_F(exp_dir: str, clamp_mode: str):
     if df is None or df.empty or "module_idx" not in df.columns:
         return
     datasets_present = sorted(df["dataset"].unique())
-    scopes = ["leaf", "pooled"]
+    # The full-pipeline ablation labels each subscription leaf / intermediate /
+    # root in ``scope_kind`` (``scope`` is its topic path); older CSVs used
+    # scope = leaf / pooled.
+    scope_col = "scope_kind" if "scope_kind" in df.columns else "scope"
+    scopes = (["leaf", "intermediate", "root"] if scope_col == "scope_kind"
+              else ["leaf", "pooled"])
+    if "epsilon" in df.columns and df["epsilon"].nunique() > 1:
+        df = df[df["epsilon"] == min(df["epsilon"].unique(), key=lambda e: abs(e - 1.0))]
 
     def _one(ax, sub, metric, ylabel):
         for scope in scopes:
-            s = sub[sub["scope"] == scope].sort_values("module_idx")
+            s = (sub[sub[scope_col] == scope].groupby("module_idx")[metric]
+                 .mean().reset_index())
             if s.empty:
                 continue
             ax.plot(s["module_idx"], s[metric], "o-", label=scope, alpha=0.85)
-        ax.set(xlabel="module (1=P-gate, 2=+rewrite, 3=+walk-up)",
+        ax.set(xlabel="module (1=P-gate, 2=+adaptive interval, 3=+walk-up)",
                ylabel=ylabel, title=ylabel)
         ax.set_xticks([1, 2, 3])
         ax.grid(True, alpha=0.3)
@@ -707,7 +715,7 @@ def plot_experiment_F(exp_dir: str, clamp_mode: str):
     # Aggregate: release-rate gain of each module, averaged across datasets.
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
     for scope in scopes:
-        s = (df[df["scope"] == scope]
+        s = (df[df[scope_col] == scope]
              .groupby("module_idx")[["release_rate", "normalized_mae"]]
              .mean().reset_index())
         if s.empty:

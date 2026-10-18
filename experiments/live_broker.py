@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Experiment E: live MQTT broker end-to-end (paper Sec. 7, live throughput /
-latency).  Spins up an embedded broker, runs real paho publishers/subscribers
-through the PrivacyPlugin, and measures live behaviour.  Kept out of the offline
+latency).  Runs real paho publishers/subscribers through the PrivacyPlugin
+against a live broker and measures live behaviour.  When no broker is listening
+it starts a local Mosquitto (the default, ``--broker-impl mosquitto``) or the
+embedded pure-Python amqtt (``--broker-impl amqtt``).  Kept out of the offline
 engine because it needs a running broker; invoked only by the CLI.
 
 Imports the offline engine for the shared DP runner + dataset prep.
@@ -125,6 +127,114 @@ class _EmbeddedBroker:
         logger.info("[exp E] embedded broker stopped")
 
 
+BROKER_IMPLS = ("mosquitto", "amqtt")
+
+# Where Mosquitto's installers put the binary when it is not on PATH.
+_MOSQUITTO_CANDIDATES = (
+    r"C:\Program Files\mosquitto\mosquitto.exe",
+    r"C:\Program Files (x86)\mosquitto\mosquitto.exe",
+    "/usr/sbin/mosquitto",
+    "/usr/local/sbin/mosquitto",
+    "/opt/homebrew/sbin/mosquitto",
+)
+
+
+def _find_mosquitto() -> str | None:
+    """The Mosquitto binary: $MOSQUITTO_BIN, then PATH, then install defaults."""
+    import shutil
+    exe = os.environ.get("MOSQUITTO_BIN") or shutil.which("mosquitto")
+    if exe:
+        return exe
+    return next((c for c in _MOSQUITTO_CANDIDATES if os.path.isfile(c)), None)
+
+
+class _MosquittoBroker:
+    """Local Eclipse Mosquitto broker run as a subprocess (the default).
+
+    Used when no broker is already listening on the requested (host, port).
+    Writes a minimal config (one anonymous listener, no persistence) to a temp
+    directory, starts ``mosquitto -c`` on it, and waits until the port accepts
+    connections; ``stop()`` terminates the process and removes the directory.
+    """
+
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        self.version = "unknown"
+        self._proc = None
+        self._dir: str | None = None
+        self._log = None
+
+    def start(self, timeout: float = 10.0) -> None:
+        import subprocess
+        import tempfile
+        exe = _find_mosquitto()
+        if exe is None:
+            raise RuntimeError(
+                "Mosquitto is not installed (or not on PATH); install it "
+                "(https://mosquitto.org/download/), point $MOSQUITTO_BIN at the "
+                "binary, start a broker yourself, or pass --broker-impl amqtt "
+                "for the embedded pure-Python broker."
+            )
+        try:
+            out = subprocess.run([exe, "-h"], capture_output=True, text=True,
+                                 timeout=5)
+            for line in (out.stdout + out.stderr).splitlines():
+                if line.startswith("mosquitto version"):
+                    self.version = line.split("version", 1)[1].strip()
+                    break
+        except Exception:
+            pass
+        self._dir = tempfile.mkdtemp(prefix="pubsubpriv-mosquitto-")
+        conf = os.path.join(self._dir, "mosquitto.conf")
+        with open(conf, "w", encoding="utf-8") as fh:
+            fh.write(f"listener {self.port} {self.host}\n"
+                     "allow_anonymous true\n"
+                     "persistence false\n")
+        self._log = open(os.path.join(self._dir, "mosquitto.log"), "w+",
+                         encoding="utf-8")
+        self._proc = subprocess.Popen([exe, "-c", conf], stdout=self._log,
+                                      stderr=subprocess.STDOUT)
+        # A child process outlives the interpreter; stop it even if the
+        # caller never reaches its finally-block stop().
+        import atexit
+        atexit.register(self.stop)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._proc.poll() is not None:
+                self._log.seek(0)
+                log = self._log.read().strip()
+                self.stop()
+                raise RuntimeError(f"Mosquitto exited on start-up: {log}")
+            if _broker_is_listening(self.host, self.port, timeout=0.25):
+                logger.info(f"[live] Mosquitto {self.version} listening at "
+                            f"{self.host}:{self.port}")
+                return
+            time.sleep(0.1)
+        self.stop()
+        raise RuntimeError(f"Mosquitto did not start within {timeout}s")
+
+    def stop(self, timeout: float = 5.0) -> None:
+        import shutil
+        import subprocess
+        if self._proc is not None:
+            if self._proc.poll() is None:
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+                    self._proc.wait(timeout=timeout)
+            self._proc = None
+            logger.info("[live] Mosquitto stopped")
+        if self._log is not None:
+            self._log.close()
+            self._log = None
+        if self._dir is not None:
+            shutil.rmtree(self._dir, ignore_errors=True)
+            self._dir = None
+
+
 def _broker_is_listening(host: str, port: int, timeout: float = 0.75) -> bool:
     import socket
     s = socket.socket()
@@ -141,26 +251,31 @@ def _broker_is_listening(host: str, port: int, timeout: float = 0.75) -> bool:
             pass
 
 
-def _ensure_broker(host: str, port: int, auto_start: bool) -> "_EmbeddedBroker | None":
-    """If a broker is already listening, return None.  Otherwise, start an
-    embedded amqtt broker on (host, port) and return a handle whose ``stop()``
+def _ensure_broker(host: str, port: int, auto_start: bool,
+                   impl: str = "mosquitto"):
+    """If a broker is already listening, return None.  Otherwise, start one on
+    (host, port) -- a local Mosquitto process by default, or the embedded
+    amqtt broker with ``impl="amqtt"`` -- and return a handle whose ``stop()``
     tears it down when the experiment finishes.  Raises if ``auto_start`` is
     false and no external broker is found.
     """
+    if impl not in BROKER_IMPLS:
+        raise ValueError(f"unknown broker implementation {impl!r}; "
+                         f"expected one of {BROKER_IMPLS}")
     if _broker_is_listening(host, port):
-        logger.info(f"[exp E] using existing broker at {host}:{port}")
+        logger.info(f"[live] using the broker already listening at {host}:{port} "
+                    f"(not started by this run; --broker-impl does not apply)")
         return None
     if not auto_start:
         raise RuntimeError(
             f"No MQTT broker listening at {host}:{port} and --no-auto-broker "
             f"was specified.  Start mosquitto (or similar) first."
         )
-    logger.info(
-        f"[exp E] no broker at {host}:{port}; starting embedded amqtt broker"
-    )
-    eb = _EmbeddedBroker(host, port)
-    eb.start()
-    return eb
+    logger.info(f"[live] no broker at {host}:{port}; starting {impl}")
+    broker = _MosquittoBroker(host, port) if impl == "mosquitto" \
+        else _EmbeddedBroker(host, port)
+    broker.start()
+    return broker
 
 
 class _LiveSubscriber:
@@ -268,6 +383,7 @@ def _drive_live_config(
     drain_ticks: int = 3,
     scenario: str = "pooled",
     n_subscribers: int = 1,
+    plugin_kwargs: dict | None = None,
 ) -> dict:
     """Run one (strategy, epsilon, w, P, scenario) config end-to-end
     through a live broker.
@@ -298,6 +414,8 @@ def _drive_live_config(
 
     Returns the plugin's release log, every subscriber's received releases
     (aggregated), per-subscriber counts, tau-truth log, and timing metadata.
+    ``plugin_kwargs`` overrides PrivacyPlugin options (e.g. k_ext,
+    wait_policy, count_cache, rho_split).
     """
     import uuid as _uuid
 
@@ -325,7 +443,7 @@ def _drive_live_config(
     else:
         raise ValueError(f"unknown scenario: {scenario}")
 
-    plugin = PrivacyPlugin(
+    plugin_opts = dict(
         broker_host=broker_host,
         broker_port=broker_port,
         raw_prefix=raw_prefix,
@@ -339,6 +457,8 @@ def _drive_live_config(
         sensor_bounds={sensor: (lo, hi)},
         client_id=f"plugin-{run_id}",
     )
+    plugin_opts.update(plugin_kwargs or {})
+    plugin = PrivacyPlugin(**plugin_opts)
     n_subscribers = max(1, int(n_subscribers))
     subscribers = [
         _LiveSubscriber(broker_host, broker_port, protected_prefix,
@@ -439,6 +559,7 @@ def experiment_E_live_broker(
     n_steps: int = 120,
     seed: int = 123,
     auto_start_broker: bool = True,
+    broker_impl: str = "mosquitto",
 ) -> pd.DataFrame:
     """Exp E: small sanity grid through a live MQTT broker.
 
@@ -447,8 +568,9 @@ def experiment_E_live_broker(
     'energy' (~36k windows per sensor -> hours of broker traffic).
 
     If no broker is listening at (broker_host, broker_port) and
-    ``auto_start_broker`` is True, spins up an embedded amqtt broker on the
-    same (host, port) for the duration of the experiment.
+    ``auto_start_broker`` is True, starts ``broker_impl`` (a local Mosquitto
+    by default, or the embedded amqtt) on the same (host, port) for the
+    duration of the experiment.
     """
     if dataset_name == "energy":
         logger.warning(
@@ -457,7 +579,8 @@ def experiment_E_live_broker(
             "windows) or 'manufacturing' (1000)."
         )
 
-    embedded_broker = _ensure_broker(broker_host, broker_port, auto_start_broker)
+    embedded_broker = _ensure_broker(broker_host, broker_port, auto_start_broker,
+                                     impl=broker_impl)
     try:
         return _experiment_E_run(
             dataset_name, output_dir, args,
@@ -606,12 +729,17 @@ def _experiment_E_run(
 
                 walkup_count = sum(1 for r in log if r.get("walk_up"))
                 walkup_rate = walkup_count / max(1, len(log))
-                # P-gate violation: a released (non-deferred) record with
-                # n_tau < plugin_P indicates the gate is broken.
+                # P-gate violation: a fresh release whose DP gate count is
+                # below plugin_P means the gate is broken.  (The exact pool
+                # n_tau may be below P_min when the noisy count let it
+                # through -- expected under DP, counted separately.)
+                plugin_P = int(out.get("plugin_P", P))
                 p_gate_violations = sum(
                     1 for r in released
-                    if int(r["n_tau"]) < int(out.get("plugin_P", P))
+                    if r.get("n_gate") is not None and int(r["n_gate"]) < plugin_P
                 )
+                releases_below_P_exact = sum(
+                    1 for r in released if int(r["n_tau"]) < plugin_P)
 
                 # Per-release message log.  Canonical rows from the live
                 # plugin path, augmented with broker-delivery and walk-up
@@ -709,6 +837,7 @@ def _experiment_E_run(
                     "num_walkups": walkup_count,
                     "walkup_rate": walkup_rate,
                     "p_gate_violations": p_gate_violations,
+                    "releases_below_P_exact": releases_below_P_exact,
                     "release_rate_live": len(released) / max(1, len(log)),
                     "release_rate_offline": off_m.get("release_rate",
                                                       float("nan")),

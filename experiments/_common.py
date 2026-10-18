@@ -41,7 +41,7 @@ def make_parser(description: str) -> argparse.ArgumentParser:
     p.add_argument("--dataset", choices=list(core.DATASETS.keys()) + ["all"],
                    default="all", help="Dataset key, or 'all'.")
     p.add_argument("--clamp-mode", choices=CLAMP_MODES + ["both"], default="static",
-                   help="Definition 5.4 clamp: static (Option A) / dp_released "
+                   help="Clamp mode: static (the paper's, Sec. 6.1) / dp_released (legacy) "
                         "(Option B) / both.  Default static.")
     p.add_argument("--output-dir", default="results")
     p.add_argument("--workers", type=int, default=0,
@@ -62,10 +62,10 @@ def make_parser(description: str) -> argparse.ArgumentParser:
                         "count (exact |P_tau| / Kellaris baselines).  Default 0.2 "
                         "(the definition's sqrt(R)/(5 sqrt(R)); min error).")
     p.add_argument("--max-publishers", type=int, default=None,
-                   help="P_max sensitivity-binding cap (Sec. 6.5).")
+                   help="P_max sensitivity-binding cap (implementation knob, not in the paper).")
     p.add_argument("--ablation-P", type=int, default=3,
                    help="P_min for the ablation/overhead/average-case experiments.")
-    p.add_argument("--k-ext", type=int, default=3, help="K_ext (Sec. 6.7).")
+    p.add_argument("--k-ext", type=int, default=3, help="K_ext (Sec. 4.1).")
     p.add_argument("--eps-clip", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--alpha", type=float, default=0.25)
@@ -78,14 +78,14 @@ def make_parser(description: str) -> argparse.ArgumentParser:
     p.add_argument("--strategies", nargs="+", default=None)
     p.add_argument("--use-grid-config", default=None,
                    help="grid_canonical.json to source MAE-optimal params from "
-                        "(Sec. 7.5).  Defaults to <output-dir>/grid_canonical.json.")
+                        "(Sec. 6.1).  Defaults to <output-dir>/grid_canonical.json.")
     p.add_argument("--grid-eps", type=float, default=None,
-                   help="Restrict the §7.5 grid search to this single epsilon and "
+                   help="Restrict the §6.1 grid search to this single epsilon and "
                         "write a grid_canonical_eps<eps>.json fragment, so the "
                         "grid phase can be split across nodes per epsilon "
                         "(experiments.grid_search only).")
     p.add_argument("--grid-rho", type=float, default=None,
-                   help="Restrict the §7.5 grid search to this single rho_tau "
+                   help="Restrict the §6.1 grid search to this single rho_tau "
                         "candidate, so the rho sweep can be split across nodes "
                         "(one shard per rho).  Used with --grid-trial: each shard "
                         "writes a full-grid fragment and _merge_grid_trial_fragments "
@@ -97,12 +97,48 @@ def make_parser(description: str) -> argparse.ArgumentParser:
                         "per-level sweep can run one task per sensor-group on "
                         "separate nodes (shortens the energy sweep long pole).")
     p.add_argument("--grid-trial", type=int, default=None,
-                   help="Run ONE trial (noise seed) of the §7.5 grid and write a "
+                   help="Run ONE trial (noise seed) of the §6.1 grid and write a "
                         "per-trial full-grid fragment, so the grid's --trials "
                         "repetitions can be split across nodes as separate tasks. "
                         "_load_grid_config averages MAE across the trial fragments "
                         "before picking each strategy's optimum "
                         "(experiments.grid_search only).")
+    p.add_argument("--eps-values", type=float, nargs="+", default=None,
+                   help="Privacy budgets for the epsilon sweeps and the grid "
+                        "(default: the paper grid 0.5 1 2 4 6 8).")
+    p.add_argument("--w-values", type=int, nargs="+", default=None,
+                   help="Window lengths for the window sweep "
+                        "(default: 4 8 12 16 20 24).")
+    p.add_argument("--fixed-epsilon", type=float, default=1.0,
+                   help="Epsilon held fixed while w is swept (window sweep, "
+                        "ablation, induced wait, latency).")
+    p.add_argument("--fixed-w", type=int, default=8,
+                   help="Window length held fixed while epsilon is swept.")
+    p.add_argument("--our-strategy", default="n_weighted",
+                   help="Budget strategy used for PAWS ('ours') in the "
+                        "Section 6 experiments (e.g. n_weighted).")
+    p.add_argument("--wait-policy",
+                   choices=["predictive", "early_stop", "reactive", "none"],
+                   default="predictive",
+                   help="Adaptive interval: predictive sizing from past noisy "
+                        "counts (paper Sec. 4.1, default), stop as soon as "
+                        "P_min is met (early_stop, Sparse Vector rule), "
+                        "whole-Delta_t extension (reactive), or never wait.")
+    p.add_argument("--no-count-cache", dest="count_cache", action="store_false",
+                   default=True,
+                   help="Re-count the whole ancestor pool at every level of "
+                        "the hierarchy walk instead of caching delta counts.")
+    p.add_argument("--live", action="store_true",
+                   help="Latency experiment: also measure end-to-end delivery "
+                        "through a real MQTT broker (a local Mosquitto is "
+                        "started if none is listening; see --broker-impl).")
+    p.add_argument("--broker-host", default="localhost")
+    p.add_argument("--broker-port", type=int, default=1883)
+    p.add_argument("--broker-impl", choices=["mosquitto", "amqtt"],
+                   default="mosquitto",
+                   help="Broker to start when none is listening: a local "
+                        "Eclipse Mosquitto process (default) or the embedded "
+                        "pure-Python amqtt.")
     p.add_argument("--quick", action="store_true", help="Reduced grids.")
     p.add_argument("--no-log-messages", dest="log_messages", action="store_false",
                    default=True, help="Skip the per-release messages CSV.")
@@ -129,14 +165,15 @@ def resolve(args) -> argparse.Namespace:
                          else [args.clamp_mode])
     # Strategies + parameter grids (mirror run_experiment.main defaults).
     args.strategies = args.strategies or core.ALL_STRATEGIES
+    from experiments.pipeline import PAPER_EPS_VALUES, PAPER_W_VALUES
     if args.quick:
         args.s_values = [1, 2, 4]
-        args.eps_values = [0.5, 1.0, 2.0]
-        args.w_values = [6, 10]
+        eps_default, w_default = [1.0, 4.0], [4, 12]
     else:
         args.s_values = [1, 2, 4, 6]
-        args.eps_values = [0.5, 1.0, 2.0, 4.0]
-        args.w_values = [4, 8, 10, 12]
+        eps_default, w_default = list(PAPER_EPS_VALUES), list(PAPER_W_VALUES)
+    args.eps_values = list(args.eps_values) if args.eps_values else eps_default
+    args.w_values = list(args.w_values) if args.w_values else w_default
     # Optional round-robin sensor shard 'i/k' -> args._sensor_shard = (i, k).
     args._sensor_shard = None
     if getattr(args, "sensor_shard", None):
@@ -146,9 +183,22 @@ def resolve(args) -> argparse.Namespace:
                 args._sensor_shard = (i, k)
         except Exception:
             raise SystemExit(f"--sensor-shard must be 'i/k' (got {args.sensor_shard!r})")
-    # Canonical grid config (Sec. 7.5): explicit path, else auto-detect.
+    # Canonical grid config (Sec. 6.1): explicit path, else auto-detect.
     path = args.use_grid_config or core._grid_canonical_path(args.output_dir)
     args.grid_config = core._load_grid_config(path)
+    if args.use_grid_config:
+        # An explicit grid config that is missing (or lacks a dataset) must not
+        # silently fall back to the CLI defaults: every result would then be at
+        # the wrong P_min / rho / Delta_t while looking like a normal run.
+        have = {(k[0], k[1]) for k in (args.grid_config or {})}
+        missing = [f"{ds}/{cm}" for ds in args._targets for cm in args._clamp_modes
+                   if (ds, cm) not in have]
+        if missing:
+            raise SystemExit(
+                f"--use-grid-config {args.use_grid_config!r}: no grid optima for "
+                f"{', '.join(missing)} (no grid_trial*.json / grid_canonical*.json "
+                f"found in {os.path.dirname(path) or '.'!r}).  Copy or run the "
+                f"grid first instead of falling back to defaults.")
     os.makedirs(args.output_dir, exist_ok=True)
     logger.info(f"workers={args.workers}  datasets={args._targets}  "
                 f"clamp={args._clamp_modes}  trials={args.trials}")

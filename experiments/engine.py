@@ -40,6 +40,7 @@ from dp_engine import (
     compute_utility_metrics,
     compute_windowed_kl_divergence,
     is_p_gated,
+    release_utility,
 )
 from data_streams import (
     DATASETS,
@@ -108,6 +109,8 @@ def run_dp_on_stream(
     rho_split: float | None = None,
     max_publishers: int | None = None,
     sums: list[float] | None = None,
+    center: float | None = None,
+    n_cap: int | None = None,
 ) -> dict:
     """Run the DP engine on a pre-aggregated stream (offline evaluation).
 
@@ -136,6 +139,7 @@ def run_dp_on_stream(
         max_publishers=(int(max_publishers)
                         if max_publishers and max_publishers == max_publishers
                         else None),
+        center=center,
     )
     stream = StreamState(config=config)
     # The noisy-sum component S~_tau is built from the ACTUAL pooled sum
@@ -146,12 +150,23 @@ def run_dp_on_stream(
     if sums is None:
         sums = [a * n for a, n in zip(aggregates, pub_counts)]
     for agg, n, s in zip(aggregates, pub_counts, sums):
-        stream.release(agg, n, true_sum=s)
+        stream.release(agg, n, true_sum=s, n_cap=n_cap)
 
-    metrics = compute_utility_metrics(stream.true_values, stream.noisy_values)
+    # A timestamp with no active publisher has no true aggregate (its 0.0 is a
+    # placeholder), so it does not enter the error.  Deferred timestamps repeat
+    # the previous release and are scored as delivered; coverage and the
+    # coverage-penalized NMAE report timestamps that received nothing.
+    scored_true = [a if n and n > 0 else None
+                   for a, n in zip(stream.true_values, pub_counts)]
+    metrics = compute_utility_metrics(scored_true, stream.noisy_values)
     metrics["normalized_mae"] = (
         metrics["mae"] / payload_bound if payload_bound > 0 else float("nan")
     )
+    ru = release_utility(scored_true, stream.noisy_values, payload_bound)
+    metrics["coverage"] = ru["coverage"]
+    metrics["nmae_penalized"] = ru["nmae_penalized"]
+    metrics["skill"] = ru["skill"]
+    metrics["corr"] = ru["corr"]
 
     # KL on only the timestamps where budget was actually spent.
     true_kl = [t for t, b in zip(stream.true_values, stream.budgets_spent)
@@ -395,6 +410,7 @@ _TRIAL_METRIC_COLS = [
     "normalized_mae", "mae", "rmse", "relative_error",
     "kl_divergence", "kl_global_utility", "release_rate",
     "attribution_advantage", "avg_n_tau", "eps_count_spent",
+    "coverage", "nmae_penalized", "skill", "corr",
 ]
 
 
@@ -689,15 +705,15 @@ def _rebuild_stream_with_dt(
     T = len(next(iter(per_pub.values())))
     agg, cnt = [], []
     for start in range(0, T, dt_multiplier):
-        block_vals = []
-        contrib_pubs = set()
+        # Each publisher contributes its LATEST reading in the block.
+        latest: dict = {}
         for tau in range(start, min(start + dt_multiplier, T)):
             for p, series in per_pub.items():
                 v = series[tau]
                 if v is not None:
-                    block_vals.append(v)
-                    contrib_pubs.add(p)
-        agg.append(float(np.mean(block_vals)) if block_vals else 0.0)
+                    latest[p] = v
+        contrib_pubs = set(latest)
+        agg.append(float(np.mean(list(latest.values()))) if latest else 0.0)
         # Multiplicity is the number of distinct publishers that contributed
         # any message during the block, matching P_tau in the paper.
         cnt.append(len(contrib_pubs))
@@ -1472,9 +1488,18 @@ def _drive_plugin_scenario(
     epsilon_count: float = 0.0,
     max_publishers: int | None = None,
     force_P: int | None = None,
+    wait_policy: str = "predictive",
+    count_cache: bool = True,
+    rho_split: float | None = None,
+    min_publishers: int | None = None,
 ):
     """Feed a per-publisher trace into a PrivacyPlugin; return the plugin, the
     mock client, and the per-tau true-aggregate log for post-hoc comparison.
+
+    The fake clock advances one Delta_t per flush, so an adaptive interval is
+    checked once per Delta_t here (the live broker checks every
+    Delta_t / wait_resolution).  ``min_publishers`` overrides the scenario's
+    default P_min.
     """
     import plugin as _plug  # local for monkey-patching
 
@@ -1497,6 +1522,8 @@ def _drive_plugin_scenario(
 
     if force_P is not None:
         plugin_P = int(force_P)
+    if min_publishers is not None:
+        plugin_P = int(min_publishers)
 
     # p_gated_uniform so the plugin's gate + Algorithm 1 walk logic actually
     # fires in the hierarchy scenario.  For pooled (plugin_P=1) the gate is a
@@ -1512,13 +1539,20 @@ def _drive_plugin_scenario(
         timestamp_interval=delta_t,
         k_ext=k_ext,
         epsilon_count=epsilon_count,
-        rho_split=resolve_rho_split(),
+        rho_split=resolve_rho_split(rho_split),
         max_publishers=max_publishers,
         enable_hierarchy_walk=enable_hierarchy_walk,
         sensor_bounds={sensor: (lo, hi)},
+        wait_policy=wait_policy,
+        wait_resolution=1,
+        count_cache=count_cache,
     )
     mock = _MockMQTTClient()
     plugin._client = mock
+    # Declare the deployment up front: every publisher registered on its topic
+    # (the public structure that caps the released mean's denominator).
+    for pub_id in per_pub:
+        plugin._registry[_leaf_of(pub_id)].add(str(pub_id))
 
     # Deterministic clock.
     clock = [0.0]
@@ -1621,8 +1655,8 @@ def _adaptive_interval_rebuild(
     restricts the pooled publisher set (used for the leaf/group scopes); None
     pools all.
 
-    Aggregation is ONE value per publisher (x_{p,tau} = the mean of publisher
-    p's readings inside the window), matching the DP model where the pool P_tau
+    Aggregation is ONE value per publisher (x_{p,tau} = publisher p's LATEST
+    reading inside the window), matching the DP model where the pool P_tau
     contributes one clamped value per publisher.  This keeps the emitted
     (mean, count) mutually consistent -- mean == (sum_p x_{p,tau}) / |P_tau| --
     so the pooled sum the DP engine privatizes is exactly mean * count (it is
@@ -1636,7 +1670,7 @@ def _adaptive_interval_rebuild(
     agg, cnt = [], []
     tau = 0
     while tau < T:
-        pub_readings: dict[str, list[float]] = {}
+        pub_readings: dict[str, float] = {}
         end = tau
         ext = 0
         while True:
@@ -1645,13 +1679,14 @@ def _adaptive_interval_rebuild(
                 for p in pubs:
                     v = per_pub[p][slot]
                     if v is not None:
-                        pub_readings.setdefault(p, []).append(v)
+                        pub_readings[p] = v      # latest reading wins
             end = block_end
             if len(pub_readings) >= P or ext >= k_ext or end >= T:
                 break
             ext += 1
-        # One value per active publisher, then the pooled per-publisher mean.
-        pub_values = [float(np.mean(vs)) for vs in pub_readings.values()]
+        # One value per active publisher (its latest reading), then the
+        # pooled per-publisher mean.
+        pub_values = [float(v) for v in pub_readings.values()]
         agg.append(float(np.mean(pub_values)) if pub_values else 0.0)
         cnt.append(len(pub_values))
         tau = end
@@ -1705,6 +1740,8 @@ def _write_grid_canonical(output_dir: str, best_records: list[dict],
             "rho_split": (float(r["rho_split"]) if r.get("rho_split") is not None
                           else None),
             "mae": float(r.get("mae")) if r.get("mae") is not None else None,
+            "objective": (float(r["objective"]) if r.get("objective") is not None
+                          else None),
         })
     with open(path, "w") as fh:
         json.dump(payload, fh, indent=2)
@@ -1712,14 +1749,24 @@ def _write_grid_canonical(output_dir: str, best_records: list[dict],
     return path
 
 
-def _merge_grid_trial_fragments(frag_paths: list[str]) -> dict | None:
-    """Average MAE across per-trial full-grid fragments and pick each
-    (dataset, clamp, strategy, epsilon)'s argmin config.
+def _grid_score(r: dict):
+    """The grid's selection score: the coverage-penalized NMAE objective, or
+    MAE for fragments written before the objective existed."""
+    v = r.get("objective")
+    if v is None or not np.isfinite(v):
+        v = r.get("mae")
+    return v
 
-    Each fragment (one per (epsilon, trial) grid shard) holds every scored
-    config with its single-trial MAE; we group by the full config key, average
-    MAE over the trials, then select the minimum-mean-MAE config per strategy.
-    Returns the same lookup shape as ``_load_grid_config`` so it is a drop-in.
+
+def _merge_grid_trial_fragments(frag_paths: list[str]) -> dict | None:
+    """Average the grid score across per-trial full-grid fragments and pick
+    each (dataset, clamp, strategy, epsilon)'s argmin config.
+
+    Each fragment (one per (epsilon, trial, rho) grid shard) holds every scored
+    config with its single-trial score (``_grid_score``); we group by the full
+    config key, average over the trials, then select the minimum-mean config per
+    strategy.  Returns the same lookup shape as ``_load_grid_config`` so it is a
+    drop-in.
     """
     from collections import defaultdict
     # (dataset, clamp, strategy, eps, P_min, P_max, dt, k_ext) -> [mae, ...]
@@ -1735,7 +1782,7 @@ def _merge_grid_trial_fragments(frag_paths: list[str]) -> dict | None:
             continue
         n += 1
         for r in records:
-            mae = r.get("mae")
+            mae = _grid_score(r)
             if mae is None or not np.isfinite(mae):
                 continue
             pmax = r.get("P_max")
@@ -1759,12 +1806,12 @@ def _merge_grid_trial_fragments(frag_paths: list[str]) -> dict | None:
         sel = (ds, clamp, strat, eps)
         if sel not in best or mean_mae < best[sel][0]:
             r = dict(meta[key])
-            r["mae"] = mean_mae
+            r["objective"] = mean_mae
             r["n_trials"] = len(maes)
             best[sel] = (mean_mae, r)
     cfg = {sel: rec for sel, (_m, rec) in best.items()}
     logger.info(f"merged {n} grid trial fragment(s) -> {len(cfg)} canonical "
-                f"entries (MAE averaged over trials)")
+                f"entries (grid score averaged over trials)")
     return cfg
 
 
@@ -2102,6 +2149,7 @@ def run_single_axis_experiments(
                 k_ext=getattr(args, "k_ext", 3),
                 epsilon_count=getattr(args, "epsilon_count", 0.0),
                 grid_config=grid_config, trials=trials,
+                eps_values=getattr(args, "eps_values", None),
             )
         if "G" in which:
             overhead_experiment(
@@ -2119,6 +2167,30 @@ def run_single_axis_experiments(
                 epsilon_count=getattr(args, "epsilon_count", 0.5),
                 grid_config=grid_config, trials=trials,
             )
+        # Section 7 experiments on the full-pipeline simulator.
+        cross = os.path.join(output_dir, "cross_dataset", clamp_mode)
+        if "U" in which:
+            from experiments.utility import utility_experiment
+            for sweep in ("epsilon", "window"):
+                utility_experiment(datasets, clamp_mode, cross, args,
+                                   sweep=sweep, trials=trials)
+        if "M" in which:
+            from experiments.ml_utility import ml_experiment
+            ml_experiment(datasets, clamp_mode, cross, args, trials=trials)
+        if "K" in which:
+            from experiments.induced_wait import induced_wait_experiment
+            induced_wait_experiment(
+                datasets, clamp_mode, cross, args, trials=trials,
+                k_ext_values=(1, 2) if getattr(args, "quick", False) else (1, 2, 4, 8))
+        if "J" in which:
+            from experiments.latency import inprocess_latency
+            exp_dir = os.path.join(cross, "experiments", "J_latency")
+            os.makedirs(exp_dir, exist_ok=True)
+            inprocess_latency(datasets, clamp_mode, args, trials=trials,
+                              n_steps=80 if getattr(args, "quick", False) else 300
+                              ).to_csv(os.path.join(
+                                  exp_dir, "experiment_J_latency_inprocess.csv"),
+                                  index=False)
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -2153,24 +2225,23 @@ def _run_grid_search_block(args, targets, clamp_modes, eps_values, strategies,
     p_max_grid = [None, 4, 8, 16]
     dt_grid = [1, 2, 4]
     k_ext_grid = [0, 2, 4]
-    # rho_tau candidates for the aggregate stream element (Definition: Aggregate
-    # Stream Element).  6 values anchored at the definition's error-equalizing
-    # sqrt(R)/(5 sqrt(R)) = 0.2, plus a smaller 0.1 (more budget to the sum) and
-    # a span toward sum-starving values: small rho starves the count (noisy
-    # gate), large rho starves the sum (noisy magnitude), so the MAE optimum is
-    # interior.  The selected best rho is written into grid_canonical.json and
-    # consumed by downstream experiments.
-    rho_grid = [0.1, 0.2, 0.4, 0.5, 0.6, 0.8]
-    # --quick is meant to validate the whole path fast; the full §7.5 grid is
-    # 5x4x3x3x6 = 1080 combos x strategies x eps (thousands of DP passes per
-    # dataset) and is the slowest shard.  Shrink it under --quick so the smoke
-    # test stays ~1 min; the FULL run still uses the complete grid.
+    # rho_tau candidates: the share of each timestamp's budget spent on
+    # population counting (the release count, and the early-stop rule's share
+    # when the interval may wait).  Small rho starves the counts (the gate,
+    # stopping rule and walk act on noise), large rho starves the sum, so the
+    # optimum is interior.  Values with 2*rho >= 1 are skipped for cells that
+    # run the early-stop rule (two shares per timestamp).  The selected rho is
+    # written into grid_canonical.json for every downstream experiment, and the
+    # per-rho optimum is written as the rho profile.
+    rho_grid = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8]
+    # --quick is meant to validate the whole path fast; shrink the grid so the
+    # smoke test stays short.  The FULL run uses the complete grid.
     if getattr(args, "quick", False):
         p_min_grid = [1, 3, 6]
         p_max_grid = [None, 8]
         dt_grid = [1, 2]
         k_ext_grid = [0, 2]
-        rho_grid = [0.1, 0.2, 0.5]
+        rho_grid = [0.1, 0.3]
     # Per-rho cluster shard (--grid-rho): restrict this task to one rho candidate
     # so the rho sweep fans out one SLURM task per rho; the full-grid fragments
     # are min-merged across rho downstream (see grid_search.main).
@@ -2208,7 +2279,8 @@ def _run_grid_search_block(args, targets, clamp_modes, eps_values, strategies,
                     epsilon=eps, w=8, strategies=strategies,
                     p_min_grid=p_min_grid, p_max_grid=p_max_grid,
                     dt_grid=dt_grid, k_ext_grid=k_ext_grid, rho_grid=rho_grid,
-                    seed=seed, workers=args.workers,
+                    seed=seed, workers=args.workers, sensor=first_sensor,
+                    wait_policy=getattr(args, "wait_policy", "predictive"),
                 )
                 if full_fragment is not None:
                     # Per-trial mode: keep EVERY scored config (averaged + argmin

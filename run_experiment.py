@@ -140,11 +140,40 @@ def main():
                         help="Run the Section 7.5 grid search FIRST, write the "
                              "canonical config, and have this same run consume "
                              "it for every downstream experiment.")
+    parser.add_argument("--eps-values", type=float, nargs="+", default=None,
+                        help="Privacy budgets for the sweeps, the grid and "
+                             "Experiments U/M (default: 0.5 1 2 4 6 8).")
+    parser.add_argument("--w-values", type=int, nargs="+", default=None,
+                        help="Window lengths for the sweeps and Experiment U's "
+                             "window sweep (default: 4 8 12 16 20 24).")
+    parser.add_argument("--fixed-epsilon", type=float, default=1.0,
+                        help="Epsilon held fixed when w is swept (U) and for "
+                             "Experiments K/J.")
+    parser.add_argument("--fixed-w", type=int, default=8,
+                        help="Window held fixed when epsilon is swept (U/M).")
+    parser.add_argument("--our-strategy", default="n_weighted",
+                        help="Budget strategy used for PAWS in Experiments "
+                             "U/M/K/J/F.")
+    parser.add_argument("--wait-policy",
+                        choices=["predictive", "early_stop", "reactive", "none"],
+                        default="predictive",
+                        help="Adaptive interval: predictive sizing from past "
+                             "noisy counts (paper Sec. 5.1.1, default), stop "
+                             "once P_min is met (early_stop), whole-Delta_t "
+                             "extension (reactive), or never wait.")
+    parser.add_argument("--no-count-cache", dest="count_cache",
+                        action="store_false", default=True,
+                        help="Re-count every level of the hierarchy walk "
+                             "instead of caching delta counts.")
+    parser.add_argument("--ml-lags", type=int, default=4,
+                        help="Experiment M: lagged values used as features.")
+    parser.add_argument("--ml-train-frac", type=float, default=0.7,
+                        help="Experiment M: leading fraction used for training.")
     parser.add_argument(
         "--experiment",
         choices=["full", "sweep", "intro", "tuning", "extras", "tune",
-                 "A", "B", "C", "D", "E", "F", "G", "H",
-                 "ABC", "ABCD", "ABCDFGH", "FGH", "none"],
+                 "A", "B", "C", "D", "E", "F", "G", "H", "U", "M", "K", "J",
+                 "ABC", "ABCD", "ABCDFGH", "FGH", "UMKJF", "none"],
         default="full",
         help="'full' runs every main-pipeline phase (sweep + intro/Fig.1 + "
              "tuning + extras incl. K_ext) + single-axis A/B/C/D/F/G/H.  The "
@@ -156,7 +185,12 @@ def main():
              "experiment: A greedy-vs-brute P-tuning, B vary-w, C vary-eps, "
              "D plugin end-to-end, F incremental-module ablation (Sec. 7.8, "
              "offline, no broker), G overhead/privacy-utility comparison "
-             "(Sec. 7.9), H average-case utility (Sec. 7.11).  'E' runs the "
+             "(Sec. 7.9), H average-case utility (Sec. 7.11).  Section 7 "
+             "experiments on the full-pipeline simulator: U utility vs "
+             "epsilon / window / depth against LDP and w-event DP, M "
+             "downstream ML utility, K induced wait, J broker latency "
+             "(in-process; use experiments.latency --live for a real "
+             "broker).  'UMKJF' runs those plus the ablation.  'E' runs the "
              "live-broker sanity subset.  'ABC'/'ABCD'/'FGH'/'ABCDFGH' run "
              "those subsets without the main pipeline.",
     )
@@ -180,10 +214,17 @@ def main():
     parser.add_argument(
         "--no-auto-broker", dest="auto_broker", action="store_false",
         default=True,
-        help="Do not auto-start an embedded amqtt broker for Experiment E "
-             "when none is listening; fail instead.  Default behaviour is to "
-             "reuse any existing broker at --broker-host/--broker-port, "
-             "otherwise spin one up for the run.",
+        help="Do not auto-start a broker for Experiment E when none is "
+             "listening; fail instead.  Default behaviour is to reuse any "
+             "existing broker at --broker-host/--broker-port, otherwise spin "
+             "one up (--broker-impl) for the run.",
+    )
+    parser.add_argument(
+        "--broker-impl", choices=["mosquitto", "amqtt"], default="mosquitto",
+        help="Broker to auto-start for Experiment E when none is listening: "
+             "a local Eclipse Mosquitto process (default; binary from "
+             "$MOSQUITTO_BIN, PATH or the install default) or the embedded "
+             "pure-Python amqtt.",
     )
     parser.add_argument(
         "--include-energy-in-E", action="store_true", default=False,
@@ -238,14 +279,19 @@ def main():
                     "generate_plots.py --output-dir <results_dir>` "
                     "after the experiment completes to render every figure.")
 
+    from experiments.pipeline import PAPER_EPS_VALUES, PAPER_W_VALUES
     if args.quick:
         s_values = [1, 2, 4]
-        eps_values = [0.5, 1.0, 2.0]
-        w_values = [6, 10]
+        eps_values = [1.0, 4.0]
+        w_values = [4, 12]
     else:
         s_values = [1, 2, 4, 6]
-        eps_values = [0.5, 1.0, 2.0, 4.0]
-        w_values = [4, 8, 10, 12]
+        eps_values = list(PAPER_EPS_VALUES)
+        w_values = list(PAPER_W_VALUES)
+    eps_values = list(args.eps_values) if args.eps_values else eps_values
+    w_values = list(args.w_values) if args.w_values else w_values
+    # Experiments U/M read these from args.
+    args.eps_values, args.w_values = eps_values, w_values
 
     strategies = args.strategies or ALL_STRATEGIES
     invalid = [s for s in strategies if s not in ALL_STRATEGIES]
@@ -326,8 +372,8 @@ def main():
                  "tuning": {"tuning"}, "extras": {"extras"}}
     main_phases = _PHASE_OF.get(args.experiment)  # None for 'full'
     run_single_axis = args.experiment in (
-        "full", "ABC", "ABCD", "ABCDFGH", "FGH",
-        "A", "B", "C", "D", "F", "G", "H",
+        "full", "ABC", "ABCD", "ABCDFGH", "FGH", "UMKJF",
+        "A", "B", "C", "D", "F", "G", "H", "U", "M", "K", "J",
     )
     run_live_E = args.experiment == "E"
 
@@ -361,6 +407,7 @@ def main():
                 n_steps=args.live_n_steps,
                 seed=args.seed or 123,
                 auto_start_broker=args.auto_broker,
+                broker_impl=args.broker_impl,
             )
         logger.info(
             f"Experiment E complete ({len(datasets_for_E)} dataset(s)).")
@@ -397,8 +444,9 @@ def main():
 
     if run_single_axis:
         if args.experiment == "full":
-            which = "ABCDFGH"   # full pipeline runs every single-axis experiment
-        elif args.experiment in ("ABCD", "ABC", "ABCDFGH", "FGH"):
+            # full pipeline runs every single-axis + Section 7 experiment
+            which = "ABCDFGHUMKJ"
+        elif args.experiment in ("ABCD", "ABC", "ABCDFGH", "FGH", "UMKJF"):
             which = args.experiment
         else:
             which = args.experiment  # single letter A/B/C/D/F/G/H
@@ -431,6 +479,7 @@ def main():
                     n_steps=args.live_n_steps,
                     seed=args.seed or 123,
                     auto_start_broker=args.auto_broker,
+                    broker_impl=args.broker_impl,
                 )
             except Exception as exc:
                 logger.exception(

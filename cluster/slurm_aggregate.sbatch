@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================================
-# coeus_aggregate.sbatch -- merge every shard's output into one combined tree.
-# Submitted by submit_coeus.sh with --dependency=afterok on the job array, so
+# slurm_aggregate.sbatch -- merge every shard's output into one combined tree.
+# Submitted by submit_slurm.sh with --dependency=afterok on the job array, so
 # it runs only after all shards complete.
 # ============================================================================
 #SBATCH --job-name=pubsubdp_agg
